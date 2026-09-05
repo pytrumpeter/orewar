@@ -177,6 +177,7 @@ fn main() {
         .init_resource::<GameState>()
         .init_resource::<LocalInput>()
         .init_resource::<MenuState>()
+        .init_resource::<camera::Overview>()
         .add_systems(
             Startup,
             (
@@ -200,6 +201,10 @@ fn main() {
                 // The menu takes Escape first and gates the controls, so it
                 // has to settle before input is gathered.
                 menu::toggle,
+                // The overview settles first: while it is up the controls are
+                // gated, and gathering before that would drive a vehicle for a
+                // frame after the camera had already left it.
+                camera::overview_controls,
                 input::gather,
                 menu::update,
                 state::interpolate_system,

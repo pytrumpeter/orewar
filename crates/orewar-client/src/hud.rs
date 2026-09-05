@@ -322,7 +322,8 @@ pub fn update_texts(
                 let name = state.local_player.map(|id| state.name_of(id)).unwrap_or_default();
                 **text = format!(
                     "OREWAR  {name}\n{link}\nore {credits}   mined {}\ndriving: {}\n\n\
-                     WASD drive | mouse aim | LMB gun | RMB missile\nTAB swap vehicle | B build | ESC menu",
+                     WASD drive | mouse aim | LMB gun | RMB missile\n\
+                     TAB swap vehicle | B build | O overview | ESC menu",
                     me.map_or(0, |p| p.ore_mined),
                     match input.controlling {
                         VehicleSlot::Tank => "TANK",
@@ -427,8 +428,15 @@ pub fn update_texts(
             }
 
             HudText::Banner => {
+                let coming_back = me.map_or(0, |p| p.respawn_in);
                 **text = match (state.status, state.winner) {
                     (GameStatus::Waiting, _) => "WAITING FOR ANOTHER PLAYER".to_string(),
+                    // Losing a harvester is the one thing that takes you off the
+                    // field entirely, so while that clock runs it is the only
+                    // thing worth saying.
+                    (GameStatus::Running, _) if coming_back > 0 => {
+                        format!("HARVESTER LOST\nBACK IN {coming_back}")
+                    }
                     (GameStatus::Finished, Some(winner)) => {
                         if Some(winner) == state.local_player {
                             "YOU WIN".to_string()

@@ -63,16 +63,20 @@ pub fn gather(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     menu: Res<MenuState>,
+    overview: Res<crate::camera::Overview>,
     mut input: ResMut<LocalInput>,
     mut state: ResMut<GameState>,
     mut net: ResMut<NetClient>,
 ) {
-    // With the menu up the vehicle coasts: it should not carry on driving on
-    // whatever was held when the menu opened, and a click on a menu item is
-    // not a trigger pull. Aim is left where it was, exactly as it is when
-    // input stops arriving at all -- a turret that snaps is worse than one
-    // that waits.
-    if menu.open {
+    // With the menu up, or the camera lifted off the vehicle, it coasts: it
+    // should not carry on driving on whatever was held at the time, and a
+    // click on a menu item or a mode button is not a trigger pull. Gating the
+    // overview this way is also what keeps it from being free reconnaissance:
+    // looking at the whole field means not fighting while you do it.
+    //
+    // Aim is left where it was, exactly as it is when input stops arriving at
+    // all -- a turret that snaps is worse than one that waits.
+    if menu.open || overview.active {
         input.throttle = 0.0;
         input.steer = 0.0;
         input.fire_primary = false;
@@ -118,8 +122,8 @@ pub fn gather(
     // the harvester moves under you while the camera and aim stay behind.
     // Coming back the same way puts you in the tank the moment it respawns.
     if let Some(me) = state.local() {
-        if me.vehicle(input.controlling).is_none() && me.vehicle(input.controlling.other()).is_some()
-        {
+        let have = |slot| me.vehicle(slot).is_some();
+        if !have(input.controlling) && have(input.controlling.other()) {
             input.controlling = input.controlling.other();
             state.set_predicted_slot(input.controlling);
         }

@@ -108,6 +108,9 @@ pub struct RenderPlayer {
     pub captures: u8,
     /// What the harvester does when nobody is driving it.
     pub harvester_mode: HarvesterMode,
+    /// Seconds until a captured player is back on the field; zero when they
+    /// are on it.
+    pub respawn_in: u8,
     pub tank: Option<RenderVehicle>,
     pub harvester: Option<RenderVehicle>,
     /// Absent while the emplacement is rubble.
@@ -505,6 +508,7 @@ impl GameState {
                             missiles: pb.missiles,
                             captures: pb.captures,
                             harvester_mode: pb.harvester_mode,
+                            respawn_in: pb.respawn_in,
                             tank,
                             harvester,
                             sentinel,
@@ -546,6 +550,7 @@ impl GameState {
                                 missiles: p.missiles,
                                 captures: p.captures,
                                 harvester_mode: p.harvester_mode,
+                                respawn_in: p.respawn_in,
                                 tank: p.tank.as_ref().map(RenderVehicle::from_snapshot),
                                 harvester: p.harvester.as_ref().map(RenderVehicle::from_snapshot),
                                 sentinel: p.sentinel.map(|s| RenderSentinel {
