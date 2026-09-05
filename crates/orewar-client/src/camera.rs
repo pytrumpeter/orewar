@@ -10,7 +10,7 @@
 //! the field after losing a harvester, since there is nothing to chase, and can
 //! be raised at any other time with the overview key.
 
-use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::view::NoIndirectDrawing;
 use orewar_shared::math::Vec2 as SimVec2;
@@ -43,12 +43,22 @@ const AIM_HALF_LIFE: f32 = 0.07;
 /// [`WORLD_SIZE`] across.
 const MIN_HEIGHT: f32 = 70.0;
 const MAX_HEIGHT: f32 = WORLD_SIZE / 0.75;
-/// How much of the height one wheel notch adds or removes.
-const ZOOM_STEP: f32 = 0.12;
+/// What one wheel notch multiplies or divides the height by.
+const ZOOM_PER_NOTCH: f32 = 1.15;
 /// How far behind the point it looks at the overview camera sits, as a fraction
 /// of its height. Straight down reads as a map; a little tilt keeps the hills
 /// and vehicles standing up.
 const OVERVIEW_TILT: f32 = 0.32;
+/// Height the overview opens at when raised by hand: enough of the field to
+/// plan with, close enough to tell vehicles apart.
+const WORKING_HEIGHT: f32 = WORLD_SIZE * 0.55;
+/// The most one frame's worth of scrolling may change the zoom by. A precision
+/// touchpad can deliver a great many small events in a single frame, and
+/// without a cap one flick lands on a limit instead of where it was aimed.
+const MAX_NOTCHES_PER_FRAME: f32 = 4.0;
+
+/// What the zoom keys change the height by per second held.
+const KEY_ZOOM_RATE: f32 = 1.9;
 
 #[derive(Component)]
 pub struct ChaseCamera;
@@ -112,6 +122,7 @@ pub fn overview_controls(
     menu: Res<MenuState>,
     state: Res<GameState>,
     input: Res<LocalInput>,
+    time: Res<Time>,
     mut overview: ResMut<Overview>,
 ) {
     // Off the field after losing a harvester: there is no vehicle to chase, so
@@ -122,6 +133,9 @@ pub fn overview_controls(
     if !menu.open && keys.just_pressed(KeyCode::KeyO) {
         overview.toggled = !overview.toggled;
         if overview.toggled && !overview.active {
+            // Opened at a known height rather than wherever the zoom was left,
+            // so raising the camera always gives the same usable framing.
+            overview.height = WORKING_HEIGHT;
             // Start over whatever you were driving, so raising the camera does
             // not also lose your place.
             if let Some(pos) = state.local().and_then(|p| {
@@ -139,22 +153,56 @@ pub fn overview_controls(
     overview.active = overview.toggled || waiting;
     if overview.active && !was_active && waiting {
         // Nothing left on the field, so open on your own corner -- that is where
-        // you are about to come back.
+        // you are about to come back -- and pulled far enough out to watch the
+        // whole match while you wait it out.
         overview.centre = orewar_shared::world::base_position(state.local_player.unwrap_or(0));
+        overview.height = MAX_HEIGHT;
     }
 
-    if !overview.active || menu.open {
+    // Only a focused window is being scrolled at on purpose. Without this the
+    // camera reads whatever the pointing device happens to be emitting while
+    // the player is somewhere else entirely, and a stream of small scroll
+    // events walks the zoom to a limit and holds it there.
+    let focused = windows.iter().any(|w| w.focused);
+    if !overview.active || menu.open || !focused {
         wheel.clear();
         motion.clear();
         return;
     }
 
-    // Zoom multiplicatively, so a notch covers the same proportion of the view
-    // whether you are looking at one base or the whole field.
-    let notches: f32 = wheel.read().map(|e| e.y).sum();
-    if notches != 0.0 {
+    // A wheel event arrives either as lines or as raw pixels depending on the
+    // device and the platform, and Windows sends 120 pixels per notch. Summing
+    // the raw values and treating them as notches makes one flick of the wheel
+    // read as hundreds, which is not a difference the rest of this can absorb.
+    let notches: f32 = wheel
+        .read()
+        .map(|e| match e.unit {
+            MouseScrollUnit::Line => e.y,
+            MouseScrollUnit::Pixel => e.y / 120.0,
+        })
+        .sum::<f32>()
+        .clamp(-MAX_NOTCHES_PER_FRAME, MAX_NOTCHES_PER_FRAME);
+    // Keys do the same job. They are also the dependable way to zoom: some
+    // pointing devices deliver a stream of scroll events for as long as the
+    // cursor is over the window, whether or not anyone has touched the wheel,
+    // and there is no way to tell those apart from a real scroll by their
+    // contents. Where that happens the wheel is unusable and these are not.
+    let mut zoom = 0.0;
+    if keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd) {
+        zoom += KEY_ZOOM_RATE * time.delta_secs();
+    }
+    if keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract) {
+        zoom -= KEY_ZOOM_RATE * time.delta_secs();
+    }
+    zoom += notches;
+
+    if zoom != 0.0 {
+        // Exponential, so a notch covers the same proportion of the view whether
+        // you are looking at one base or the whole field -- and, unlike a linear
+        // step, no quantity of scrolling can drive the height through zero and
+        // out the other side.
         overview.height =
-            (overview.height * (1.0 - ZOOM_STEP * notches)).clamp(MIN_HEIGHT, MAX_HEIGHT);
+            (overview.height * ZOOM_PER_NOTCH.powf(-zoom)).clamp(MIN_HEIGHT, MAX_HEIGHT);
     }
 
     // Right button drags the map. The left one is left alone so the buttons
