@@ -266,6 +266,19 @@ pub const RAM_SPEED_LOSS: f32 = 0.55;
 /// Seconds without taking damage before shields begin to regenerate.
 pub const SHIELD_REGEN_DELAY: f32 = 4.0;
 
+/// How far a base emplacement will engage. Longer than the harvester's own
+/// turret: it is the thing that makes walking into somebody's corner cost
+/// something, so it has to reach past the pad it is defending.
+pub const SENTINEL_RANGE: f32 = 55.0;
+/// One shell a second.
+pub const SENTINEL_COOLDOWN: f32 = 1.0;
+pub const SENTINEL_HULL: f32 = 120.0;
+/// Seconds of rubble before it comes back at full hull. Long enough that
+/// silencing one buys a real window, short enough that it is not a kill.
+pub const SENTINEL_REBUILD: f32 = 20.0;
+/// Collision radius for incoming fire.
+pub const SENTINEL_RADIUS: f32 = 2.6;
+
 pub const AUTO_TURRET_RANGE: f32 = 42.0;
 pub const AUTO_TURRET_COOLDOWN: f32 = 0.9;
 

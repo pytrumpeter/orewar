@@ -88,6 +88,14 @@ impl RenderVehicle {
     }
 }
 
+/// A base emplacement as drawn. Its position is fixed by the player id, so
+/// only what moves travels.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderSentinel {
+    pub hull: f32,
+    pub turret_yaw: f32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RenderPlayer {
     pub id: u8,
@@ -100,6 +108,8 @@ pub struct RenderPlayer {
     pub captures: u8,
     pub tank: Option<RenderVehicle>,
     pub harvester: Option<RenderVehicle>,
+    /// Absent while the emplacement is rubble.
+    pub sentinel: Option<RenderSentinel>,
 }
 
 impl RenderPlayer {
@@ -470,6 +480,18 @@ impl GameState {
                         (_, Some(vb)) => Some(RenderVehicle::from_snapshot(&vb)),
                         _ => None,
                     };
+                    // The gun slews, so its heading is worth interpolating for
+                    // the same reason a hull's is.
+                    let sentinel = match (pa.and_then(|p| p.sentinel), pb.sentinel) {
+                        (Some(sa), Some(sb)) => Some(RenderSentinel {
+                            hull: sb.hull,
+                            turret_yaw: math::angle_lerp(sa.turret_yaw, sb.turret_yaw, t),
+                        }),
+                        (_, Some(sb)) => {
+                            Some(RenderSentinel { hull: sb.hull, turret_yaw: sb.turret_yaw })
+                        }
+                        _ => None,
+                    };
                     if let Some(slot) = players.get_mut(pb.id as usize) {
                         *slot = Some(RenderPlayer {
                             id: pb.id,
@@ -482,6 +504,7 @@ impl GameState {
                             captures: pb.captures,
                             tank,
                             harvester,
+                            sentinel,
                         });
                     }
                 }
@@ -521,6 +544,10 @@ impl GameState {
                                 captures: p.captures,
                                 tank: p.tank.as_ref().map(RenderVehicle::from_snapshot),
                                 harvester: p.harvester.as_ref().map(RenderVehicle::from_snapshot),
+                                sentinel: p.sentinel.map(|s| RenderSentinel {
+                                    hull: s.hull,
+                                    turret_yaw: s.turret_yaw,
+                                }),
                             });
                         }
                     }
@@ -630,8 +657,12 @@ mod tests {
     #[test]
     fn a_frame_between_two_steps_is_drawn_between_two_positions() {
         let mut p = Prediction { active: true, ..Default::default() };
-        let frame =
-            InputFrame { tick: 1, controlling: VehicleSlot::Tank, throttle: 1.0, steer: 0.0, ..Default::default() };
+        let frame = InputFrame {
+            tick: 1,
+            controlling: VehicleSlot::Tank,
+            throttle: 1.0,
+            ..Default::default()
+        };
         // Two steps, so there is a real gap to slide across.
         p.apply(frame, 0, &[]);
         p.apply(InputFrame { tick: 2, ..frame }, 0, &[]);
@@ -644,7 +675,10 @@ mod tests {
 
         let mid = p.render_pos(0.5);
         let expected = start.lerp(end, 0.5);
-        assert!((mid - expected).length() < 1e-4, "a half-step frame drew {mid:?}, not {expected:?}");
+        assert!(
+            (mid - expected).length() < 1e-4,
+            "a half-step frame drew {mid:?}, not {expected:?}"
+        );
     }
 
     /// Prediction must land where authority does once inputs are replayed.

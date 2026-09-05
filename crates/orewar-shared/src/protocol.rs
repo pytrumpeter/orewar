@@ -237,6 +237,32 @@ impl Decode for VehicleSnapshot {
 /// Bytes one `VehicleSnapshot` occupies on the wire.
 pub const VEHICLE_SNAPSHOT_BYTES: usize = 22;
 
+/// The gun emplacement in a player's home corner.
+///
+/// Its position never travels: it is fixed by [`crate::world::sentinel_position`]
+/// and both sides derive it from the player id. Only what changes is sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SentinelSnapshot {
+    pub hull: f32,
+    pub turret_yaw: f32,
+}
+
+impl Encode for SentinelSnapshot {
+    fn encode(&self, w: &mut Writer) {
+        w.unorm16(self.hull, STAT_SCALE);
+        w.angle(self.turret_yaw);
+    }
+}
+
+impl Decode for SentinelSnapshot {
+    fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        Ok(SentinelSnapshot { hull: r.unorm16(STAT_SCALE)?, turret_yaw: r.angle()? })
+    }
+}
+
+/// Bytes one `SentinelSnapshot` occupies on the wire.
+pub const SENTINEL_SNAPSHOT_BYTES: usize = 4;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerSnapshot {
     pub id: u8,
@@ -252,6 +278,8 @@ pub struct PlayerSnapshot {
     pub tank: Option<VehicleSnapshot>,
     /// Absent once the harvester has been captured.
     pub harvester: Option<VehicleSnapshot>,
+    /// Absent while the emplacement is rubble and rebuilding.
+    pub sentinel: Option<SentinelSnapshot>,
 }
 
 impl Encode for PlayerSnapshot {
@@ -259,7 +287,8 @@ impl Encode for PlayerSnapshot {
         let flags = self.connected as u8
             | (self.eliminated as u8) << 1
             | (self.tank.is_some() as u8) << 2
-            | (self.harvester.is_some() as u8) << 3;
+            | (self.harvester.is_some() as u8) << 3
+            | (self.sentinel.is_some() as u8) << 4;
         w.u8(self.id);
         w.u8(flags);
         w.u32(self.credits);
@@ -272,6 +301,9 @@ impl Encode for PlayerSnapshot {
         }
         if let Some(v) = &self.harvester {
             v.encode(w);
+        }
+        if let Some(sentinel) = &self.sentinel {
+            sentinel.encode(w);
         }
     }
 }
@@ -287,6 +319,7 @@ impl Decode for PlayerSnapshot {
         let captures = r.u8()?;
         let tank = if flags & 0b100 != 0 { Some(r.read()?) } else { None };
         let harvester = if flags & 0b1000 != 0 { Some(r.read()?) } else { None };
+        let sentinel = if flags & 0b1_0000 != 0 { Some(r.read()?) } else { None };
         Ok(PlayerSnapshot {
             id,
             connected: flags & 1 != 0,
@@ -298,6 +331,7 @@ impl Decode for PlayerSnapshot {
             captures,
             tank,
             harvester,
+            sentinel,
         })
     }
 }
@@ -607,6 +641,9 @@ pub enum GameEvent {
     /// worth saying out loud, and a harvester taken empty should not claim a
     /// haul that was not there.
     OreSeized { by: u8, from: u8, amount: u32 },
+    /// A base emplacement was shot down and is rebuilding.
+    SentinelDestroyed { player: u8 },
+    SentinelRebuilt { player: u8 },
 }
 
 impl Encode for GameEvent {
@@ -654,6 +691,12 @@ impl Encode for GameEvent {
             GameEvent::OreSeized { by, from, amount } => {
                 w.u8(14).u8(by).u8(from).u32(amount);
             }
+            GameEvent::SentinelDestroyed { player } => {
+                w.u8(15).u8(player);
+            }
+            GameEvent::SentinelRebuilt { player } => {
+                w.u8(16).u8(player);
+            }
         }
     }
 }
@@ -688,6 +731,8 @@ impl Decode for GameEvent {
             12 => GameEvent::GameOver { winner: r.u8()? },
             13 => GameEvent::MatchReset { world_seed: r.u64()?, by: r.u8()? },
             14 => GameEvent::OreSeized { by: r.u8()?, from: r.u8()?, amount: r.u32()? },
+            15 => GameEvent::SentinelDestroyed { player: r.u8()? },
+            16 => GameEvent::SentinelRebuilt { player: r.u8()? },
             other => return Err(DecodeError::BadTag("GameEvent", other)),
         })
     }
@@ -815,6 +860,7 @@ mod tests {
             captures: 2,
             tank: Some(sample_vehicle()),
             harvester: Some(sample_vehicle()),
+            sentinel: Some(SentinelSnapshot { hull: 118.5, turret_yaw: 2.0 }),
         }
     }
 
@@ -887,6 +933,8 @@ mod tests {
             GameEvent::GameOver { winner: 1 },
             GameEvent::MatchReset { world_seed: 0xFEED_FACE_1234_5678, by: 2 },
             GameEvent::OreSeized { by: 1, from: 2, amount: 47 },
+            GameEvent::SentinelDestroyed { player: 3 },
+            GameEvent::SentinelRebuilt { player: 3 },
         ];
         for e in events {
             let bytes = ServerMessage::Event(e).to_vec();
@@ -1031,8 +1079,14 @@ mod tests {
     #[test]
     fn struct_size_constants_match_the_encoders() {
         assert_eq!(sample_vehicle().to_vec().len(), VEHICLE_SNAPSHOT_BYTES);
-        let bare = PlayerSnapshot { tank: None, harvester: None, ..sample_player(0) };
+        let bare =
+            PlayerSnapshot { tank: None, harvester: None, sentinel: None, ..sample_player(0) };
         assert_eq!(bare.to_vec().len(), PLAYER_SNAPSHOT_FIXED_BYTES);
+        let with_sentinel = PlayerSnapshot { tank: None, harvester: None, ..sample_player(0) };
+        assert_eq!(
+            with_sentinel.to_vec().len(),
+            PLAYER_SNAPSHOT_FIXED_BYTES + SENTINEL_SNAPSHOT_BYTES
+        );
         let proj = ProjectileSnapshot {
             id: 1,
             kind: ProjectileKind::Bullet,

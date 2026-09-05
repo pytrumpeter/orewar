@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use orewar_shared::math::{Vec2, angle_delta, wrap_angle};
 use orewar_shared::protocol::{
     GameEvent, GameStatus, HitFx, HitKind, InputFrame, MAX_HITS_PER_SNAPSHOT, OreUpdate,
-    PlayerInfo, PlayerSnapshot, ProjectileKind,
+    PlayerInfo, PlayerSnapshot, ProjectileKind, SentinelSnapshot,
     ProjectileSnapshot, RejectReason, Snapshot, VehicleSlot, VehicleSnapshot,
     MAX_PROJECTILES_PER_SNAPSHOT,
 };
@@ -95,6 +95,7 @@ pub struct Player {
     pub captures: u8,
     pub tank: Option<Vehicle>,
     pub harvester: Option<Vehicle>,
+    pub sentinel: Sentinel,
     /// Counts down while the tank is destroyed.
     pub respawn_timer: f32,
     pub input: InputFrame,
@@ -124,6 +125,7 @@ impl Player {
             captures: 0,
             tank: Some(Vehicle::spawn(VehicleKind::Tank, tank_pos, inward, 0)),
             harvester: Some(Vehicle::spawn(VehicleKind::Harvester, harvester_pos, inward, 0)),
+            sentinel: Sentinel::new(id),
             respawn_timer: 0.0,
             input: InputFrame::default(),
             input_age: 0.0,
@@ -185,6 +187,12 @@ impl Player {
             captures: self.captures,
             tank: self.tank.as_ref().map(Vehicle::to_snapshot),
             harvester: self.harvester.as_ref().map(Vehicle::to_snapshot),
+            // Absent while it is rubble, which is how the client knows to draw
+            // the wreck instead of the gun.
+            sentinel: self.sentinel.standing().then(|| SentinelSnapshot {
+                hull: self.sentinel.hull,
+                turret_yaw: self.sentinel.turret_yaw,
+            }),
         }
     }
 }
@@ -200,10 +208,59 @@ pub struct Projectile {
     pub life: f32,
 }
 
+/// The gun emplacement in a player's home corner.
+///
+/// Not a vehicle: it never moves, has no shield, and is not something the player
+/// drives. It exists to make walking into somebody's base cost something even
+/// when they are away fighting.
+#[derive(Clone, Debug)]
+pub struct Sentinel {
+    pub hull: f32,
+    pub turret_yaw: f32,
+    gun_cooldown: f32,
+    /// Seconds of rubble left. Zero means it is standing.
+    rebuild_timer: f32,
+    /// Which of the enemies in range is being engaged. Advanced only after a
+    /// shot actually leaves, so it commits to one target long enough to finish
+    /// slewing onto it instead of thrashing between two.
+    cursor: usize,
+}
+
+impl Sentinel {
+    fn new(player: u8) -> Self {
+        // Facing the middle of the field, so it starts pointed where trouble
+        // comes from rather than at its own corner.
+        let pos = world::sentinel_position(player);
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - pos).to_angle();
+        Sentinel {
+            hull: sim::SENTINEL_HULL,
+            turret_yaw: inward,
+            gun_cooldown: 0.0,
+            rebuild_timer: 0.0,
+            cursor: 0,
+        }
+    }
+
+    pub fn standing(&self) -> bool {
+        self.rebuild_timer <= 0.0
+    }
+}
+
+/// What a projectile ran into.
+///
+/// Vehicles and emplacements are both worth hitting but are damaged through
+/// entirely different paths, so the swept-collision pass reports which it found
+/// rather than trying to describe one in terms of the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hittable {
+    Vehicle(VehicleSlot),
+    Sentinel,
+}
+
 /// A candidate for a projectile to hit.
 struct Target {
     player: u8,
-    slot: VehicleSlot,
+    what: Hittable,
     pos: Vec2,
     radius: f32,
 }
@@ -448,6 +505,7 @@ impl Game {
         // ended up rather than where they were before being pushed apart.
         self.step_collisions();
         self.step_weapons(dt);
+        self.step_sentinels(dt);
         self.step_projectiles(dt);
         self.step_economy(dt);
         self.step_capture(dt);
@@ -723,6 +781,75 @@ impl Game {
         }
     }
 
+    /// Base emplacements: pick a target, slew onto it, fire.
+    ///
+    /// Deliberately shaped like the Auto Turret block in [`Self::step_weapons`],
+    /// which solved the same problem for the harvester -- the difference is that
+    /// this one works through the enemies in range in turn rather than always
+    /// engaging the nearest, so a pair of attackers cannot have one of them
+    /// soak every shell while the other works unmolested.
+    fn step_sentinels(&mut self, dt: f32) {
+        let targets = self.collect_targets();
+        let mut spawned: Vec<Projectile> = Vec::new();
+
+        for slot_index in 0..self.players.len() {
+            let Some(p) = self.players[slot_index].as_mut() else { continue };
+            if p.eliminated {
+                continue;
+            }
+            let owner = p.id;
+            let post = world::sentinel_position(owner);
+            let s = &mut p.sentinel;
+
+            if !s.standing() {
+                s.rebuild_timer -= dt;
+                if s.standing() {
+                    s.hull = sim::SENTINEL_HULL;
+                    self.events.push(GameEvent::SentinelRebuilt { player: owner });
+                }
+                continue;
+            }
+
+            s.gun_cooldown = (s.gun_cooldown - dt).max(0.0);
+
+            let in_range: Vec<Vec2> = targets
+                .iter()
+                .filter(|t| t.player != owner && t.what != Hittable::Sentinel)
+                .filter(|t| t.pos.distance(post) <= sim::SENTINEL_RANGE)
+                .map(|t| t.pos)
+                .collect();
+            if in_range.is_empty() {
+                continue;
+            }
+
+            // The cursor only moves when a shell leaves, so the emplacement
+            // stays committed until it has actually taken its shot.
+            let target = in_range[s.cursor % in_range.len()];
+            let desired = (target - post).to_angle();
+            s.turret_yaw = sim::step_turret(s.turret_yaw, desired, dt);
+
+            if s.gun_cooldown <= 0.0 && angle_delta(s.turret_yaw, desired).abs() < 0.15 {
+                s.gun_cooldown = sim::SENTINEL_COOLDOWN;
+                s.cursor = s.cursor.wrapping_add(1);
+                spawned.push(Projectile {
+                    id: 0,
+                    kind: ProjectileKind::Bullet,
+                    owner,
+                    pos: post + Vec2::from_angle(s.turret_yaw) * (sim::SENTINEL_RADIUS + 1.0),
+                    yaw: s.turret_yaw,
+                    speed: sim::BULLET_SPEED,
+                    life: sim::BULLET_LIFETIME,
+                });
+            }
+        }
+
+        for mut proj in spawned {
+            proj.id = self.next_projectile_id;
+            self.next_projectile_id = self.next_projectile_id.wrapping_add(1);
+            self.projectiles.push(proj);
+        }
+    }
+
     fn collect_targets(&self) -> Vec<Target> {
         let mut out = Vec::new();
         for p in self.players.iter().flatten() {
@@ -732,7 +859,7 @@ impl Game {
             if let Some(v) = &p.tank {
                 out.push(Target {
                     player: p.id,
-                    slot: VehicleSlot::Tank,
+                    what: Hittable::Vehicle(VehicleSlot::Tank),
                     pos: v.mv.pos,
                     radius: sim::tuning(VehicleKind::Tank).radius,
                 });
@@ -740,9 +867,18 @@ impl Game {
             if let Some(v) = &p.harvester {
                 out.push(Target {
                     player: p.id,
-                    slot: VehicleSlot::Harvester,
+                    what: Hittable::Vehicle(VehicleSlot::Harvester),
                     pos: v.mv.pos,
                     radius: sim::tuning(VehicleKind::Harvester).radius,
+                });
+            }
+            // Rubble is not worth shooting at.
+            if p.sentinel.standing() {
+                out.push(Target {
+                    player: p.id,
+                    what: Hittable::Sentinel,
+                    pos: world::sentinel_position(p.id),
+                    radius: sim::SENTINEL_RADIUS,
                 });
             }
         }
@@ -754,7 +890,7 @@ impl Game {
         // Moved aside for the duration: `retain_mut` below holds a mutable
         // borrow of `self.projectiles`, and the terrain cannot change mid-tick.
         let hills = std::mem::take(&mut self.hills);
-        let mut hits: Vec<(u8, VehicleSlot, f32, u8, f32)> = Vec::new();
+        let mut hits: Vec<(u8, Hittable, f32, u8, f32)> = Vec::new();
         // Moved aside for the same reason the terrain is: `retain_mut` holds
         // `self.projectiles` for the whole pass.
         let mut fx = std::mem::take(&mut self.fx);
@@ -834,7 +970,7 @@ impl Game {
                 if proj.kind == ProjectileKind::Missile {
                     fx.push(HitFx::on_terrain(HitKind::Blast, impact));
                 }
-                hits.push((target.player, target.slot, damage, proj.owner, bearing));
+                hits.push((target.player, target.what, damage, proj.owner, bearing));
                 return false;
             }
 
@@ -846,9 +982,32 @@ impl Game {
         self.hills = hills;
         self.fx = fx;
 
-        for (player, slot, damage, attacker, bearing) in hits {
-            self.damage_vehicle(player, slot, damage, attacker, bearing);
+        for (player, what, damage, attacker, bearing) in hits {
+            match what {
+                Hittable::Vehicle(slot) => {
+                    self.damage_vehicle(player, slot, damage, attacker, bearing)
+                }
+                Hittable::Sentinel => self.damage_sentinel(player, damage),
+            }
         }
+    }
+
+    /// An emplacement has no shield to flash and nothing to follow, so a hit on
+    /// one is only ever the static blast the missile already reported.
+    fn damage_sentinel(&mut self, player: u8, damage: f32) {
+        let Some(p) = self.players.get_mut(player as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        if !p.sentinel.standing() {
+            return;
+        }
+        p.sentinel.hull = (p.sentinel.hull - damage).max(0.0);
+        if p.sentinel.hull > 0.0 {
+            return;
+        }
+        p.sentinel.rebuild_timer = sim::SENTINEL_REBUILD;
+        p.sentinel.gun_cooldown = 0.0;
+        self.events.push(GameEvent::SentinelDestroyed { player });
     }
 
     /// `bearing` is the direction the blow came in on, used only to place
@@ -1739,7 +1898,10 @@ mod tests {
         let mut g = two_player_game();
         g.hills.clear();
         g.damage_vehicle(0, VehicleSlot::Tank, 100_000.0, 1, 0.0);
-        assert!(g.player(0).unwrap().tank.is_none(), "the tank has to be gone for this to test anything");
+        assert!(
+            g.player(0).unwrap().tank.is_none(),
+            "the tank has to be gone for this to test anything"
+        );
 
         let start = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
         for tick in 0..30u32 {
@@ -1785,9 +1947,15 @@ mod tests {
         }
 
         let captor = g.player(1).unwrap();
-        assert_eq!(captor.credits, before + 42, "whole units only, and the fraction goes down with the hull");
+        assert_eq!(
+            captor.credits,
+            before + 42,
+            "whole units only, and the fraction goes down with the hull"
+        );
         assert!(
-            g.events.iter().any(|e| matches!(e, GameEvent::OreSeized { by: 1, from: 0, amount: 42 })),
+            g.events
+                .iter()
+                .any(|e| matches!(e, GameEvent::OreSeized { by: 1, from: 0, amount: 42 })),
             "the haul has to be announced: {:?}",
             g.events
         );
@@ -1812,6 +1980,125 @@ mod tests {
         assert!(
             !g.events.iter().any(|e| matches!(e, GameEvent::OreSeized { .. })),
             "nothing was aboard, so nothing was seized"
+        );
+    }
+
+    /// An emplacement has to work through everyone in range, not fixate.
+    ///
+    /// Always engaging the nearest would let a pair of attackers park one tank
+    /// in front to soak every shell while the other worked untouched.
+    #[test]
+    fn a_sentinel_shares_its_fire_between_two_attackers() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        // Player 0's emplacement, with two of player 1's hulls sitting in front
+        // of it side by side so neither is meaningfully nearer.
+        let post = world::sentinel_position(0);
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - post).to_angle();
+        let ahead = Vec2::from_angle(inward) * 30.0;
+        let across = Vec2::from_angle(inward).perp() * 10.0;
+        let (a, b) = (post + ahead + across, post + ahead - across);
+
+        let mut hit_tank = 0u32;
+        let mut hit_harvester = 0u32;
+        for _ in 0..600 {
+            // Held in place; this test is about who gets shot at.
+            {
+                let p = g.player_mut(1).unwrap();
+                p.tank.as_mut().unwrap().mv = MoveState { pos: a, yaw: 0.0, speed: 0.0 };
+                p.harvester.as_mut().unwrap().mv = MoveState { pos: b, yaw: 0.0, speed: 0.0 };
+                p.tank.as_mut().unwrap().shield = 100.0;
+                p.harvester.as_mut().unwrap().shield = 100.0;
+            }
+            g.step(TICK_DT);
+            let p = g.player(1).unwrap();
+            hit_tank += (p.tank.as_ref().unwrap().shield < 100.0) as u32;
+            hit_harvester += (p.harvester.as_ref().unwrap().shield < 100.0) as u32;
+        }
+        assert!(
+            hit_tank > 0 && hit_harvester > 0,
+            "both hulls should have been engaged, got {hit_tank}/{hit_harvester}"
+        );
+    }
+
+    /// Out of range is out of the fight.
+    #[test]
+    fn a_sentinel_ignores_what_it_cannot_reach() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        let post = world::sentinel_position(0);
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - post).to_angle();
+        let far = post + Vec2::from_angle(inward) * (sim::SENTINEL_RANGE + 25.0);
+        {
+            let p = g.player_mut(1).unwrap();
+            p.tank.as_mut().unwrap().mv = MoveState { pos: far, yaw: 0.0, speed: 0.0 };
+        }
+        let full = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+        for _ in 0..300 {
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = far;
+            g.step(TICK_DT);
+        }
+        assert_eq!(g.player(1).unwrap().tank.as_ref().unwrap().shield, full);
+    }
+
+    /// Shooting one down buys a window, and only a window.
+    #[test]
+    fn a_downed_sentinel_goes_quiet_and_comes_back() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        assert!(g.player(0).unwrap().sentinel.standing());
+
+        g.damage_sentinel(0, sim::SENTINEL_HULL + 1.0);
+        assert!(!g.player(0).unwrap().sentinel.standing(), "it should be rubble");
+        assert!(
+            g.snapshot_for(1, false).players.iter().find(|p| p.id == 0).unwrap().sentinel.is_none(),
+            "rubble must not be sent as a standing gun"
+        );
+
+        // Silent while it rebuilds, even with a target sitting right there.
+        let post = world::sentinel_position(0);
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - post).to_angle();
+        let close = post + Vec2::from_angle(inward) * 20.0;
+        let full = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+        for _ in 0..((sim::SENTINEL_REBUILD / TICK_DT) as usize - 30) {
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = close;
+            g.step(TICK_DT);
+        }
+        assert_eq!(
+            g.player(1).unwrap().tank.as_ref().unwrap().shield,
+            full,
+            "rubble does not shoot"
+        );
+
+        for _ in 0..90 {
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = close;
+            g.step(TICK_DT);
+        }
+        let s = &g.player(0).unwrap().sentinel;
+        assert!(s.standing() && s.hull == sim::SENTINEL_HULL, "it should be back at full hull");
+        assert!(
+            g.events.iter().any(|e| matches!(e, GameEvent::SentinelRebuilt { player: 0 })),
+            "and say so"
+        );
+    }
+
+    /// It must not shoot its own side, and its own side must not shoot it.
+    #[test]
+    fn a_sentinel_is_friendly_to_its_owner() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        let post = world::sentinel_position(0);
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - post).to_angle();
+        let close = post + Vec2::from_angle(inward) * 20.0;
+        let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
+        for _ in 0..300 {
+            g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = close;
+            g.step(TICK_DT);
+        }
+        assert_eq!(
+            g.player(0).unwrap().tank.as_ref().unwrap().shield,
+            full,
+            "an emplacement does not shoot the player it belongs to"
         );
     }
 

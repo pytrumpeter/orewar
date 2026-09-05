@@ -356,6 +356,17 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
                 format!("{} rescued their harvester", name(player))
             }
         }
+        GameEvent::SentinelDestroyed { player } => {
+            if Some(player) == me {
+                "Your base gun is down".to_string()
+            } else {
+                format!("{}'s base gun is down", name(player))
+            }
+        }
+        GameEvent::SentinelRebuilt { player } if Some(player) == me => {
+            "Your base gun is back".to_string()
+        }
+        GameEvent::SentinelRebuilt { .. } => return None,
         GameEvent::OreSeized { by, from, amount } => {
             if Some(by) == me {
                 format!("Seized {amount} ore from {}", name(from))

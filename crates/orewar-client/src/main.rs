@@ -15,6 +15,7 @@ mod hud;
 mod input;
 mod menu;
 mod net;
+mod sentinels;
 mod state;
 mod vehicles;
 
@@ -183,6 +184,7 @@ fn main() {
                 camera::setup,
                 hud::setup,
                 menu::setup,
+                sentinels::setup,
                 effects::setup,
             ),
         )
@@ -204,6 +206,7 @@ fn main() {
                     vehicles::sync_projectiles,
                     field::sync_ore,
                     field::sync_hills,
+                    sentinels::sync,
                     camera::follow,
                     hud::update_texts,
                     hud::update_bars,

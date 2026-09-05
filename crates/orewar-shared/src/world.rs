@@ -23,6 +23,10 @@ pub const DEFAULT_PORT: u16 = 45_701;
 pub const BASE_INSET: f32 = 24.0;
 /// A harvester within this distance of its own pad unloads its cargo.
 pub const BASE_RADIUS: f32 = 13.0;
+/// How far into the corner the gun emplacement sits. Behind the pad, and
+/// clear of it: 24 - 11 across both axes puts it about 18 out from the pad
+/// centre, past the 13 a harvester unloads within.
+pub const SENTINEL_INSET: f32 = 11.0;
 
 /// Per-player identity colors, chosen to stay distinct against green grass.
 pub const PLAYER_COLORS: [[u8; 3]; MAX_PLAYERS] =
@@ -53,6 +57,18 @@ const CORNER_ORDER: [u32; MAX_PLAYERS] = [0, 2, 1, 3];
 pub fn base_position(player: u8) -> Vec2 {
     let idx = player as usize % MAX_PLAYERS;
     rotate_quarter(vec2(BASE_INSET, BASE_INSET), CORNER_ORDER[idx])
+}
+
+/// Where a player's gun emplacement stands: tucked into the corner behind
+/// their pad.
+///
+/// Built through `rotate_quarter` like everything else on the map, so all
+/// four sit identically under the quadrant symmetry. Far enough back that it
+/// covers the pad without standing on it, which would put it between a
+/// harvester and the spot it unloads at.
+pub fn sentinel_position(player: u8) -> Vec2 {
+    let idx = player as usize % MAX_PLAYERS;
+    rotate_quarter(vec2(SENTINEL_INSET, SENTINEL_INSET), CORNER_ORDER[idx])
 }
 
 /// Ore in the ground. `amount` depletes as it is harvested; `capacity` is what
