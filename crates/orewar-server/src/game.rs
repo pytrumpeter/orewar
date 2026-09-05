@@ -137,7 +137,7 @@ impl Player {
     /// to a stop and stops shooting. Aim is kept, since a turret left pointing
     /// where it was is less jarring than one that snaps.
     fn effective_input(&self) -> InputFrame {
-        if self.input_age > INPUT_TIMEOUT {
+        let mut frame = if self.input_age > INPUT_TIMEOUT {
             InputFrame {
                 controlling: self.input.controlling,
                 aim: self.input.aim,
@@ -146,7 +146,17 @@ impl Player {
             }
         } else {
             self.input
+        };
+
+        // Driving a vehicle that is not there is driving nothing. A destroyed
+        // tank used to strand the player: the client kept naming the tank it no
+        // longer had, so the harvester was treated as unattended and would not
+        // respond to anything until the respawn. Falling through here fixes it
+        // for every client, including one that never notices.
+        if self.vehicle(frame.controlling).is_none() {
+            frame.controlling = frame.controlling.other();
         }
+        frame
     }
 
     pub fn vehicle(&self, slot: VehicleSlot) -> Option<&Vehicle> {
@@ -1703,6 +1713,37 @@ mod tests {
             full,
             "parking against a slope is not a crash"
         );
+    }
+
+    /// Losing your tank must not leave you driving nothing.
+    ///
+    /// The client keeps naming the vehicle it last chose, so a destroyed tank
+    /// used to mean every input was applied to a hull that no longer existed --
+    /// the harvester sat there unattended and the player was frozen out until
+    /// the respawn.
+    #[test]
+    fn a_destroyed_tank_hands_control_to_the_harvester() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        g.damage_vehicle(0, VehicleSlot::Tank, 100_000.0, 1, 0.0);
+        assert!(g.player(0).unwrap().tank.is_none(), "the tank has to be gone for this to test anything");
+
+        let start = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        for tick in 0..30u32 {
+            // Still asking to drive the tank, exactly as a client would.
+            g.set_input(
+                0,
+                InputFrame {
+                    tick: tick + 1,
+                    controlling: VehicleSlot::Tank,
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            g.step(TICK_DT);
+        }
+        let moved = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos.distance(start);
+        assert!(moved > 3.0, "the harvester only moved {moved:.2}; the player is still frozen out");
     }
 
     #[test]

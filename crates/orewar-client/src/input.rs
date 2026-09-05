@@ -112,6 +112,19 @@ pub fn gather(
         state.set_predicted_slot(input.controlling);
     }
 
+    // Follow the vehicle you actually have. A destroyed tank leaves nothing
+    // to drive, and the server already falls through to the other slot, but
+    // prediction and the turret still have to be pointed at the right hull or
+    // the harvester moves under you while the camera and aim stay behind.
+    // Coming back the same way puts you in the tank the moment it respawns.
+    if let Some(me) = state.local() {
+        if me.vehicle(input.controlling).is_none() && me.vehicle(input.controlling.other()).is_some()
+        {
+            input.controlling = input.controlling.other();
+            state.set_predicted_slot(input.controlling);
+        }
+    }
+
     // Build menu. Closing it with Escape is handled in `menu::toggle`, which
     // owns that key so the two menus cannot both react to one press.
     if keys.just_pressed(KeyCode::KeyB) {
