@@ -156,6 +156,13 @@ impl Player {
         }
     }
 
+    fn vehicle_mut(&mut self, slot: VehicleSlot) -> Option<&mut Vehicle> {
+        match slot {
+            VehicleSlot::Tank => self.tank.as_mut(),
+            VehicleSlot::Harvester => self.harvester.as_mut(),
+        }
+    }
+
     fn to_snapshot(&self) -> PlayerSnapshot {
         PlayerSnapshot {
             id: self.id,
@@ -189,6 +196,27 @@ struct Target {
     slot: VehicleSlot,
     pos: Vec2,
     radius: f32,
+}
+
+/// One vehicle as [`Game::step_collisions`] sees it: a circle with a heading.
+///
+/// Lifted out of the players so the whole field can be compared against itself
+/// without holding a borrow on any one of them, then written back.
+#[derive(Clone, Copy)]
+struct Body {
+    player: u8,
+    slot: VehicleSlot,
+    pos: Vec2,
+    radius: f32,
+    /// Velocity. Both how fast two hulls were closing and, once normalised,
+    /// which way each was actually travelling -- which is not the way it
+    /// faces when it is reversing.
+    vel: Vec2,
+    /// What is left of the speed after the meeting.
+    speed_scale: f32,
+    /// A wreck has no engine to be shoved with, so it holds its ground and the
+    /// hull that ran into it gives all of it.
+    fixed: bool,
 }
 
 pub struct Game {
@@ -406,6 +434,9 @@ impl Game {
         }
 
         self.step_vehicles(dt);
+        // Before weapons and capture, so both read where the hulls actually
+        // ended up rather than where they were before being pushed apart.
+        self.step_collisions();
         self.step_weapons(dt);
         self.step_projectiles(dt);
         self.step_economy(dt);
@@ -422,8 +453,13 @@ impl Game {
     }
 
     fn step_vehicles(&mut self, dt: f32) {
+        // Crashes are charged after the loop: applying damage needs the game as
+        // a whole, and the loop has one player in hand at a time.
+        let mut crashes: Vec<(u8, VehicleSlot, f32, f32)> = Vec::new();
+
         for slot_index in 0..self.players.len() {
             let Some(p) = self.players[slot_index].as_mut() else { continue };
+            let id = p.id;
             let powerups = p.powerups;
             let input = p.effective_input();
             let controlling = input.controlling;
@@ -438,15 +474,26 @@ impl Game {
                     continue;
                 };
 
-                if v.disabled {
+                let outcome = if v.disabled {
                     v.mv.speed = 0.0;
+                    sim::StepOutcome::default()
                 } else if slot == controlling {
-                    sim::step_vehicle(&mut v.mv, throttle, steer, kind, powerups, &self.hills, dt);
+                    sim::step_vehicle(&mut v.mv, throttle, steer, kind, powerups, &self.hills, dt)
                 } else {
                     // An unattended vehicle coasts to a halt and holds station.
                     // A harvester parked on ore keeps working, which is what
                     // makes leaving it there while you fight worthwhile.
-                    sim::step_vehicle(&mut v.mv, 0.0, 0.0, kind, powerups, &self.hills, dt);
+                    sim::step_vehicle(&mut v.mv, 0.0, 0.0, kind, powerups, &self.hills, dt)
+                };
+
+                // Driving into a hillside costs hull, above a speed that nosing
+                // up to one never reaches. Turbo makes this worse, which is the
+                // point: it buys speed, and speed is what hurts here.
+                if outcome.terrain_impact > sim::IMPACT_THRESHOLD {
+                    let over = outcome.terrain_impact - sim::IMPACT_THRESHOLD;
+                    // The hill met the front of the hull, so that is the face the
+                    // shield lights up on.
+                    crashes.push((id, slot, over * sim::TERRAIN_IMPACT_DAMAGE, v.mv.yaw));
                 }
 
                 if slot == VehicleSlot::Tank {
@@ -464,6 +511,116 @@ impl Game {
                 v.gun_cooldown = (v.gun_cooldown - dt).max(0.0);
                 v.missile_cooldown = (v.missile_cooldown - dt).max(0.0);
             }
+        }
+
+        // Nobody to blame but the driver, so the crash is charged to them; a
+        // tank lost this way is not a kill for anyone.
+        for (player, slot, damage, bearing) in crashes {
+            self.damage_vehicle(player, slot, damage, player, bearing);
+        }
+    }
+
+    /// Keeps hulls out of each other, and charges both for a hard meeting.
+    ///
+    /// Vehicles are circles that cannot share ground: anything that ends a tick
+    /// inside another hull is pushed back out along the line between the two,
+    /// and loses the speed it was carrying in. Meeting fast enough costs both
+    /// sides hull, so ramming is a real move with a real price rather than a way
+    /// to park inside somebody.
+    ///
+    /// Server-only. The client predicts its own vehicle with [`sim::step_vehicle`]
+    /// and knows nothing about the others, so a push shows up there as a small
+    /// correction on the next snapshot. That is fine because contact is
+    /// transient by construction -- the hulls separate the same tick they meet --
+    /// and the error never approaches the threshold that would snap the camera.
+    fn step_collisions(&mut self) {
+        let mut bodies: Vec<Body> = Vec::new();
+        for p in self.players.iter().flatten() {
+            if p.eliminated {
+                continue;
+            }
+            for slot in [VehicleSlot::Tank, VehicleSlot::Harvester] {
+                let Some(v) = p.vehicle(slot) else { continue };
+                bodies.push(Body {
+                    player: p.id,
+                    slot,
+                    pos: v.mv.pos,
+                    radius: sim::tuning(slot.kind()).radius,
+                    vel: Vec2::from_angle(v.mv.yaw) * v.mv.speed,
+                    speed_scale: 1.0,
+                    fixed: v.disabled,
+                });
+            }
+        }
+
+        let mut rams: Vec<(u8, VehicleSlot, f32, u8, f32)> = Vec::new();
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                // Copied out, so the positions already nudged by earlier pairs
+                // in this pass are the ones being compared.
+                let (a, b) = (bodies[i], bodies[j]);
+                let Some((axis, overlap)) = sim::overlap_push(a.pos, a.radius, b.pos, b.radius)
+                else {
+                    continue;
+                };
+
+                // Ground is given by whoever can give it.
+                let (give_a, give_b) = match (a.fixed, b.fixed) {
+                    (true, true) => (0.0, 0.0),
+                    (true, false) => (0.0, 1.0),
+                    (false, true) => (1.0, 0.0),
+                    (false, false) => (0.5, 0.5),
+                };
+                bodies[i].pos -= axis * (overlap * give_a);
+                bodies[j].pos += axis * (overlap * give_b);
+
+                // Whichever of them was driving into the other loses most of
+                // what it was carrying. Scaled by how head-on it was, so sliding
+                // along somebody costs nothing and running them down costs a
+                // lot -- the same shape as the hill in `sim::step_vehicle`.
+                let into_a = axis.dot(a.vel.normalize_or_zero()).clamp(0.0, 1.0);
+                let into_b = (-axis).dot(b.vel.normalize_or_zero()).clamp(0.0, 1.0);
+                bodies[i].speed_scale *= 1.0 - sim::RAM_SPEED_LOSS * into_a;
+                bodies[j].speed_scale *= 1.0 - sim::RAM_SPEED_LOSS * into_b;
+
+                // Your own two vehicles bump each other constantly; only an
+                // enemy costs hull.
+                if a.player == b.player {
+                    continue;
+                }
+                // How fast the gap was actually shrinking. Two tanks driving at
+                // each other close at twice their own speed; a tank running down
+                // a parked one closes at its own.
+                let closing = (a.vel - b.vel).dot(axis);
+                if closing <= sim::IMPACT_THRESHOLD {
+                    continue;
+                }
+                let damage = (closing - sim::IMPACT_THRESHOLD) * sim::RAM_DAMAGE;
+                // Both pay the same, each on the face that met the other. The
+                // partner is named as the attacker, so running somebody down is
+                // a kill you get credit for.
+                rams.push((a.player, a.slot, damage, b.player, axis.to_angle()));
+                rams.push((b.player, b.slot, damage, a.player, (-axis).to_angle()));
+            }
+        }
+
+        for body in &bodies {
+            let Some(p) = self.players.get_mut(body.player as usize).and_then(Option::as_mut)
+            else {
+                continue;
+            };
+            let Some(v) = p.vehicle_mut(body.slot) else { continue };
+            // A push can put a hull past the edge of the world, or into a hill.
+            // The wall is clamped here because nothing else will; a hill is left
+            // to `step_vehicle`, which shoves everything clear at the top of the
+            // next tick anyway.
+            let (lo, hi) = (body.radius, world::WORLD_SIZE - body.radius);
+            v.mv.pos = Vec2::new(body.pos.x.clamp(lo, hi), body.pos.y.clamp(lo, hi));
+            v.mv.speed *= body.speed_scale;
+        }
+
+        for (player, slot, damage, attacker, bearing) in rams {
+            self.damage_vehicle(player, slot, damage, attacker, bearing);
         }
     }
 
@@ -1328,8 +1485,9 @@ mod tests {
     ///
     /// Otherwise disabling one achieves nothing: the attacker has to cross the
     /// distance to the wreck *and then* hold it for `CAPTURE_TIME`, while the
-    /// defender only has to already be standing there -- which they are, since a
-    /// tank spawns and respawns within `CAPTURE_RADIUS` of its own harvester.
+    /// defender only has to drive back to it. A tank now spawns well outside
+    /// `CAPTURE_RADIUS` of its own harvester, so that return trip is real, but
+    /// the repair itself still has to be the slower half of the exchange.
     #[test]
     fn a_rescue_takes_longer_than_a_capture() {
         let mut g = two_player_game();
@@ -1350,6 +1508,200 @@ mod tests {
             seconds > sim::CAPTURE_TIME,
             "rescue took {seconds:.1}s against a {:.1}s capture, so a wreck can never be taken",
             sim::CAPTURE_TIME
+        );
+    }
+
+    /// Two hulls cannot end a tick sharing ground, and meeting at speed costs
+    /// both of them.
+    #[test]
+    fn two_tanks_that_run_into_each_other_bounce_apart_and_both_pay() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        let touching = sim::tuning(VehicleKind::Tank).radius * 2.0;
+        let top = sim::tuning(VehicleKind::Tank).max_speed;
+
+        // Nose to nose and well inside each other, closing at twice top speed.
+        {
+            let a = g.player_mut(0).unwrap().tank.as_mut().unwrap();
+            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: top };
+        }
+        {
+            let b = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+            b.mv = MoveState {
+                pos: Vec2::new(100.0 + touching * 0.5, 100.0),
+                yaw: std::f32::consts::PI,
+                speed: top,
+            };
+        }
+        let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
+
+        g.step(TICK_DT);
+
+        let a = g.player(0).unwrap().tank.as_ref().unwrap();
+        let b = g.player(1).unwrap().tank.as_ref().unwrap();
+        assert!(
+            a.mv.pos.distance(b.mv.pos) >= touching - 1e-3,
+            "hulls ended {:.2} apart, inside the {touching:.2} they occupy",
+            a.mv.pos.distance(b.mv.pos)
+        );
+        assert!(a.shield < full && b.shield < full, "a head-on meeting has to cost both sides");
+        assert!(a.mv.speed < top && b.mv.speed < top, "and take the run out of both of them");
+    }
+
+    /// Contact at a crawl is how you park next to somebody, not an attack.
+    #[test]
+    fn hulls_that_barely_touch_cost_nobody_anything() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        let touching = sim::tuning(VehicleKind::Tank).radius * 2.0;
+
+        {
+            let a = g.player_mut(0).unwrap().tank.as_mut().unwrap();
+            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: 2.0 };
+        }
+        {
+            let b = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+            b.mv = MoveState {
+                pos: Vec2::new(100.0 + touching - 0.4, 100.0),
+                yaw: 0.0,
+                speed: 0.0,
+            };
+        }
+        let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
+
+        g.step(TICK_DT);
+
+        assert_eq!(g.player(0).unwrap().tank.as_ref().unwrap().shield, full);
+        assert_eq!(g.player(1).unwrap().tank.as_ref().unwrap().shield, full);
+        let a = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+        let b = g.player(1).unwrap().tank.as_ref().unwrap().mv.pos;
+        assert!(a.distance(b) >= touching - 1e-3, "they still may not overlap");
+    }
+
+    /// A wreck is scenery: solid, but it neither moves nor takes any more
+    /// punishment. Without this a captor could shove the harvester they came for
+    /// out from under themselves, or finish it off by driving at it.
+    #[test]
+    fn a_wreck_is_solid_but_takes_nothing_and_gives_no_ground() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        let hull = g.player(0).unwrap().harvester.as_ref().unwrap().hull;
+
+        // Straight through the middle of it at full speed.
+        {
+            let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+            t.mv = MoveState {
+                pos: wreck,
+                yaw: 0.0,
+                speed: sim::tuning(VehicleKind::Tank).max_speed,
+            };
+        }
+        g.step(TICK_DT);
+
+        let h = g.player(0).unwrap().harvester.as_ref().unwrap();
+        assert_eq!(h.mv.pos, wreck, "a wreck has no engine to be shoved with");
+        assert_eq!(h.hull, hull, "and nothing left to lose");
+
+        let touching =
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+        let tank = g.player(1).unwrap().tank.as_ref().unwrap().mv.pos;
+        assert!(
+            tank.distance(wreck) >= touching - 1e-3,
+            "the tank ended {:.2} from the wreck, inside it",
+            tank.distance(wreck)
+        );
+    }
+
+    /// The reach has to survive hulls no longer overlapping.
+    ///
+    /// [`sim::CAPTURE_RADIUS`] used to be wide enough that a tank covered its
+    /// own harvester from where it spawned. Now that it is close to touching, it
+    /// has to clear the distance two hulls are held apart at -- otherwise a tank
+    /// pressed right up against a wreck would still be out of range and no
+    /// capture could ever complete.
+    #[test]
+    fn a_tank_pressed_against_a_wreck_is_in_range_to_take_it() {
+        let touching =
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+        assert!(
+            sim::CAPTURE_RADIUS > touching,
+            "hulls are held {touching} apart, so a {} reach can never be met",
+            sim::CAPTURE_RADIUS
+        );
+
+        // And in play: an enemy tank driven up against a wreck, never placed on
+        // top of it, still takes it.
+        let mut g = two_player_game();
+        g.hills.clear();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        {
+            let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0 };
+        }
+        for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
+            g.step(TICK_DT);
+        }
+        assert!(g.player(0).unwrap().eliminated, "an undefended wreck at arm's length must fall");
+    }
+
+    /// Driving into a hillside is a crash, and it is charged to the driver
+    /// rather than counting as anybody's kill.
+    #[test]
+    fn a_tank_driven_into_a_hill_at_speed_loses_hull() {
+        let mut g = two_player_game();
+        let start = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+        g.hills = vec![Hill { pos: start + Vec2::new(40.0, 0.0), radius: 8.0 }];
+        {
+            let t = g.player_mut(0).unwrap().tank.as_mut().unwrap();
+            t.mv.yaw = 0.0;
+        }
+        let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
+
+        for tick in 0..60u32 {
+            g.set_input(
+                0,
+                InputFrame {
+                    tick: tick + 1,
+                    controlling: VehicleSlot::Tank,
+                    throttle: 1.0,
+                    aim: 0.0,
+                    ..Default::default()
+                },
+            );
+            g.step(TICK_DT);
+        }
+        assert!(
+            g.player(0).unwrap().tank.as_ref().unwrap().shield < full,
+            "a full-speed run into a hillside has to cost something"
+        );
+
+        // Nosing up to the same hill at a crawl does not.
+        let mut gentle = two_player_game();
+        gentle.hills = vec![Hill { pos: start + Vec2::new(12.0, 0.0), radius: 8.0 }];
+        {
+            let t = gentle.player_mut(0).unwrap().tank.as_mut().unwrap();
+            t.mv.yaw = 0.0;
+        }
+        for tick in 0..60u32 {
+            gentle.set_input(
+                0,
+                InputFrame {
+                    tick: tick + 1,
+                    controlling: VehicleSlot::Tank,
+                    throttle: 0.2,
+                    aim: 0.0,
+                    ..Default::default()
+                },
+            );
+            gentle.step(TICK_DT);
+        }
+        assert_eq!(
+            gentle.player(0).unwrap().tank.as_ref().unwrap().shield,
+            full,
+            "parking against a slope is not a crash"
         );
     }
 

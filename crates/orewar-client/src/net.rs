@@ -322,6 +322,15 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
         GameEvent::PurchaseRejected { powerup, reason } => {
             format!("Cannot buy {}: {}", powerup.name(), reason.describe())
         }
+        // A tank lost to a hillside is charged to its own driver, so `by` is
+        // the victim. Saying somebody destroyed their own tank reads as a bug.
+        GameEvent::TankDestroyed { player, by } if by == player => {
+            if Some(player) == me {
+                "You wrecked your own tank".to_string()
+            } else {
+                format!("{} wrecked their own tank", name(player))
+            }
+        }
         GameEvent::TankDestroyed { player, by } => {
             if Some(player) == me {
                 format!("Your tank was destroyed by {}", name(by))

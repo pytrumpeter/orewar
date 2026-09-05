@@ -157,7 +157,10 @@ impl Prediction {
             self.history.clear();
             return;
         }
-        sim::step_vehicle(
+        // Impacts are the server's to charge for, and it does not tell the
+        // client about the other vehicles at all, so the outcome is nothing this
+        // side can act on.
+        let _ = sim::step_vehicle(
             &mut self.state,
             frame.throttle,
             frame.steer,
@@ -198,7 +201,7 @@ impl Prediction {
         let replay: Vec<InputFrame> =
             self.history.iter().copied().filter(|f| f.controlling == slot).collect();
         for frame in replay {
-            sim::step_vehicle(
+            let _ = sim::step_vehicle(
                 &mut self.state,
                 frame.throttle,
                 frame.steer,
@@ -612,7 +615,15 @@ mod tests {
         // The server confirms tick 4 and reports where it had the tank then.
         let mut authority = MoveState::default();
         for _ in 1..=4 {
-            sim::step_vehicle(&mut authority, 1.0, 0.0, VehicleSlot::Tank.kind(), 0, &hills, TICK_DT);
+            let _ = sim::step_vehicle(
+                &mut authority,
+                1.0,
+                0.0,
+                VehicleSlot::Tank.kind(),
+                0,
+                &hills,
+                TICK_DT,
+            );
         }
         p.reconcile(
             &VehicleSnapshot {

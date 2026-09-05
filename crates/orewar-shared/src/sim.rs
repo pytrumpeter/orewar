@@ -112,6 +112,19 @@ pub struct MoveState {
     pub speed: f32,
 }
 
+/// What a step ran into, for a caller that needs to do more than move.
+///
+/// [`step_vehicle`] stays a pure function of movement and never applies damage:
+/// damage is the server's to decide, and the client runs this same function to
+/// predict its own vehicle. So a collision is reported back rather than acted
+/// on, and the client is free to ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepOutcome {
+    /// Speed carried into terrain this tick, measured before the impact bled it
+    /// off. Zero when nothing was hit.
+    pub terrain_impact: f32,
+}
+
 /// Advances a vehicle by one tick.
 ///
 /// `throttle` and `steer` are each clamped to `-1..=1`. Both vehicles are
@@ -121,6 +134,7 @@ pub struct MoveState {
 /// the one function that owns where a vehicle ends up. The client predicts with
 /// it and the server decides with it; if terrain were applied outside, one side
 /// could forget and every hill would become a rubber-banding bug.
+#[must_use = "the outcome reports impacts the caller may need to charge for"]
 pub fn step_vehicle(
     state: &mut MoveState,
     throttle: f32,
@@ -129,7 +143,8 @@ pub fn step_vehicle(
     powerups: u16,
     hills: &[Hill],
     dt: f32,
-) {
+) -> StepOutcome {
+    let mut outcome = StepOutcome::default();
     let t = tuning(kind);
     let throttle = throttle.clamp(-1.0, 1.0);
     let steer = steer.clamp(-1.0, 1.0);
@@ -168,7 +183,15 @@ pub fn step_vehicle(
         // into a face loses the same 60% a wall takes; grazing one barely costs
         // anything, which is what lets a hill be steered around rather than
         // becoming flypaper for anything that brushes it.
-        let head_on = (-out).dot(Vec2::from_angle(state.yaw)).clamp(0.0, 1.0);
+        // Which way the hull is actually travelling, not which way it faces:
+        // reversing into a slope is the same collision as driving into one,
+        // and under turbo a tank backs up faster than the threshold that
+        // hurts. Taking yaw alone made backwards a free direction.
+        let travel = Vec2::from_angle(state.yaw) * state.speed.signum();
+        let head_on = (-out).dot(travel).clamp(0.0, 1.0);
+        // Read before the impact bleeds it off, and keep the worst of the tick:
+        // this is what the server charges the hull for.
+        outcome.terrain_impact = outcome.terrain_impact.max(state.speed.abs() * head_on);
         state.speed *= 1.0 - 0.6 * head_on;
     }
 
@@ -185,6 +208,8 @@ pub fn step_vehicle(
         state.pos.y = state.pos.y.clamp(lo, hi);
         state.speed *= 0.4;
     }
+
+    outcome
 }
 
 /// Rotates a turret toward `desired`, respecting its slew rate.
@@ -214,6 +239,30 @@ pub const MISSILE_COOLDOWN: f32 = 2.4;
 pub const MISSILE_SEEK_CONE: f32 = 1.05;
 pub const MISSILE_SEEK_RANGE: f32 = 120.0;
 
+// ---------------------------------------------------------------------------
+// Impacts
+// ---------------------------------------------------------------------------
+
+/// Speed at which running into something starts to hurt.
+///
+/// Below this a bump is just a bump: nosing up to a hill, or shunting a hull
+/// out of the way at low speed, costs nothing. Half a tank's top speed, so it
+/// takes a deliberate run-up.
+pub const IMPACT_THRESHOLD: f32 = 9.5;
+
+/// Hull damage per unit of speed above [`IMPACT_THRESHOLD`] when a vehicle
+/// drives into terrain. A tank at full tilt into a hillside pays about what one
+/// shell costs it.
+pub const TERRAIN_IMPACT_DAMAGE: f32 = 2.0;
+
+/// Damage per unit of *closing* speed above [`IMPACT_THRESHOLD`] when two
+/// vehicles meet, charged to both of them. Lower than terrain because two tanks
+/// driving at each other close at twice their own speed.
+pub const RAM_DAMAGE: f32 = 0.6;
+
+/// How much of the speed a hull was carrying into another hull it loses.
+pub const RAM_SPEED_LOSS: f32 = 0.55;
+
 /// Seconds without taking damage before shields begin to regenerate.
 pub const SHIELD_REGEN_DELAY: f32 = 4.0;
 
@@ -231,7 +280,13 @@ pub const HARVEST_MAX_SPEED: f32 = 4.0;
 pub const UNLOAD_RATE: f32 = 50.0;
 
 // Capture.
-pub const CAPTURE_RADIUS: f32 = 11.0;
+/// How close a tank has to be to a disabled harvester to work on it.
+///
+/// Just past touching: the two hulls meet at 2.4 + 2.9 = 5.3 and vehicles no
+/// longer share space, so anything at or below that could never be reached.
+/// Small on purpose -- at 11.0 a tank covered its own harvester from where it
+/// spawned, so a defender never had to do anything to deny a capture.
+pub const CAPTURE_RADIUS: f32 = 6.5;
 /// Seconds an enemy tank must hold station to take a disabled harvester.
 pub const CAPTURE_TIME: f32 = 4.0;
 /// How fast an owner's tank repairs their own disabled harvester.
@@ -301,6 +356,25 @@ pub fn segment_circle_hit(a: Vec2, b: Vec2, center: Vec2, radius: f32) -> Option
     if (0.0..=1.0).contains(&t2) { Some(t2) } else { None }
 }
 
+/// How far two overlapping circles have to move apart, and along which axis.
+///
+/// `None` when they are already clear. The axis points from `a` toward `b`, so
+/// `a` backs off along it and `b` moves forward; how the distance is split
+/// between them is the caller's call, because a wreck gives no ground.
+pub fn overlap_push(a: Vec2, ra: f32, b: Vec2, rb: f32) -> Option<(Vec2, f32)> {
+    let touching = ra + rb;
+    let offset = b - a;
+    let dist = offset.length();
+    if dist >= touching {
+        return None;
+    }
+    // Exactly co-located leaves no axis to separate along. Pick one rather than
+    // dividing by zero and welding the two hulls together for the rest of the
+    // match.
+    let axis = if dist > 1e-4 { offset / dist } else { Vec2::new(1.0, 0.0) };
+    Some((axis, touching - dist))
+}
+
 /// Earliest fraction along `a -> b` at which it runs into a hill.
 ///
 /// Swept for the same reason vehicle hits are: a bullet crosses 4.5 units in
@@ -326,7 +400,7 @@ mod tests {
     fn a_vehicle_drives_along_its_heading() {
         let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0 };
         for _ in 0..60 {
-            step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
         }
         // Facing +X at yaw 0, so it must have moved in +X and nowhere else.
         assert!(s.pos.x > 110.0, "expected forward motion, got {:?}", s.pos);
@@ -340,7 +414,15 @@ mod tests {
             let mut s = MoveState::default();
             s.pos = vec2(100.0, 100.0);
             for _ in 0..120 {
-                step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, powerups, &[], world::TICK_DT);
+                let _ = step_vehicle(
+                    &mut s,
+                    1.0,
+                    0.0,
+                    VehicleKind::Tank,
+                    powerups,
+                    &[],
+                    world::TICK_DT,
+                );
             }
             s.speed
         };
@@ -353,7 +435,7 @@ mod tests {
     fn vehicles_cannot_leave_the_field() {
         let mut s = MoveState { pos: vec2(10.0, 10.0), yaw: std::f32::consts::PI, speed: 0.0 };
         for _ in 0..600 {
-            step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
         }
         let r = tuning(VehicleKind::Tank).radius;
         assert!(s.pos.x >= r - 1e-3 && s.pos.x <= WORLD_SIZE - r + 1e-3, "{:?}", s.pos);
@@ -366,7 +448,7 @@ mod tests {
         let hill = Hill { pos: vec2(140.0, 100.0), radius: 9.0 };
         let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0 };
         for _ in 0..300 {
-            step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
         }
         let clear = hill.radius + tuning(VehicleKind::Tank).radius;
         assert!(
@@ -388,7 +470,7 @@ mod tests {
         // Offset enough that the hull catches the shoulder rather than the face.
         let mut s = MoveState { pos: vec2(100.0, 110.0), yaw: 0.0, speed: 0.0 };
         for _ in 0..150 {
-            step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
         }
         assert!(s.pos.distance(hill.pos) >= clear - 1e-3, "ended inside the hill: {:?}", s.pos);
         assert!(s.pos.x > hill.pos.x + hill.radius, "should have got past, at {:?}", s.pos);
@@ -407,7 +489,7 @@ mod tests {
     fn a_vehicle_inside_a_hill_is_pushed_clear() {
         let hill = Hill { pos: vec2(100.0, 100.0), radius: 9.0 };
         let mut s = MoveState { pos: hill.pos, yaw: 0.7, speed: 0.0 };
-        step_vehicle(&mut s, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+        let _ = step_vehicle(&mut s, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
         let clear = hill.radius + tuning(VehicleKind::Tank).radius;
         assert!((s.pos.distance(hill.pos) - clear).abs() < 1e-3, "{:?}", s.pos);
     }
@@ -422,6 +504,84 @@ mod tests {
         assert!(segment_hill_hit(vec2(0.0, 0.0), vec2(100.0, 0.0), &[]).is_none());
     }
 
+    /// Terrain impact has to reflect how hard the hill was actually met, or
+    /// the server cannot tell a crash from parking against a slope.
+    #[test]
+    fn a_hill_reports_how_hard_it_was_hit() {
+        let hill = Hill { pos: vec2(140.0, 100.0), radius: 9.0 };
+
+        // Open ground reports nothing at all.
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0 };
+        let mut worst: f32 = 0.0;
+        for _ in 0..60 {
+            let out = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
+            worst = worst.max(out.terrain_impact);
+        }
+        assert_eq!(worst, 0.0, "nothing was hit");
+
+        // Straight into the face at speed: the impact is most of the top speed.
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0 };
+        let mut worst: f32 = 0.0;
+        for _ in 0..90 {
+            let out = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            worst = worst.max(out.terrain_impact);
+        }
+        assert!(
+            worst > IMPACT_THRESHOLD,
+            "a full-speed crash reported {worst}, under the {IMPACT_THRESHOLD} that hurts"
+        );
+
+        // Clipping a shoulder is not a crash.
+        let mut s = MoveState { pos: vec2(100.0, 110.0), yaw: 0.0, speed: 0.0 };
+        let mut worst: f32 = 0.0;
+        for _ in 0..150 {
+            let out = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            worst = worst.max(out.terrain_impact);
+        }
+        assert!(worst < IMPACT_THRESHOLD, "a graze reported {worst} and would have cost hull");
+    }
+
+    /// Backing into a hillside is the same crash as driving into one.
+    ///
+    /// Turbo puts a tank's reverse above [`IMPACT_THRESHOLD`], so reading the
+    /// impact off the hull's facing rather than off where it was actually going
+    /// left backwards as a free direction.
+    #[test]
+    fn reversing_into_a_hill_is_still_a_crash() {
+        let hill = Hill { pos: vec2(60.0, 100.0), radius: 9.0 };
+        let turbo = crate::world::PowerUp::Turbo.bit();
+
+        // Facing away from the hill and reversing straight into it.
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0 };
+        let mut worst: f32 = 0.0;
+        for _ in 0..90 {
+            let out =
+                step_vehicle(&mut s, -1.0, 0.0, VehicleKind::Tank, turbo, &[hill], world::TICK_DT);
+            worst = worst.max(out.terrain_impact);
+        }
+        assert!(
+            worst > IMPACT_THRESHOLD,
+            "backing into a hill under turbo reported {worst}, so reverse costs nothing"
+        );
+    }
+
+    #[test]
+    fn overlapping_hulls_are_pushed_apart_along_their_axis() {
+        let (ra, rb) = (2.4f32, 2.9f32);
+        // Clear of each other: nothing to do.
+        assert!(overlap_push(vec2(0.0, 0.0), ra, vec2(20.0, 0.0), rb).is_none());
+        assert!(overlap_push(vec2(0.0, 0.0), ra, vec2(ra + rb, 0.0), rb).is_none());
+
+        let (axis, overlap) = overlap_push(vec2(0.0, 0.0), ra, vec2(4.0, 0.0), rb).unwrap();
+        assert!((axis - vec2(1.0, 0.0)).length() < 1e-5, "axis points at the other hull");
+        assert!((overlap - (ra + rb - 4.0)).abs() < 1e-5, "overlap is the shortfall");
+
+        // Exactly co-located still separates rather than dividing by zero.
+        let (axis, overlap) = overlap_push(vec2(5.0, 5.0), ra, vec2(5.0, 5.0), rb).unwrap();
+        assert!(axis.length() > 0.99, "a usable axis even with no direction to take");
+        assert!((overlap - (ra + rb)).abs() < 1e-5);
+    }
+
     #[test]
     fn stepping_is_deterministic() {
         let run = || {
@@ -429,7 +589,15 @@ mod tests {
             for i in 0..500 {
                 let throttle = if i % 7 == 0 { -1.0 } else { 1.0 };
                 let steer = ((i % 13) as f32 - 6.0) / 6.0;
-                step_vehicle(&mut s, throttle, steer, VehicleKind::Harvester, 0, &[], world::TICK_DT);
+                let _ = step_vehicle(
+                    &mut s,
+                    throttle,
+                    steer,
+                    VehicleKind::Harvester,
+                    0,
+                    &[],
+                    world::TICK_DT,
+                );
             }
             s
         };
