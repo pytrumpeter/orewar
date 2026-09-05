@@ -263,6 +263,9 @@ fn handle_packet(
             for message in incoming.reliable {
                 match ClientMessage::from_slice(&message) {
                     Ok(ClientMessage::Purchase(p)) => game.purchase(player_id, p),
+                    Ok(ClientMessage::SetHarvesterMode(m)) => {
+                        game.set_harvester_mode(player_id, m)
+                    }
                     Ok(ClientMessage::Leave) => {
                         println!("player {player_id} left");
                         game.disconnect(player_id);

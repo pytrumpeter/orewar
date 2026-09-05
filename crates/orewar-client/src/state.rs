@@ -23,8 +23,8 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 use orewar_shared::math::{self, Vec2 as SimVec2};
 use orewar_shared::protocol::{
-    GameStatus, HitFx, InputFrame, PlayerInfo, ProjectileKind, Snapshot, VehicleSlot,
-    VehicleSnapshot,
+    GameStatus, HarvesterMode, HitFx, InputFrame, PlayerInfo, ProjectileKind, Snapshot,
+    VehicleSlot, VehicleSnapshot,
 };
 use orewar_shared::sim::{self, MoveState};
 use orewar_shared::world::{self, Hill, MAX_PLAYERS, OreDeposit, TICK_DT};
@@ -106,6 +106,8 @@ pub struct RenderPlayer {
     pub powerups: u16,
     pub missiles: u8,
     pub captures: u8,
+    /// What the harvester does when nobody is driving it.
+    pub harvester_mode: HarvesterMode,
     pub tank: Option<RenderVehicle>,
     pub harvester: Option<RenderVehicle>,
     /// Absent while the emplacement is rubble.
@@ -502,6 +504,7 @@ impl GameState {
                             powerups: pb.powerups,
                             missiles: pb.missiles,
                             captures: pb.captures,
+                            harvester_mode: pb.harvester_mode,
                             tank,
                             harvester,
                             sentinel,
@@ -542,6 +545,7 @@ impl GameState {
                                 powerups: p.powerups,
                                 missiles: p.missiles,
                                 captures: p.captures,
+                                harvester_mode: p.harvester_mode,
                                 tank: p.tank.as_ref().map(RenderVehicle::from_snapshot),
                                 harvester: p.harvester.as_ref().map(RenderVehicle::from_snapshot),
                                 sentinel: p.sentinel.map(|s| RenderSentinel {

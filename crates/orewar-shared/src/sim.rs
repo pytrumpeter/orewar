@@ -7,7 +7,7 @@
 //! module must stay free of wall-clock time, randomness, and floating frame
 //! deltas.
 
-use crate::math::{Vec2, angle_approach, approach, wrap_angle};
+use crate::math::{Vec2, angle_approach, angle_delta, approach, wrap_angle};
 use crate::world::{self, Hill, PowerUp, WORLD_SIZE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,6 +388,87 @@ pub fn overlap_push(a: Vec2, ra: f32, b: Vec2, rb: f32) -> Option<(Vec2, f32)> {
     Some((axis, touching - dist))
 }
 
+// ---------------------------------------------------------------------------
+// Autopilot
+// ---------------------------------------------------------------------------
+
+/// Cruise throttle for an unattended harvester, as a fraction of full.
+///
+/// Deliberately slow. An autopilot harvester is a floor on your income, not a
+/// replacement for driving one -- taking it over yourself should be visibly
+/// worth doing. It also keeps the cruise well under [`IMPACT_THRESHOLD`], so a
+/// harvester left to itself can never crash into a hillside hard enough to hurt.
+pub const AUTOPILOT_CRUISE: f32 = 0.4;
+
+/// How wide of a hill the autopilot tries to pass.
+pub const AUTOPILOT_CLEARANCE: f32 = 4.0;
+
+/// Below this the autopilot decides it is wedged and backs off.
+pub const AUTOPILOT_STALL_SPEED: f32 = 0.5;
+
+/// Heading to actually steer for, given where the autopilot wants to end up.
+///
+/// The direct bearing, unless a hill sits across it -- then the tangent past the
+/// side the target is already on. Driving straight at a target behind a hill
+/// parks the harvester against the slope indefinitely: the push-out in
+/// [`step_vehicle`] holds it clear, and it drives straight back in.
+pub fn autopilot_bearing(from: Vec2, to: Vec2, hills: &[Hill]) -> f32 {
+    let direct = (to - from).to_angle();
+    let travel = from.distance(to);
+
+    // The nearest hill that the path actually crosses. Only the first one
+    // matters; rounding it changes the picture for whatever comes after.
+    let mut blocking: Option<(f32, Vec2, f32)> = None;
+    for hill in hills {
+        let radius = hill.radius + AUTOPILOT_CLEARANCE;
+        let offset = hill.pos - from;
+        let along = offset.dot(Vec2::from_angle(direct));
+        // Behind us, or beyond the target: not in the way.
+        if along <= 0.0 || along - radius > travel {
+            continue;
+        }
+        let lateral = (offset.length_squared() - along * along).max(0.0).sqrt();
+        if lateral >= radius {
+            continue;
+        }
+        if blocking.is_none_or(|(best, _, _)| along < best) {
+            blocking = Some((along, hill.pos, radius));
+        }
+    }
+
+    let Some((_, centre, radius)) = blocking else { return direct };
+
+    let offset = centre - from;
+    let distance = offset.length();
+    let to_hill = offset.to_angle();
+    if distance <= radius {
+        // Already inside the margin: the only useful heading is straight out.
+        return wrap_angle(to_hill + std::f32::consts::PI);
+    }
+    // Pass on the side the target is already on, so rounding the hill makes
+    // progress instead of doubling the journey.
+    let side = if angle_delta(to_hill, direct) >= 0.0 { 1.0 } else { -1.0 };
+    wrap_angle(to_hill + side * (radius / distance).clamp(-1.0, 1.0).asin())
+}
+
+/// Throttle and steer for a harvester driving itself to `target`.
+///
+/// Returns neutral once inside `stop_within`, so the vehicle brakes and settles
+/// under [`HARVEST_MAX_SPEED`] rather than circling the thing it came for.
+pub fn autopilot(state: &MoveState, target: Vec2, stop_within: f32, hills: &[Hill]) -> (f32, f32) {
+    if state.pos.distance(target) <= stop_within {
+        return (0.0, 0.0);
+    }
+    let bearing = autopilot_bearing(state.pos, target, hills);
+    let turn = angle_delta(state.yaw, bearing);
+    // Proportional, and saturating well before the error is large, so it holds
+    // a line instead of weaving.
+    let steer = (turn * 2.0).clamp(-1.0, 1.0);
+    // Straighten up before building speed; a hard turn under power swings wide.
+    let throttle = if turn.abs() > 1.0 { 0.0 } else { AUTOPILOT_CRUISE };
+    (throttle, steer)
+}
+
 /// Earliest fraction along `a -> b` at which it runs into a hill.
 ///
 /// Swept for the same reason vehicle hits are: a bullet crosses 4.5 units in
@@ -576,6 +657,69 @@ mod tests {
             worst > IMPACT_THRESHOLD,
             "backing into a hill under turbo reported {worst}, so reverse costs nothing"
         );
+    }
+
+    #[test]
+    fn the_autopilot_steers_straight_at_an_unobstructed_target() {
+        let from = vec2(100.0, 100.0);
+        let to = vec2(160.0, 100.0);
+        assert!(autopilot_bearing(from, to, &[]).abs() < 1e-4, "should be due +x");
+
+        // A hill behind, or off to the side, is not in the way.
+        let behind = Hill { pos: vec2(60.0, 100.0), radius: 10.0 };
+        let aside = Hill { pos: vec2(130.0, 140.0), radius: 10.0 };
+        let bearing = autopilot_bearing(from, to, &[behind, aside]);
+        assert!(bearing.abs() < 1e-4, "nothing crosses the path, got {bearing}");
+    }
+
+    /// The case that would otherwise wedge a harvester forever: a hill sitting
+    /// squarely between it and where it is going.
+    #[test]
+    fn the_autopilot_rounds_a_hill_on_the_way_to_its_target() {
+        let hill = Hill { pos: vec2(130.0, 100.0), radius: 10.0 };
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0 };
+        let target = vec2(180.0, 100.0);
+
+        // Straight through the middle, so the direct bearing is useless.
+        let bearing = autopilot_bearing(s.pos, target, &[hill]);
+        assert!(bearing.abs() > 0.2, "should aim off the hill, got {bearing}");
+
+        // And driving on it actually arrives.
+        for _ in 0..900 {
+            let (throttle, steer) = autopilot(&s, target, 6.0, &[hill]);
+            let _ = step_vehicle(
+                &mut s,
+                throttle,
+                steer,
+                VehicleKind::Harvester,
+                0,
+                &[hill],
+                world::TICK_DT,
+            );
+            if s.pos.distance(target) <= 6.0 {
+                break;
+            }
+        }
+        assert!(
+            s.pos.distance(target) <= 6.0,
+            "ended {:.1} away, so it never got round the hill",
+            s.pos.distance(target)
+        );
+    }
+
+    #[test]
+    fn the_autopilot_stops_when_it_arrives() {
+        let s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0 };
+        let (throttle, steer) = autopilot(&s, vec2(103.0, 100.0), 6.0, &[]);
+        assert_eq!((throttle, steer), (0.0, 0.0), "inside the stop radius it coasts");
+    }
+
+    /// The cruise has to stay under the speed that hurts, or a harvester left
+    /// to itself would grind its own hull away on the scenery.
+    #[test]
+    fn the_autopilot_cruises_too_slowly_to_hurt_itself() {
+        let top = tuning(VehicleKind::Harvester).max_speed;
+        assert!(top * AUTOPILOT_CRUISE < IMPACT_THRESHOLD);
     }
 
     #[test]

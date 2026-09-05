@@ -142,6 +142,8 @@ pub enum ClientMessage {
     /// the authority but takes no side -- so the alternative would be inventing
     /// one, and a four-player game around one screen does not need it.
     NewGame,
+    /// Reliable. Changes what the harvester does when left to itself.
+    SetHarvesterMode(HarvesterMode),
 }
 
 impl Encode for ClientMessage {
@@ -153,6 +155,9 @@ impl Encode for ClientMessage {
             }
             ClientMessage::Purchase(p) => {
                 w.u8(2).u8(*p as u8);
+            }
+            ClientMessage::SetHarvesterMode(m) => {
+                w.u8(5).u8(*m as u8);
             }
             ClientMessage::Leave => {
                 w.u8(3);
@@ -177,6 +182,13 @@ impl Decode for ClientMessage {
             }
             3 => ClientMessage::Leave,
             4 => ClientMessage::NewGame,
+            5 => {
+                let raw = r.u8()?;
+                ClientMessage::SetHarvesterMode(
+                    HarvesterMode::from_u8(raw)
+                        .ok_or(DecodeError::BadTag("HarvesterMode", raw))?,
+                )
+            }
             other => return Err(DecodeError::BadTag("ClientMessage", other)),
         })
     }
@@ -237,6 +249,34 @@ impl Decode for VehicleSnapshot {
 /// Bytes one `VehicleSnapshot` occupies on the wire.
 pub const VEHICLE_SNAPSHOT_BYTES: usize = 22;
 
+/// What an unattended harvester does with itself.
+///
+/// Only consulted while the player is driving something else; taking the
+/// harvester over with TAB overrides whatever is selected, and letting go
+/// resumes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HarvesterMode {
+    /// Work the field: nearest deposit, fill up, home, unload, repeat.
+    #[default]
+    Auto = 0,
+    /// Drive home and wait there.
+    Home = 1,
+    /// Hold station wherever it is.
+    Stop = 2,
+}
+
+impl HarvesterMode {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(HarvesterMode::Auto),
+            1 => Some(HarvesterMode::Home),
+            2 => Some(HarvesterMode::Stop),
+            _ => None,
+        }
+    }
+}
+
 /// The gun emplacement in a player's home corner.
 ///
 /// Its position never travels: it is fixed by [`crate::world::sentinel_position`]
@@ -280,6 +320,10 @@ pub struct PlayerSnapshot {
     pub harvester: Option<VehicleSnapshot>,
     /// Absent while the emplacement is rubble and rebuilding.
     pub sentinel: Option<SentinelSnapshot>,
+    /// What the harvester does when nobody is driving it. Sent back so the
+    /// control panel shows what the server actually has, not what this client
+    /// last asked for.
+    pub harvester_mode: HarvesterMode,
 }
 
 impl Encode for PlayerSnapshot {
@@ -296,6 +340,7 @@ impl Encode for PlayerSnapshot {
         w.u16(self.powerups);
         w.u8(self.missiles);
         w.u8(self.captures);
+        w.u8(self.harvester_mode as u8);
         if let Some(v) = &self.tank {
             v.encode(w);
         }
@@ -317,6 +362,9 @@ impl Decode for PlayerSnapshot {
         let powerups = r.u16()?;
         let missiles = r.u8()?;
         let captures = r.u8()?;
+        let raw_mode = r.u8()?;
+        let harvester_mode =
+            HarvesterMode::from_u8(raw_mode).ok_or(DecodeError::BadTag("HarvesterMode", raw_mode))?;
         let tank = if flags & 0b100 != 0 { Some(r.read()?) } else { None };
         let harvester = if flags & 0b1000 != 0 { Some(r.read()?) } else { None };
         let sentinel = if flags & 0b1_0000 != 0 { Some(r.read()?) } else { None };
@@ -329,6 +377,7 @@ impl Decode for PlayerSnapshot {
             powerups,
             missiles,
             captures,
+            harvester_mode,
             tank,
             harvester,
             sentinel,
@@ -337,7 +386,7 @@ impl Decode for PlayerSnapshot {
 }
 
 /// Fixed bytes per player, before optional vehicles.
-pub const PLAYER_SNAPSHOT_FIXED_BYTES: usize = 14;
+pub const PLAYER_SNAPSHOT_FIXED_BYTES: usize = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -861,6 +910,7 @@ mod tests {
             tank: Some(sample_vehicle()),
             harvester: Some(sample_vehicle()),
             sentinel: Some(SentinelSnapshot { hull: 118.5, turret_yaw: 2.0 }),
+            harvester_mode: HarvesterMode::Home,
         }
     }
 
@@ -906,6 +956,8 @@ mod tests {
             ClientMessage::Purchase(PowerUp::AutoTurret),
             ClientMessage::Leave,
             ClientMessage::NewGame,
+            ClientMessage::SetHarvesterMode(HarvesterMode::Home),
+            ClientMessage::SetHarvesterMode(HarvesterMode::Auto),
             ClientMessage::Input(InputFrame::default()),
         ] {
             let bytes = msg.to_vec();

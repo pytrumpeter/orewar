@@ -14,7 +14,8 @@ use bevy::prelude::*;
 use orewar_shared::bytes::{Decode, Encode};
 use orewar_shared::net::{Endpoint, MAX_PACKET, PacketKind, begin_packet, parse_packet};
 use orewar_shared::protocol::{
-    ClientMessage, DenyReason, GameEvent, InputFrame, PROTOCOL_ID, ServerMessage,
+    ClientMessage, DenyReason, GameEvent, HarvesterMode, InputFrame, PROTOCOL_ID,
+    ServerMessage,
 };
 use orewar_shared::world::PowerUp;
 
@@ -134,6 +135,11 @@ impl NetClient {
     }
 
     /// Asks the server to restart the match for everyone on a fresh map.
+    /// Tells the server what the harvester should do when left alone.
+    pub fn set_harvester_mode(&mut self, mode: HarvesterMode) {
+        self.send_reliable(&ClientMessage::SetHarvesterMode(mode));
+    }
+
     pub fn request_new_game(&mut self) {
         self.send_reliable(&ClientMessage::NewGame);
     }

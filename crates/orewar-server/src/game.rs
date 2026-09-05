@@ -12,8 +12,8 @@ use std::collections::HashSet;
 
 use orewar_shared::math::{Vec2, angle_delta, wrap_angle};
 use orewar_shared::protocol::{
-    GameEvent, GameStatus, HitFx, HitKind, InputFrame, MAX_HITS_PER_SNAPSHOT, OreUpdate,
-    PlayerInfo, PlayerSnapshot, ProjectileKind, SentinelSnapshot,
+    GameEvent, GameStatus, HarvesterMode, HitFx, HitKind, InputFrame, MAX_HITS_PER_SNAPSHOT,
+    OreUpdate, PlayerInfo, PlayerSnapshot, ProjectileKind, SentinelSnapshot,
     ProjectileSnapshot, RejectReason, Snapshot, VehicleSlot, VehicleSnapshot,
     MAX_PROJECTILES_PER_SNAPSHOT,
 };
@@ -96,6 +96,14 @@ pub struct Player {
     pub tank: Option<Vehicle>,
     pub harvester: Option<Vehicle>,
     pub sentinel: Sentinel,
+    /// What the harvester does when the player is driving something else.
+    pub harvester_mode: HarvesterMode,
+    /// Seconds the autopilot has spent asking for throttle and going nowhere.
+    /// Steering rounds a hill, but a harvester can still end up wedged; this is
+    /// what notices.
+    stuck_for: f32,
+    /// Seconds left of backing out of being wedged.
+    unstick_for: f32,
     /// Counts down while the tank is destroyed.
     pub respawn_timer: f32,
     pub input: InputFrame,
@@ -126,6 +134,9 @@ impl Player {
             tank: Some(Vehicle::spawn(VehicleKind::Tank, tank_pos, inward, 0)),
             harvester: Some(Vehicle::spawn(VehicleKind::Harvester, harvester_pos, inward, 0)),
             sentinel: Sentinel::new(id),
+            harvester_mode: HarvesterMode::default(),
+            stuck_for: 0.0,
+            unstick_for: 0.0,
             respawn_timer: 0.0,
             input: InputFrame::default(),
             input_age: 0.0,
@@ -185,6 +196,7 @@ impl Player {
             powerups: self.powerups,
             missiles: self.missiles,
             captures: self.captures,
+            harvester_mode: self.harvester_mode,
             tank: self.tank.as_ref().map(Vehicle::to_snapshot),
             harvester: self.harvester.as_ref().map(Vehicle::to_snapshot),
             // Absent while it is rubble, which is how the client knows to draw
@@ -442,6 +454,20 @@ impl Game {
     ///
     /// Inputs are unreliable and can be reordered by the network; replaying a
     /// stale frame would jerk the vehicle backwards.
+    /// Changes what a player's harvester does when left to itself.
+    ///
+    /// Takes effect on the next tick the player is not driving it; there is
+    /// nothing to validate, since every mode is always available.
+    pub fn set_harvester_mode(&mut self, id: u8, mode: HarvesterMode) {
+        if let Some(p) = self.player_mut(id) {
+            p.harvester_mode = mode;
+            // A mode change is a fresh instruction; whatever it was stuck
+            // against a moment ago is no longer the plan.
+            p.stuck_for = 0.0;
+            p.unstick_for = 0.0;
+        }
+    }
+
     pub fn set_input(&mut self, id: u8, frame: InputFrame) {
         if let Some(p) = self.player_mut(id) {
             if frame.tick >= p.acked_input || p.acked_input == 0 {
@@ -520,14 +546,46 @@ impl Game {
         }
     }
 
+    /// Where an unattended harvester should head, and how close counts as
+    /// arrived. `None` means hold station -- either the player asked for that,
+    /// or there is nothing left to go and get.
+    fn autopilot_target(&self, player: u8) -> Option<(Vec2, f32)> {
+        let p = self.player(player)?;
+        let h = p.harvester.as_ref()?;
+        let home = (world::base_position(player), world::BASE_RADIUS * 0.6);
+
+        match p.harvester_mode {
+            HarvesterMode::Stop => None,
+            HarvesterMode::Home => Some(home),
+            HarvesterMode::Auto => {
+                // A full harvester cannot mine, so the load is only worth
+                // anything once it is back at the pad.
+                if h.cargo >= sim::cargo_capacity(p.powerups) {
+                    return Some(home);
+                }
+                let nearest = self.ore.iter().filter(|d| d.amount > 0.0).min_by(|a, b| {
+                    a.pos
+                        .distance_squared(h.mv.pos)
+                        .total_cmp(&b.pos.distance_squared(h.mv.pos))
+                })?;
+                // Stop short of the middle, so braking settles it under
+                // HARVEST_MAX_SPEED while still inside HARVEST_RADIUS.
+                Some((nearest.pos, sim::HARVEST_RADIUS * 0.7))
+            }
+        }
+    }
+
     fn step_vehicles(&mut self, dt: f32) {
         // Crashes are charged after the loop: applying damage needs the game as
         // a whole, and the loop has one player in hand at a time.
         let mut crashes: Vec<(u8, VehicleSlot, f32, f32)> = Vec::new();
 
         for slot_index in 0..self.players.len() {
+            // Read before the player is borrowed: it looks at the ore field.
+            let Some(id) = self.players[slot_index].as_ref().map(|p| p.id) else { continue };
+            let auto = self.autopilot_target(id);
+
             let Some(p) = self.players[slot_index].as_mut() else { continue };
-            let id = p.id;
             let powerups = p.powerups;
             let input = p.effective_input();
             let controlling = input.controlling;
@@ -547,10 +605,48 @@ impl Game {
                     sim::StepOutcome::default()
                 } else if slot == controlling {
                     sim::step_vehicle(&mut v.mv, throttle, steer, kind, powerups, &self.hills, dt)
+                } else if slot == VehicleSlot::Harvester {
+                    // Left alone, the harvester works the field on whichever
+                    // mode the player picked. This branch runs only while they
+                    // are driving something else, so taking it over with TAB
+                    // overrides the mode for free and letting go resumes it.
+                    let (mut auto_throttle, mut auto_steer) = match auto {
+                        Some((target, stop_within)) => {
+                            sim::autopilot(&v.mv, target, stop_within, &self.hills)
+                        }
+                        None => (0.0, 0.0),
+                    };
+
+                    // Asking for throttle and going nowhere means wedged --
+                    // shoved into a corner by another hull, or nosed into a
+                    // slope the tangent led back onto.
+                    if auto_throttle != 0.0 && v.mv.speed.abs() < sim::AUTOPILOT_STALL_SPEED {
+                        p.stuck_for += dt;
+                    } else {
+                        p.stuck_for = 0.0;
+                    }
+                    if p.unstick_for > 0.0 {
+                        p.unstick_for -= dt;
+                        // Back out while turning, so the next attempt starts
+                        // from a different heading instead of repeating this one.
+                        auto_throttle = -1.0;
+                        auto_steer = 1.0;
+                    } else if p.stuck_for > 1.0 {
+                        p.stuck_for = 0.0;
+                        p.unstick_for = 1.0;
+                    }
+
+                    sim::step_vehicle(
+                        &mut v.mv,
+                        auto_throttle,
+                        auto_steer,
+                        kind,
+                        powerups,
+                        &self.hills,
+                        dt,
+                    )
                 } else {
-                    // An unattended vehicle coasts to a halt and holds station.
-                    // A harvester parked on ore keeps working, which is what
-                    // makes leaving it there while you fight worthwhile.
+                    // An unattended tank coasts to a halt and holds station.
                     sim::step_vehicle(&mut v.mv, 0.0, 0.0, kind, powerups, &self.hills, dt)
                 };
 
@@ -2100,6 +2196,79 @@ mod tests {
             full,
             "an emplacement does not shoot the player it belongs to"
         );
+    }
+
+    /// The whole point of the autopilot: income without being driven.
+    ///
+    /// Runs the full loop -- find ore, fill up, come home, unload -- with the
+    /// player notionally in their tank the entire time.
+    #[test]
+    fn an_auto_harvester_mines_and_banks_without_being_driven() {
+        let mut g = two_player_game();
+        let start = g.player(0).unwrap().credits;
+        assert_eq!(g.player(0).unwrap().harvester_mode, HarvesterMode::Auto, "the default");
+
+        // Two minutes of nobody touching it. The player sits in their tank, so
+        // the harvester is on its own the whole way.
+        for tick in 0..3600u32 {
+            g.set_input(
+                0,
+                InputFrame {
+                    tick: tick + 1,
+                    controlling: VehicleSlot::Tank,
+                    ..Default::default()
+                },
+            );
+            g.step(TICK_DT);
+        }
+
+        let p = g.player(0).unwrap();
+        assert!(
+            p.ore_mined > 0,
+            "it never banked anything: cargo {:.1}, credits {}",
+            p.harvester.as_ref().unwrap().cargo,
+            p.credits
+        );
+        assert!(p.credits > start, "credits went {start} -> {}", p.credits);
+    }
+
+    /// Stop means stop, so a player can park it somewhere deliberately.
+    #[test]
+    fn a_stopped_harvester_stays_where_it_is() {
+        let mut g = two_player_game();
+        g.set_harvester_mode(0, HarvesterMode::Stop);
+        let start = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        for _ in 0..600 {
+            g.step(TICK_DT);
+        }
+        let moved = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos.distance(start);
+        assert!(moved < 1.0, "it wandered {moved:.2} with the brakes on");
+    }
+
+    /// Home means home, and arriving there is what banks the load.
+    #[test]
+    fn a_harvester_sent_home_goes_home() {
+        let mut g = two_player_game();
+        g.set_harvester_mode(0, HarvesterMode::Home);
+        // Start it well out in the field so the trip is real.
+        {
+            let h = g.player_mut(0).unwrap().harvester.as_mut().unwrap();
+            h.mv = MoveState { pos: Vec2::splat(world::WORLD_SIZE * 0.4), yaw: 0.0, speed: 0.0 };
+            h.cargo = 20.0;
+        }
+        for _ in 0..5400 {
+            g.step(TICK_DT);
+            if g.player(0).unwrap().credits > STARTING_CREDITS {
+                break;
+            }
+        }
+        let pos = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        assert!(
+            sim::is_at_base(pos, 0),
+            "ended at {pos:?}, not on its pad at {:?}",
+            world::base_position(0)
+        );
+        assert!(g.player(0).unwrap().credits > STARTING_CREDITS, "and should have unloaded");
     }
 
     #[test]
