@@ -4,8 +4,11 @@ use crate::math::{Vec2, vec2};
 use crate::rng::Rng;
 
 /// Field is a `GRID_CELLS` square of `CELL_SIZE` tiles.
+///
+/// The cell is what grows when the field does; the grid stays 64 squares so the
+/// ground texture and the drawn lines keep the same relationship to it.
 pub const GRID_CELLS: u32 = 64;
-pub const CELL_SIZE: f32 = 5.0;
+pub const CELL_SIZE: f32 = 7.5;
 pub const WORLD_SIZE: f32 = GRID_CELLS as f32 * CELL_SIZE;
 
 /// One corner each, so the field supports four players.
@@ -63,7 +66,10 @@ pub struct OreDeposit {
 
 /// Kept sparse on purpose: a handful of deposits per quadrant makes each one
 /// worth driving to and worth denying an opponent.
-const DEPOSITS_PER_QUADRANT: usize = 6;
+// Counts scale with area, not with width: a quadrant went from 160 to 240 a
+// side, which is 2.25 times the ground. Holding the count would have left the
+// same picture stretched, with long empty drives between patches.
+const DEPOSITS_PER_QUADRANT: usize = 13;
 /// Rich, contested deposits in the middle of the field.
 const CENTER_DEPOSITS: usize = 4;
 
@@ -143,7 +149,7 @@ pub struct Hill {
     pub radius: f32,
 }
 
-const HILLS_PER_QUADRANT: usize = 4;
+const HILLS_PER_QUADRANT: usize = 9;
 const MIN_HILL_RADIUS: f32 = 6.0;
 const MAX_HILL_RADIUS: f32 = 11.0;
 
