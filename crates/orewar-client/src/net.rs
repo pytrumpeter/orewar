@@ -17,6 +17,7 @@ use orewar_shared::protocol::{
     ClientMessage, DenyReason, GameEvent, HarvesterMode, InputFrame, PROTOCOL_ID,
     ServerMessage,
 };
+use orewar_shared::sim;
 use orewar_shared::world::PowerUp;
 
 use crate::state::GameState;
@@ -385,7 +386,22 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
         GameEvent::HarvesterCaptured { by, from } => {
             format!("{} captured {}'s harvester", name(by), name(from))
         }
-        GameEvent::PlayerEliminated { player } => format!("{} is out", name(player)),
+        // No longer permanent: a capture puts you off the field for a minute,
+        // then hands you a fresh pair of vehicles and an empty bank.
+        GameEvent::PlayerEliminated { player } => {
+            if Some(player) == me {
+                format!("Harvester lost -- back in {:.0}s", sim::CAPTURE_LOCKOUT)
+            } else {
+                format!("{} is down for a minute", name(player))
+            }
+        }
+        GameEvent::PlayerReturned { player } => {
+            if Some(player) == me {
+                "You are back, with your upgrades and nothing else".to_string()
+            } else {
+                format!("{} is back on the field", name(player))
+            }
+        }
         GameEvent::GameOver { winner } => {
             if Some(winner) == me {
                 "You win!".to_string()

@@ -324,6 +324,10 @@ pub struct PlayerSnapshot {
     /// control panel shows what the server actually has, not what this client
     /// last asked for.
     pub harvester_mode: HarvesterMode,
+    /// Whole seconds until a captured player is back on the field. Zero when
+    /// they are already on it. Whole seconds because it is only ever read as
+    /// a countdown on screen.
+    pub respawn_in: u8,
 }
 
 impl Encode for PlayerSnapshot {
@@ -341,6 +345,7 @@ impl Encode for PlayerSnapshot {
         w.u8(self.missiles);
         w.u8(self.captures);
         w.u8(self.harvester_mode as u8);
+        w.u8(self.respawn_in);
         if let Some(v) = &self.tank {
             v.encode(w);
         }
@@ -365,6 +370,7 @@ impl Decode for PlayerSnapshot {
         let raw_mode = r.u8()?;
         let harvester_mode =
             HarvesterMode::from_u8(raw_mode).ok_or(DecodeError::BadTag("HarvesterMode", raw_mode))?;
+        let respawn_in = r.u8()?;
         let tank = if flags & 0b100 != 0 { Some(r.read()?) } else { None };
         let harvester = if flags & 0b1000 != 0 { Some(r.read()?) } else { None };
         let sentinel = if flags & 0b1_0000 != 0 { Some(r.read()?) } else { None };
@@ -378,6 +384,7 @@ impl Decode for PlayerSnapshot {
             missiles,
             captures,
             harvester_mode,
+            respawn_in,
             tank,
             harvester,
             sentinel,
@@ -386,7 +393,7 @@ impl Decode for PlayerSnapshot {
 }
 
 /// Fixed bytes per player, before optional vehicles.
-pub const PLAYER_SNAPSHOT_FIXED_BYTES: usize = 15;
+pub const PLAYER_SNAPSHOT_FIXED_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -693,6 +700,8 @@ pub enum GameEvent {
     /// A base emplacement was shot down and is rebuilding.
     SentinelDestroyed { player: u8 },
     SentinelRebuilt { player: u8 },
+    /// A captured player is back on the field with a fresh pair of vehicles.
+    PlayerReturned { player: u8 },
 }
 
 impl Encode for GameEvent {
@@ -746,6 +755,9 @@ impl Encode for GameEvent {
             GameEvent::SentinelRebuilt { player } => {
                 w.u8(16).u8(player);
             }
+            GameEvent::PlayerReturned { player } => {
+                w.u8(17).u8(player);
+            }
         }
     }
 }
@@ -782,6 +794,7 @@ impl Decode for GameEvent {
             14 => GameEvent::OreSeized { by: r.u8()?, from: r.u8()?, amount: r.u32()? },
             15 => GameEvent::SentinelDestroyed { player: r.u8()? },
             16 => GameEvent::SentinelRebuilt { player: r.u8()? },
+            17 => GameEvent::PlayerReturned { player: r.u8()? },
             other => return Err(DecodeError::BadTag("GameEvent", other)),
         })
     }
@@ -911,6 +924,7 @@ mod tests {
             harvester: Some(sample_vehicle()),
             sentinel: Some(SentinelSnapshot { hull: 118.5, turret_yaw: 2.0 }),
             harvester_mode: HarvesterMode::Home,
+            respawn_in: 41,
         }
     }
 
@@ -987,6 +1001,7 @@ mod tests {
             GameEvent::OreSeized { by: 1, from: 2, amount: 47 },
             GameEvent::SentinelDestroyed { player: 3 },
             GameEvent::SentinelRebuilt { player: 3 },
+            GameEvent::PlayerReturned { player: 1 },
         ];
         for e in events {
             let bytes = ServerMessage::Event(e).to_vec();

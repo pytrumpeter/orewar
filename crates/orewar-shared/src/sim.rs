@@ -269,6 +269,19 @@ pub const SHIELD_REGEN_DELAY: f32 = 4.0;
 /// How far a base emplacement will engage. Longer than the harvester's own
 /// turret: it is the thing that makes walking into somebody's corner cost
 /// something, so it has to reach past the pad it is defending.
+/// How long losing your harvester keeps you off the field.
+///
+/// Long enough to be the worst thing that can happen to you and short
+/// enough that it is a setback rather than the end of your match. You come
+/// back with your upgrades and nothing else.
+pub const CAPTURE_LOCKOUT: f32 = 60.0;
+
+/// Captures needed to win.
+///
+/// A capture no longer removes anybody, so being last one standing cannot
+/// end a match any more; taking three harvesters is what does.
+pub const CAPTURES_TO_WIN: u8 = 3;
+
 pub const SENTINEL_RANGE: f32 = 55.0;
 /// One shell a second.
 pub const SENTINEL_COOLDOWN: f32 = 1.0;

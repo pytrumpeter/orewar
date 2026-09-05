@@ -106,6 +106,9 @@ pub struct Player {
     unstick_for: f32,
     /// Counts down while the tank is destroyed.
     pub respawn_timer: f32,
+    /// Counts down while the player is off the field entirely, having had their
+    /// harvester taken. Zero means they are in the match.
+    pub down_for: f32,
     pub input: InputFrame,
     /// Seconds since a fresh input frame arrived.
     pub input_age: f32,
@@ -113,13 +116,23 @@ pub struct Player {
     pub acked_input: u32,
 }
 
+/// Where a player's vehicles stand at the start of a match, and which way they
+/// face. Shared by the opening spawn and by coming back from a capture, so the
+/// two cannot drift apart.
+fn starting_placement(id: u8) -> (Vec2, Vec2, f32) {
+    let base = world::base_position(id);
+    // Face the middle of the field, which is where the action is.
+    let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - base).to_angle();
+    (
+        base + Vec2::from_angle(inward) * 7.0,
+        base + Vec2::from_angle(inward).perp() * 7.0,
+        inward,
+    )
+}
+
 impl Player {
     fn new(id: u8, token: u64, name: String) -> Self {
-        let base = world::base_position(id);
-        // Face the middle of the field, which is where the action is.
-        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - base).to_angle();
-        let tank_pos = base + Vec2::from_angle(inward) * 7.0;
-        let harvester_pos = base + Vec2::from_angle(inward).perp() * 7.0;
+        let (tank_pos, harvester_pos, inward) = starting_placement(id);
         Player {
             id,
             name,
@@ -138,6 +151,7 @@ impl Player {
             stuck_for: 0.0,
             unstick_for: 0.0,
             respawn_timer: 0.0,
+            down_for: 0.0,
             input: InputFrame::default(),
             input_age: 0.0,
             acked_input: 0,
@@ -197,6 +211,9 @@ impl Player {
             missiles: self.missiles,
             captures: self.captures,
             harvester_mode: self.harvester_mode,
+            // Rounded up, so a countdown on screen reaches zero at the moment
+            // the vehicles actually come back rather than a beat before.
+            respawn_in: self.down_for.max(0.0).ceil().min(255.0) as u8,
             tank: self.tank.as_ref().map(Vehicle::to_snapshot),
             harvester: self.harvester.as_ref().map(Vehicle::to_snapshot),
             // Absent while it is rubble, which is how the client knows to draw
@@ -1314,10 +1331,16 @@ impl Game {
             // the fraction is lost with the hull rather than rounded up.
             spoils = victim.harvester.as_ref().map_or(0.0, |h| h.cargo).floor().max(0.0) as u32;
             victim.harvester = None;
-            victim.eliminated = true;
             // A player with no harvester has nothing left to defend, so their
-            // tank leaves the field with it.
+            // tank leaves the field with it. They are off the field rather than
+            // out of the match: `eliminated` means "not here right now", and
+            // `down_for` is how long that lasts.
             victim.tank = None;
+            victim.eliminated = true;
+            victim.down_for = sim::CAPTURE_LOCKOUT;
+            // Nothing to come back to on the tank timer; the whole player is on
+            // the clock now.
+            victim.respawn_timer = 0.0;
         }
         if let Some(captor) = self.player_mut(by) {
             captor.captures = captor.captures.saturating_add(1);
@@ -1336,8 +1359,41 @@ impl Game {
 
     fn step_respawns(&mut self, dt: f32) {
         let mut respawned = Vec::new();
+        let mut returned = Vec::new();
+
         for slot_index in 0..self.players.len() {
             let Some(p) = self.players[slot_index].as_mut() else { continue };
+
+            // A player whose harvester was taken sits the minute out and then
+            // starts again: fresh vehicles, an empty bank, and every upgrade
+            // they had bought still theirs. Losing a harvester costs a minute
+            // and everything liquid, not the match.
+            if p.down_for > 0.0 {
+                p.down_for -= dt;
+                if p.down_for > 0.0 {
+                    continue;
+                }
+                let (tank_pos, harvester_pos, inward) = starting_placement(p.id);
+                p.down_for = 0.0;
+                p.eliminated = false;
+                p.credits = 0;
+                p.missiles = STARTING_MISSILES;
+                p.tank =
+                    Some(Vehicle::spawn(VehicleKind::Tank, tank_pos, inward, p.powerups));
+                p.harvester = Some(Vehicle::spawn(
+                    VehicleKind::Harvester,
+                    harvester_pos,
+                    inward,
+                    p.powerups,
+                ));
+                // Whatever it was doing when it was taken is not a plan for the
+                // new one.
+                p.stuck_for = 0.0;
+                p.unstick_for = 0.0;
+                returned.push(p.id);
+                continue;
+            }
+
             if p.eliminated || p.tank.is_some() {
                 continue;
             }
@@ -1358,16 +1414,25 @@ impl Game {
         for player in respawned {
             self.events.push(GameEvent::TankRespawned { player });
         }
+        for player in returned {
+            self.events.push(GameEvent::PlayerReturned { player });
+        }
     }
 
+    /// Three harvesters wins it.
+    ///
+    /// Being last one standing used to end a match, and cannot any more: a
+    /// capture puts its victim off the field for a minute rather than out of the
+    /// game, so there is always someone else still playing. Taking harvesters is
+    /// what accumulates toward anything now, which is also what the scoreboard
+    /// has always shown.
     fn check_victory(&mut self) {
         if self.status != GameStatus::Running || self.joined < 2 {
             return;
         }
-        let alive: Vec<u8> =
-            self.players.iter().flatten().filter(|p| !p.eliminated).map(|p| p.id).collect();
-        if alive.len() == 1 {
-            let winner = alive[0];
+        let leader =
+            self.players.iter().flatten().find(|p| p.captures >= sim::CAPTURES_TO_WIN).map(|p| p.id);
+        if let Some(winner) = leader {
             self.status = GameStatus::Finished;
             self.winner = Some(winner);
             self.events.push(GameEvent::GameOver { winner });
@@ -1720,24 +1785,116 @@ mod tests {
         assert!(!g.player(0).unwrap().eliminated, "it has to be captured, not just shot");
     }
 
-    #[test]
-    fn an_enemy_tank_captures_a_disabled_harvester_and_wins() {
-        let mut g = two_player_game();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+    /// Takes one harvester and lets the clock run out on the victim.
+    ///
+    /// Returns the game with the capture done, so the tests below can each pick
+    /// up the part of the aftermath they care about.
+    fn capture_once(g: &mut Game, by: u8, from: u8) {
+        g.damage_vehicle(from, VehicleSlot::Harvester, 100_000.0, by, 0.0);
+        let wreck = g.player(from).unwrap().harvester.as_ref().unwrap().mv.pos;
         // Vehicles spawn within capture range of each other, so the owner's tank
         // has to be drawn away before the wreck is actually takeable.
-        g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = Vec2::splat(128.0);
+        g.player_mut(from).unwrap().tank.as_mut().unwrap().mv.pos = Vec2::splat(128.0);
 
-        // Park player 1's tank on top of it and hold.
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 4) {
-            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.player_mut(by).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
             g.step(TICK_DT);
         }
+        assert!(g.player(from).unwrap().harvester.is_none(), "the harvester changed hands");
+    }
 
-        assert!(g.player(0).unwrap().eliminated);
-        assert!(g.player(0).unwrap().harvester.is_none(), "the harvester changed hands");
-        assert_eq!(g.player(1).unwrap().captures, 1);
+    /// A capture takes a player off the field, not out of the match.
+    #[test]
+    fn a_captured_player_sits_out_a_minute_and_comes_back_rebuilt() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        // Something to lose: upgrades bought, ore banked, missiles spent.
+        {
+            let p = g.player_mut(0).unwrap();
+            p.powerups = PowerUp::Turbo.bit() | PowerUp::Radar.bit();
+            p.credits = 900;
+            p.missiles = 0;
+        }
+
+        capture_once(&mut g, 1, 0);
+        assert!(g.player(0).unwrap().eliminated, "off the field for now");
+        assert!(g.player(0).unwrap().tank.is_none(), "the tank goes with the harvester");
+        assert_ne!(g.status, GameStatus::Finished, "one capture is not the match");
+
+        // Still gone most of the way through the minute.
+        for _ in 0..((sim::CAPTURE_LOCKOUT / TICK_DT) as usize - 30) {
+            g.step(TICK_DT);
+        }
+        assert!(g.player(0).unwrap().eliminated, "back far too early");
+        assert!(g.player(0).unwrap().tank.is_none());
+
+        for _ in 0..90 {
+            g.step(TICK_DT);
+        }
+        let p = g.player(0).unwrap();
+        assert!(!p.eliminated, "should be back after the lockout");
+        assert!(p.tank.is_some() && p.harvester.is_some(), "both vehicles come back");
+        assert_eq!(p.credits, 0, "the bank is gone");
+        assert_eq!(p.missiles, STARTING_MISSILES, "restocked as at the start of a match");
+        assert_eq!(
+            p.powerups,
+            PowerUp::Turbo.bit() | PowerUp::Radar.bit(),
+            "upgrades are permanent -- they are the whole reason to keep playing"
+        );
+        assert_eq!(p.harvester.as_ref().unwrap().cargo, 0.0);
+        assert!(
+            g.events.iter().any(|e| matches!(e, GameEvent::PlayerReturned { player: 0 })),
+            "and it should be announced"
+        );
+    }
+
+    /// The vehicles have to come back where they started, not where they died.
+    #[test]
+    fn a_returning_player_starts_from_their_own_base() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        capture_once(&mut g, 1, 0);
+        // Checked the instant they return: the harvester is on autopilot and
+        // sets off for the nearest ore straight away, so waiting even a second
+        // longer would be measuring where it drove to, not where it started.
+        for _ in 0..((sim::CAPTURE_LOCKOUT / TICK_DT) as usize + 60) {
+            g.step(TICK_DT);
+            if !g.player(0).unwrap().eliminated {
+                break;
+            }
+        }
+        let p = g.player(0).unwrap();
+        assert!(!p.eliminated, "never came back");
+        let base = world::base_position(0);
+        assert!(
+            p.tank.as_ref().unwrap().mv.pos.distance(base) < 12.0,
+            "tank came back {:.1} from base",
+            p.tank.as_ref().unwrap().mv.pos.distance(base)
+        );
+        assert!(
+            p.harvester.as_ref().unwrap().mv.pos.distance(base) < 12.0,
+            "harvester came back {:.1} from base",
+            p.harvester.as_ref().unwrap().mv.pos.distance(base)
+        );
+    }
+
+    /// Three harvesters is what ends a match now.
+    #[test]
+    fn taking_three_harvesters_wins_the_match() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        for round in 1..=sim::CAPTURES_TO_WIN {
+            capture_once(&mut g, 1, 0);
+            assert_eq!(g.player(1).unwrap().captures, round);
+            if round < sim::CAPTURES_TO_WIN {
+                assert_ne!(g.status, GameStatus::Finished, "won after only {round}");
+                // Let them back on the field so there is a harvester to take.
+                for _ in 0..((sim::CAPTURE_LOCKOUT / TICK_DT) as usize + 60) {
+                    g.step(TICK_DT);
+                }
+                assert!(!g.player(0).unwrap().eliminated, "never came back for round {round}");
+            }
+        }
         assert_eq!(g.status, GameStatus::Finished);
         assert_eq!(g.winner, Some(1));
     }
