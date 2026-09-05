@@ -1,1 +1,10 @@
 /target
+
+# Loose binaries left next to the source by a stray `cargo build` invocation or
+# a copied-out executable. The real build output lives in /target.
+*.exe
+*.pdb
+
+# Identity token the client writes when it is run without --name, so a player
+# returns to the same slot after a restart. Local to one machine.
+.orewar-token
