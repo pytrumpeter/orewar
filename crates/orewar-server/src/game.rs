@@ -1324,6 +1324,35 @@ mod tests {
         assert!(!g.player(0).unwrap().eliminated);
     }
 
+    /// Bringing a harvester back has to be slower than taking it.
+    ///
+    /// Otherwise disabling one achieves nothing: the attacker has to cross the
+    /// distance to the wreck *and then* hold it for `CAPTURE_TIME`, while the
+    /// defender only has to already be standing there -- which they are, since a
+    /// tank spawns and respawns within `CAPTURE_RADIUS` of its own harvester.
+    #[test]
+    fn a_rescue_takes_longer_than_a_capture() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        // Owner alone on it, which is the fastest a rescue can go.
+        let mut ticks = 0;
+        while ticks < 2000 {
+            g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.step(TICK_DT);
+            ticks += 1;
+            if !g.player(0).unwrap().harvester.as_ref().unwrap().disabled {
+                break;
+            }
+        }
+        let seconds = ticks as f32 * TICK_DT;
+        assert!(
+            seconds > sim::CAPTURE_TIME,
+            "rescue took {seconds:.1}s against a {:.1}s capture, so a wreck can never be taken",
+            sim::CAPTURE_TIME
+        );
+    }
+
     #[test]
     fn an_owner_tank_contests_an_enemy_capture() {
         let mut g = two_player_game();

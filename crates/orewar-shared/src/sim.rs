@@ -235,7 +235,15 @@ pub const CAPTURE_RADIUS: f32 = 11.0;
 /// Seconds an enemy tank must hold station to take a disabled harvester.
 pub const CAPTURE_TIME: f32 = 4.0;
 /// How fast an owner's tank repairs their own disabled harvester.
-pub const RESCUE_REPAIR_RATE: f32 = 11.0;
+///
+/// Deliberately slow enough that a rescue takes longer than [`CAPTURE_TIME`].
+/// At 11.0 it took three seconds against a four-second capture, so disabling a
+/// harvester achieved nothing: the attacker still had to cross the ground to
+/// the wreck and then hold it, while the defender only had to already be
+/// standing there -- which they are, since a tank spawns and respawns inside
+/// [`CAPTURE_RADIUS`] of its own harvester. The wreck was repaired before the
+/// attacker could arrive, every time.
+pub const RESCUE_REPAIR_RATE: f32 = 4.5;
 /// Hull fraction at which a rescued harvester comes back online.
 pub const REENABLE_HULL_FRACTION: f32 = 0.25;
 
