@@ -903,7 +903,10 @@ impl Game {
                 // become something an enemy tank has to come and take.
                 v.disabled = true;
                 v.capture_progress = 0.0;
-                v.cargo = 0.0;
+                // The cargo stays aboard. Whoever reaches the wreck first gets
+                // it: the owner carries it home on a rescue, an enemy takes it
+                // with the capture. Destroying the load outright made disabling
+                // a loaded harvester worth less than catching it at the pad.
                 let _ = powerups;
                 self.events.push(GameEvent::HarvesterDisabled { player });
             }
@@ -1050,7 +1053,11 @@ impl Game {
     }
 
     fn apply_capture(&mut self, by: u8, from: u8) {
+        let mut spoils = 0u32;
         if let Some(victim) = self.player_mut(from) {
+            // Whole units only, matching how a harvester unloads at its own pad;
+            // the fraction is lost with the hull rather than rounded up.
+            spoils = victim.harvester.as_ref().map_or(0.0, |h| h.cargo).floor().max(0.0) as u32;
             victim.harvester = None;
             victim.eliminated = true;
             // A player with no harvester has nothing left to defend, so their
@@ -1059,8 +1066,14 @@ impl Game {
         }
         if let Some(captor) = self.player_mut(by) {
             captor.captures = captor.captures.saturating_add(1);
+            captor.credits += spoils;
+            captor.ore_mined += spoils;
         }
         self.events.push(GameEvent::HarvesterCaptured { by, from });
+        // Only worth saying when there was something aboard.
+        if spoils > 0 {
+            self.events.push(GameEvent::OreSeized { by, from, amount: spoils });
+        }
         self.events.push(GameEvent::PlayerEliminated { player: from });
         // Anything still in the air belonged to a fight that is now over.
         self.projectiles.retain(|p| p.owner != from);
@@ -1744,6 +1757,62 @@ mod tests {
         }
         let moved = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos.distance(start);
         assert!(moved > 3.0, "the harvester only moved {moved:.2}; the player is still frozen out");
+    }
+
+    /// A wreck keeps its load, and the load goes to whoever takes it.
+    #[test]
+    fn capturing_a_loaded_harvester_seizes_its_ore() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+
+        // Disabling must not empty it -- that is where the ore used to vanish.
+        {
+            let h = g.player_mut(0).unwrap().harvester.as_mut().unwrap();
+            h.cargo = 42.7;
+        }
+        let before = g.player(1).unwrap().credits;
+
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        let touching =
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+        {
+            let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0 };
+        }
+        for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
+            g.step(TICK_DT);
+        }
+
+        let captor = g.player(1).unwrap();
+        assert_eq!(captor.credits, before + 42, "whole units only, and the fraction goes down with the hull");
+        assert!(
+            g.events.iter().any(|e| matches!(e, GameEvent::OreSeized { by: 1, from: 0, amount: 42 })),
+            "the haul has to be announced: {:?}",
+            g.events
+        );
+    }
+
+    /// An empty harvester should not claim a haul that was never there.
+    #[test]
+    fn capturing_an_empty_harvester_announces_nothing() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        let touching =
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+        {
+            let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0 };
+        }
+        for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
+            g.step(TICK_DT);
+        }
+        assert!(
+            !g.events.iter().any(|e| matches!(e, GameEvent::OreSeized { .. })),
+            "nothing was aboard, so nothing was seized"
+        );
     }
 
     #[test]

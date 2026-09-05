@@ -356,6 +356,15 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
                 format!("{} rescued their harvester", name(player))
             }
         }
+        GameEvent::OreSeized { by, from, amount } => {
+            if Some(by) == me {
+                format!("Seized {amount} ore from {}", name(from))
+            } else if Some(from) == me {
+                format!("{} seized your {amount} ore", name(by))
+            } else {
+                format!("{} seized {amount} ore from {}", name(by), name(from))
+            }
+        }
         GameEvent::HarvesterCaptured { by, from } => {
             format!("{} captured {}'s harvester", name(by), name(from))
         }

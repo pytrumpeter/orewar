@@ -24,7 +24,7 @@ use crate::world::{MAX_PLAYERS, PowerUp, WORLD_SIZE};
 /// Without a bump an older peer would complete the handshake and then hit an
 /// unknown tag on the reliable stream, which is a decode error rather than a
 /// recoverable one.
-pub const PROTOCOL_ID: u32 = 0x4F52_5706;
+pub const PROTOCOL_ID: u32 = 0x4F52_5707;
 
 /// Quantization ceiling for shield and hull values.
 const STAT_SCALE: f32 = 512.0;
@@ -601,6 +601,12 @@ pub enum GameEvent {
     /// never sees another `Welcome`, and the map never travels as a deposit
     /// list -- both sides generate it from the seed.
     MatchReset { world_seed: u64, by: u8 },
+    /// A captured harvester's cargo changed hands.
+    ///
+    /// Separate from `HarvesterCaptured` because the amount is the part
+    /// worth saying out loud, and a harvester taken empty should not claim a
+    /// haul that was not there.
+    OreSeized { by: u8, from: u8, amount: u32 },
 }
 
 impl Encode for GameEvent {
@@ -645,6 +651,9 @@ impl Encode for GameEvent {
             GameEvent::MatchReset { world_seed, by } => {
                 w.u8(13).u64(world_seed).u8(by);
             }
+            GameEvent::OreSeized { by, from, amount } => {
+                w.u8(14).u8(by).u8(from).u32(amount);
+            }
         }
     }
 }
@@ -678,6 +687,7 @@ impl Decode for GameEvent {
             11 => GameEvent::MatchStarted,
             12 => GameEvent::GameOver { winner: r.u8()? },
             13 => GameEvent::MatchReset { world_seed: r.u64()?, by: r.u8()? },
+            14 => GameEvent::OreSeized { by: r.u8()?, from: r.u8()?, amount: r.u32()? },
             other => return Err(DecodeError::BadTag("GameEvent", other)),
         })
     }
@@ -876,6 +886,7 @@ mod tests {
             GameEvent::MatchStarted,
             GameEvent::GameOver { winner: 1 },
             GameEvent::MatchReset { world_seed: 0xFEED_FACE_1234_5678, by: 2 },
+            GameEvent::OreSeized { by: 1, from: 2, amount: 47 },
         ];
         for e in events {
             let bytes = ServerMessage::Event(e).to_vec();
