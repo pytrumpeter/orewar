@@ -250,9 +250,12 @@ pub struct GameState {
     snapshots: VecDeque<(f64, Snapshot)>,
     pub render: RenderWorld,
     pub prediction: Prediction,
-    /// Impacts reported by the newest snapshot, waiting to be turned into
-    /// effect entities. Drained every frame by `crate::effects::spawn`.
-    pub pending_fx: Vec<HitFx>,
+    /// Impacts waiting to be drawn, each paired with the render time it
+    /// belongs to. They are held rather than drawn on arrival because the
+    /// world itself is drawn [`INTERP_DELAY`] behind: showing a hit the
+    /// moment its snapshot lands puts the flash ahead of the shot that
+    /// caused it, which reads as the bullet exploding before it arrives.
+    pending_fx: Vec<(f64, HitFx)>,
     /// Recent events, newest last, for the on-screen log.
     pub log: VecDeque<String>,
     /// Server tick of the newest snapshot, for the HUD.
@@ -305,6 +308,18 @@ impl GameState {
         self.winner = None;
     }
 
+    /// Hands over the impacts whose moment has come, keeping the rest.
+    ///
+    /// Effects wait out the same delay the world is drawn behind, so a
+    /// shield flash lands on the frame the shot is seen to arrive rather
+    /// than a tenth of a second early.
+    pub fn take_due_fx(&mut self, now: f64) -> Vec<HitFx> {
+        let (due, waiting): (Vec<_>, Vec<_>) =
+            self.pending_fx.drain(..).partition(|(at, _)| *at <= now);
+        self.pending_fx = waiting;
+        due.into_iter().map(|(_, fx)| fx).collect()
+    }
+
     pub fn note(&mut self, message: impl Into<String>) {
         self.log.push_back(message.into());
         while self.log.len() > 6 {
@@ -339,8 +354,9 @@ impl GameState {
         self.winner = snapshot.winner;
         self.server_tick = snapshot.tick;
         // Stale snapshots were rejected above, so each tick's impacts are
-        // picked up exactly once.
-        self.pending_fx.extend(snapshot.hits.iter().copied());
+        // picked up exactly once. `now` is when this snapshot arrived, and
+        // `interpolate` reaches it `INTERP_DELAY` later.
+        self.pending_fx.extend(snapshot.hits.iter().map(|fx| (now + INTERP_DELAY, *fx)));
 
         // Apply ore amounts. A full sync replaces everything; otherwise only the
         // deposits the server says changed.
@@ -618,6 +634,33 @@ mod tests {
             p.state.pos,
             predicted
         );
+    }
+
+    /// An impact must not be drawn before the world reaches the tick it
+    /// happened in.
+    ///
+    /// The world is rendered `INTERP_DELAY` behind the newest snapshot, so an
+    /// effect drawn the moment its snapshot lands is that much early -- the hit
+    /// flash appears while the shell still has visible distance to cover.
+    #[test]
+    fn an_impact_waits_for_the_world_to_catch_up_to_it() {
+        use orewar_shared::protocol::{HitFx, HitKind};
+
+        let mut s = GameState::default();
+        let arrived = 4.0;
+        s.push_snapshot(arrived, Snapshot {
+            tick: 1,
+            hits: vec![HitFx::on_terrain(HitKind::Blast, SimVec2::new(10.0, 10.0))],
+            ..Default::default()
+        });
+
+        assert!(s.take_due_fx(arrived).is_empty(), "drawn on arrival, before its tick is shown");
+        assert!(
+            s.take_due_fx(arrived + INTERP_DELAY - 0.01).is_empty(),
+            "still early"
+        );
+        assert_eq!(s.take_due_fx(arrived + INTERP_DELAY).len(), 1, "due once the world arrives");
+        assert!(s.take_due_fx(arrived + 10.0).is_empty(), "and handed over only once");
     }
 
     #[test]

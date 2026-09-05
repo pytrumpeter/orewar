@@ -263,6 +263,17 @@ impl Game {
             if !name.is_empty() {
                 p.name = name.to_owned();
             }
+            // Input ticks are numbered per connection, and a client that has
+            // restarted begins again from one. `set_input` drops anything not
+            // newer than `acked_input`, so carrying the old high-water mark
+            // across a resume would reject every frame the returning client
+            // ever sends: it would sit on the field, fully connected and
+            // unable to move. The stale frame goes too, so a key held at the
+            // moment the old connection dropped does not drive the vehicle
+            // until the first real frame lands.
+            p.acked_input = 0;
+            p.input = InputFrame::default();
+            p.input_age = 0.0;
             let id = p.id;
             self.events.push(GameEvent::PlayerJoined { player: id });
             return Some(id);
@@ -1114,6 +1125,53 @@ mod tests {
         assert_eq!(g.status, GameStatus::Running);
         g.restart(7, 1);
         assert_eq!(g.status, GameStatus::Running, "nobody should have to rejoin");
+    }
+
+    /// Reconnecting must not cost you the ability to drive.
+    ///
+    /// Input frames are numbered per connection and a restarted client counts
+    /// from one again, so a server still holding the old high-water mark would
+    /// reject every frame forever. The vehicle then sits there while the rest of
+    /// the client -- camera, HUD, swapping vehicles -- carries on working, which
+    /// makes it look like anything but an input problem.
+    #[test]
+    fn a_resumed_player_can_still_drive() {
+        let mut g = two_player_game();
+        // Open ground: this is about whether input is accepted, and a tank
+        // parked against a hill would not move either way.
+        g.hills.clear();
+        for tick in 1..200u32 {
+            g.set_input(0, InputFrame {
+                tick,
+                controlling: VehicleSlot::Tank,
+                throttle: 1.0,
+                ..Default::default()
+            });
+            g.step(TICK_DT);
+        }
+        assert!(g.player(0).unwrap().acked_input > 100, "the tick counter should have climbed");
+
+        // The client restarts: same token, same slot, tick numbering from one.
+        g.disconnect(0);
+        assert_eq!(g.join(1, "one"), Some(0), "same token must resume the same slot");
+
+        let before = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+        for tick in 1..60u32 {
+            g.set_input(0, InputFrame {
+                tick,
+                controlling: VehicleSlot::Tank,
+                throttle: 1.0,
+                ..Default::default()
+            });
+            g.step(TICK_DT);
+        }
+        let after = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+        // Well clear of the four units it coasts through on leftover speed when
+        // the frames are being thrown away.
+        assert!(
+            after.distance(before) > 20.0,
+            "a resumed player must be able to drive, went {before:?} -> {after:?}"
+        );
     }
 
     #[test]

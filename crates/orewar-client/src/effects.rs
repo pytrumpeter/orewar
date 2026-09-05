@@ -172,10 +172,13 @@ fn shield_arc_mesh() -> Mesh {
 pub fn spawn(
     mut commands: Commands,
     assets: Res<EffectAssets>,
+    time: Res<Time>,
     mut state: ResMut<GameState>,
     mut live: Query<&mut Effect>,
 ) {
-    for fx in state.pending_fx.drain(..) {
+    // The same clock `interpolate` runs on, so an impact appears on the
+    // frame the world reaches the tick it happened in.
+    for fx in state.take_due_fx(time.elapsed_secs_f64()) {
         // One shield, one flash. A hull under fire is hit faster than a flash
         // fades, so a second entity would not read as a second hit -- it would
         // just sit on top of the first. Restarting the arc already on that hull

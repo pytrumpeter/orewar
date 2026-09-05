@@ -167,8 +167,16 @@ pub fn leave_and_exit(net: &mut NetClient) -> ! {
 }
 
 /// Drains the socket and drives the handshake. Runs before anything reads state.
-pub fn poll(mut net: ResMut<NetClient>, mut state: ResMut<GameState>) {
+pub fn poll(mut net: ResMut<NetClient>, time: Res<Time>, mut state: ResMut<GameState>) {
     let now = net.now();
+    // Snapshots are stamped on the clock `state::interpolate` compares
+    // against, not on the connection's own. The two do not share an origin:
+    // the socket opens before the window does, so `net.now()` runs ahead by
+    // however long this client took to start. Mixing them made the world
+    // render that startup time further into the past -- a different amount
+    // on every client, and long enough to see a hit land before the shot
+    // arrived.
+    let render_now = time.elapsed_secs_f64();
     let mut buf = [0u8; MAX_PACKET];
 
     loop {
@@ -232,14 +240,14 @@ pub fn poll(mut net: ResMut<NetClient>, mut state: ResMut<GameState>) {
                 };
                 for message in incoming.reliable {
                     if let Ok(msg) = ServerMessage::from_slice(&message) {
-                        handle_message(&mut net, &mut state, msg);
+                        handle_message(&mut net, &mut state, render_now, msg);
                     }
                 }
                 if let Some(payload) = incoming.unreliable {
                     if let Ok(ServerMessage::Snapshot(snapshot)) =
                         ServerMessage::from_slice(&payload)
                     {
-                        state.push_snapshot(now, snapshot);
+                        state.push_snapshot(render_now, snapshot);
                     }
                 }
             }
@@ -273,7 +281,12 @@ pub fn poll(mut net: ResMut<NetClient>, mut state: ResMut<GameState>) {
     }
 }
 
-fn handle_message(net: &mut NetClient, state: &mut GameState, message: ServerMessage) {
+fn handle_message(
+    net: &mut NetClient,
+    state: &mut GameState,
+    render_now: f64,
+    message: ServerMessage,
+) {
     match message {
         ServerMessage::Welcome { player_id, world_seed, .. } => {
             state.local_player = Some(player_id);
@@ -281,10 +294,7 @@ fn handle_message(net: &mut NetClient, state: &mut GameState, message: ServerMes
             net.link = Link::Connected;
         }
         ServerMessage::Roster(roster) => state.roster = roster,
-        ServerMessage::Snapshot(snapshot) => {
-            let now = net.now();
-            state.push_snapshot(now, snapshot);
-        }
+        ServerMessage::Snapshot(snapshot) => state.push_snapshot(render_now, snapshot),
         ServerMessage::Event(event) => {
             // A couple of events change the client's own world before they are
             // narrated; the rest are purely for the log.

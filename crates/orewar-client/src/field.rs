@@ -337,9 +337,10 @@ pub fn sync_hills(
 
 /// Builds a hill: a low, faceted dome of unit radius.
 ///
-/// The silhouette is jittered inward only. The simulation blocks a vehicle at
-/// the exact radius, so a bump that stuck out past it would show as a hull
-/// stopping against thin air.
+/// The footprint is exactly the unit circle, because that circle is what the
+/// simulation stops vehicles and shells against. Anything else -- larger or
+/// smaller -- shows up in play as collisions happening where the ground looks
+/// clear, or not happening where it looks solid.
 fn hill_mesh(seed: u64) -> Mesh {
     const RINGS: usize = 4;
     const SPOKES: usize = 20;
@@ -354,7 +355,13 @@ fn hill_mesh(seed: u64) -> Mesh {
         for spoke in 0..SPOKES {
             let angle = spoke as f32 / SPOKES as f32 * std::f32::consts::TAU;
             let (sin, cos) = angle.sin_cos();
-            let r = frac * rng.range_f32(0.86, 1.0);
+            let jitter = rng.range_f32(0.86, 1.0);
+            // The rim is the collision circle, exactly. Only the inner rings
+            // wander. Jittering the rim inward -- which is what this used to do
+            // -- leaves a ragged band around every hill that stops shells while
+            // looking like open grass, and a player reads that as a shot
+            // vanishing beside a hill that was plainly not in the way.
+            let r = if ring == 1 { frac } else { frac * jitter };
             // A raised-cosine profile: flat-topped and flat-footed, so the hill
             // meets the grass without a visible seam and has a summit rather
             // than a spike.
@@ -401,6 +408,51 @@ fn hill_mesh(seed: u64) -> Mesh {
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::mesh::VertexAttributeValues;
+
+    fn positions_of(mesh: &Mesh) -> Vec<[f32; 3]> {
+        match mesh.attribute(Mesh::ATTRIBUTE_POSITION).expect("mesh has positions") {
+            VertexAttributeValues::Float32x3(v) => v.clone(),
+            other => panic!("unexpected position format: {other:?}"),
+        }
+    }
+
+    /// What a hill looks like has to be what a hill *is*.
+    ///
+    /// `sync_hills` scales this mesh by the radius the simulation collides
+    /// against, so the drawn footprint has to be that same circle: no vertex
+    /// outside it, and the rim reaching it all the way round. When it was drawn
+    /// short, every hill carried a band of ground that ate shells while looking
+    /// like open grass.
+    #[test]
+    fn a_hill_is_drawn_exactly_as_wide_as_it_collides() {
+        for variant in 0..HILL_VARIANTS {
+            let mesh = hill_mesh(0x4111_0000_9AB1_0000 ^ variant as u64);
+            let positions = positions_of(&mesh);
+            assert!(!positions.is_empty());
+
+            let mut rim_seen = 0;
+            for [x, y, z] in &positions {
+                let r = x.hypot(*z);
+                assert!(r <= 1.0 + 1e-5, "variant {variant}: vertex sticks out to {r}");
+                // The rim sits at ground level, where the raised-cosine profile
+                // is zero; every one of those has to be on the circle.
+                if *y < 1e-5 {
+                    assert!(
+                        (r - 1.0).abs() < 1e-5,
+                        "variant {variant}: ground vertex at {r}, not on the collision circle"
+                    );
+                    rim_seen += 1;
+                }
+            }
+            assert!(rim_seen > 0, "variant {variant}: no rim vertices at ground level");
+        }
+    }
 }
 
 /// Builds one deposit's patch of ore-bearing rock: flat, jagged, barely raised.

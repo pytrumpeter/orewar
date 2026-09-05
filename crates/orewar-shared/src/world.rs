@@ -298,6 +298,12 @@ mod tests {
         let b = generate_ore(12345);
         assert_eq!(a, b);
         assert_ne!(generate_ore(1), generate_ore(2));
+
+        // The client and the server each generate the terrain from the seed
+        // rather than sending it, so anything but byte-identical output here
+        // means they disagree about where a shell stops.
+        assert_eq!(generate_hills(12345), generate_hills(12345));
+        assert_ne!(generate_hills(1), generate_hills(2));
     }
 
     #[test]
