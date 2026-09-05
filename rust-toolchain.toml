@@ -1,0 +1,5 @@
+# Bevy 0.19 requires rustc 1.95+. Pinned here rather than changing the machine's
+# default toolchain, so this project builds reproducibly without affecting
+# anything else installed on the system.
+[toolchain]
+channel = "1.98.1"

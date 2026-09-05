@@ -1,0 +1,8 @@
+[package]
+name = "orewar-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol, UDP reliability layer, and shared simulation math for Orewar."
+
+[dependencies]

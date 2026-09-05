@@ -1,0 +1,10 @@
+[package]
+name = "orewar-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Orewar Bevy client."
+
+[dependencies]
+orewar-shared.workspace = true
+bevy = "0.19.1"

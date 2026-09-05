@@ -1,0 +1,1538 @@
+//! The authoritative simulation.
+//!
+//! This is the only place game state actually changes. Clients send intent and
+//! render what comes back; everything that decides an outcome -- who was hit,
+//! who owns which harvester, whether a purchase can be afforded -- happens here.
+//!
+//! Player state is keyed by a client-supplied token rather than by socket
+//! address, so a player who drops out keeps their ore, power-ups, and vehicles
+//! and resumes the same slot when they reconnect.
+
+use std::collections::HashSet;
+
+use orewar_shared::math::{Vec2, angle_delta, wrap_angle};
+use orewar_shared::protocol::{
+    GameEvent, GameStatus, HitFx, HitKind, InputFrame, MAX_HITS_PER_SNAPSHOT, OreUpdate,
+    PlayerInfo, PlayerSnapshot, ProjectileKind,
+    ProjectileSnapshot, RejectReason, Snapshot, VehicleSlot, VehicleSnapshot,
+    MAX_PROJECTILES_PER_SNAPSHOT,
+};
+use orewar_shared::sim::{self, MoveState, VehicleKind};
+use orewar_shared::world::{
+    self, Hill, MAX_PLAYERS, MISSILES_PER_PACK, OreDeposit, PowerUp, STARTING_CREDITS,
+    STARTING_MISSILES,
+};
+
+/// How long a player's last input frame stays in effect.
+///
+/// Input arrives unreliably and a client that lags out simply stops sending.
+/// Without an expiry the server would keep applying whatever was last held --
+/// a dropped player would drive on at full throttle, firing, indefinitely.
+pub const INPUT_TIMEOUT: f32 = 0.5;
+
+/// One of a player's two vehicles.
+#[derive(Clone, Debug)]
+pub struct Vehicle {
+    pub mv: MoveState,
+    pub turret_yaw: f32,
+    pub shield: f32,
+    pub hull: f32,
+    pub cargo: f32,
+    /// A harvester at zero hull. It cannot move or harvest, and an enemy tank
+    /// can take it.
+    pub disabled: bool,
+    /// Capture progress while disabled, `0..=1`.
+    pub capture_progress: f32,
+    /// Seconds since last taking damage, gating shield regeneration.
+    pub since_damage: f32,
+    pub gun_cooldown: f32,
+    pub missile_cooldown: f32,
+}
+
+impl Vehicle {
+    fn spawn(kind: VehicleKind, pos: Vec2, yaw: f32, powerups: u16) -> Self {
+        Vehicle {
+            mv: MoveState { pos, yaw, speed: 0.0 },
+            turret_yaw: yaw,
+            shield: sim::max_shield(kind, powerups),
+            hull: sim::max_hull(kind, powerups),
+            cargo: 0.0,
+            disabled: false,
+            capture_progress: 0.0,
+            since_damage: sim::SHIELD_REGEN_DELAY,
+            gun_cooldown: 0.0,
+            missile_cooldown: 0.0,
+        }
+    }
+
+    fn to_snapshot(&self) -> VehicleSnapshot {
+        VehicleSnapshot {
+            pos: self.mv.pos,
+            yaw: self.mv.yaw,
+            turret_yaw: self.turret_yaw,
+            speed: self.mv.speed,
+            shield: self.shield,
+            hull: self.hull,
+            cargo: self.cargo,
+            disabled: self.disabled,
+            capture_progress: self.capture_progress,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Player {
+    pub id: u8,
+    pub name: String,
+    /// Stable identity across reconnects.
+    pub token: u64,
+    pub connected: bool,
+    pub eliminated: bool,
+    pub credits: u32,
+    pub ore_mined: u32,
+    pub powerups: u16,
+    pub missiles: u8,
+    pub captures: u8,
+    pub tank: Option<Vehicle>,
+    pub harvester: Option<Vehicle>,
+    /// Counts down while the tank is destroyed.
+    pub respawn_timer: f32,
+    pub input: InputFrame,
+    /// Seconds since a fresh input frame arrived.
+    pub input_age: f32,
+    /// Highest input tick accepted, echoed back so the client can reconcile.
+    pub acked_input: u32,
+}
+
+impl Player {
+    fn new(id: u8, token: u64, name: String) -> Self {
+        let base = world::base_position(id);
+        // Face the middle of the field, which is where the action is.
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - base).to_angle();
+        let tank_pos = base + Vec2::from_angle(inward) * 7.0;
+        let harvester_pos = base + Vec2::from_angle(inward).perp() * 7.0;
+        Player {
+            id,
+            name,
+            token,
+            connected: true,
+            eliminated: false,
+            credits: STARTING_CREDITS,
+            ore_mined: 0,
+            powerups: 0,
+            missiles: STARTING_MISSILES,
+            captures: 0,
+            tank: Some(Vehicle::spawn(VehicleKind::Tank, tank_pos, inward, 0)),
+            harvester: Some(Vehicle::spawn(VehicleKind::Harvester, harvester_pos, inward, 0)),
+            respawn_timer: 0.0,
+            input: InputFrame::default(),
+            input_age: 0.0,
+            acked_input: 0,
+        }
+    }
+
+    /// The input to actually simulate with.
+    ///
+    /// Once frames stop arriving the controls go neutral, so the vehicle coasts
+    /// to a stop and stops shooting. Aim is kept, since a turret left pointing
+    /// where it was is less jarring than one that snaps.
+    fn effective_input(&self) -> InputFrame {
+        if self.input_age > INPUT_TIMEOUT {
+            InputFrame {
+                controlling: self.input.controlling,
+                aim: self.input.aim,
+                tick: self.input.tick,
+                ..Default::default()
+            }
+        } else {
+            self.input
+        }
+    }
+
+    pub fn vehicle(&self, slot: VehicleSlot) -> Option<&Vehicle> {
+        match slot {
+            VehicleSlot::Tank => self.tank.as_ref(),
+            VehicleSlot::Harvester => self.harvester.as_ref(),
+        }
+    }
+
+    fn to_snapshot(&self) -> PlayerSnapshot {
+        PlayerSnapshot {
+            id: self.id,
+            connected: self.connected,
+            eliminated: self.eliminated,
+            credits: self.credits,
+            ore_mined: self.ore_mined,
+            powerups: self.powerups,
+            missiles: self.missiles,
+            captures: self.captures,
+            tank: self.tank.as_ref().map(Vehicle::to_snapshot),
+            harvester: self.harvester.as_ref().map(Vehicle::to_snapshot),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Projectile {
+    pub id: u16,
+    pub kind: ProjectileKind,
+    pub owner: u8,
+    pub pos: Vec2,
+    pub yaw: f32,
+    pub speed: f32,
+    pub life: f32,
+}
+
+/// A candidate for a projectile to hit.
+struct Target {
+    player: u8,
+    slot: VehicleSlot,
+    pos: Vec2,
+    radius: f32,
+}
+
+pub struct Game {
+    pub seed: u64,
+    pub tick: u32,
+    pub status: GameStatus,
+    pub winner: Option<u8>,
+    pub players: Vec<Option<Player>>,
+    pub ore: Vec<OreDeposit>,
+    /// Impassable ground. Regenerated from the seed, never sent on the wire.
+    pub hills: Vec<Hill>,
+    pub projectiles: Vec<Projectile>,
+    next_projectile_id: u16,
+    /// Deposits whose amount changed since the last full ore sync.
+    dirty_ore: HashSet<u16>,
+    /// Drained and broadcast each tick.
+    pub events: Vec<GameEvent>,
+    /// Impacts from this tick, for clients to draw. Cosmetic, so they ride
+    /// the unreliable snapshot and are dropped rather than queued.
+    fx: Vec<HitFx>,
+    /// Players who have ever joined, so a solo player is not declared winner.
+    joined: u8,
+}
+
+impl Game {
+    pub fn new(seed: u64) -> Self {
+        Game {
+            seed,
+            tick: 0,
+            status: GameStatus::Waiting,
+            winner: None,
+            players: vec![None; MAX_PLAYERS],
+            ore: world::generate_ore(seed),
+            hills: world::generate_hills(seed),
+            projectiles: Vec::new(),
+            next_projectile_id: 0,
+            dirty_ore: HashSet::new(),
+            events: Vec::new(),
+            fx: Vec::new(),
+            joined: 0,
+        }
+    }
+
+    pub fn player(&self, id: u8) -> Option<&Player> {
+        self.players.get(id as usize).and_then(|p| p.as_ref())
+    }
+
+    pub fn player_mut(&mut self, id: u8) -> Option<&mut Player> {
+        self.players.get_mut(id as usize).and_then(|p| p.as_mut())
+    }
+
+    pub fn roster(&self) -> Vec<PlayerInfo> {
+        self.players
+            .iter()
+            .flatten()
+            .map(|p| PlayerInfo { id: p.id, name: p.name.clone(), connected: p.connected })
+            .collect()
+    }
+
+    pub fn connected_count(&self) -> usize {
+        self.players.iter().flatten().filter(|p| p.connected).count()
+    }
+
+    /// Admits a player, resuming an existing slot when the token is recognised.
+    ///
+    /// Returning the same slot for a known token is what makes a dropped
+    /// connection recoverable: ore, power-ups, and both vehicles are exactly
+    /// where they were left.
+    pub fn join(&mut self, token: u64, name: &str) -> Option<u8> {
+        if let Some(p) = self.players.iter_mut().flatten().find(|p| p.token == token) {
+            p.connected = true;
+            if !name.is_empty() {
+                p.name = name.to_owned();
+            }
+            let id = p.id;
+            self.events.push(GameEvent::PlayerJoined { player: id });
+            return Some(id);
+        }
+
+        // Finished matches take no new players; a fresh one would have nothing
+        // to do but watch.
+        if self.status == GameStatus::Finished {
+            return None;
+        }
+
+        let slot = self.players.iter().position(Option::is_none)? as u8;
+        let display = if name.is_empty() {
+            world::PLAYER_COLOR_NAMES[slot as usize].to_owned()
+        } else {
+            name.to_owned()
+        };
+        self.players[slot as usize] = Some(Player::new(slot, token, display));
+        self.joined = self.joined.saturating_add(1);
+        self.events.push(GameEvent::PlayerJoined { player: slot });
+        Some(slot)
+    }
+
+    /// Marks a player offline. Their state and vehicles stay on the field.
+    /// Restarts the match on a fresh map, keeping who is in it.
+    ///
+    /// Everything a player *earned* goes: credits, power-ups, mined totals,
+    /// captures, and both vehicles, which return to their pads. Everything that
+    /// identifies them stays -- slot, name, token -- so a restart is not a
+    /// reconnect and nobody has to rejoin.
+    ///
+    /// `tick` deliberately keeps counting. Clients discard any snapshot whose
+    /// tick is not newer than the last one they hold, so winding it back would
+    /// make them ignore the entire new match.
+    pub fn restart(&mut self, seed: u64, by: u8) {
+        self.seed = seed;
+        self.ore = world::generate_ore(seed);
+        self.hills = world::generate_hills(seed);
+        self.dirty_ore.clear();
+        self.fx.clear();
+        self.projectiles.clear();
+        self.next_projectile_id = 0;
+        self.winner = None;
+        self.status = GameStatus::Waiting;
+
+        for slot in self.players.iter_mut() {
+            let Some(old) = slot.as_ref() else { continue };
+            // Rebuilt rather than field-by-field reset, so a field added to
+            // `Player` later cannot be forgotten here.
+            let mut fresh = Player::new(old.id, old.token, old.name.clone());
+            fresh.connected = old.connected;
+            *slot = Some(fresh);
+        }
+
+        self.events.push(GameEvent::MatchReset { world_seed: seed, by });
+        // A restart with enough players already present starts immediately;
+        // this is also what re-announces `MatchStarted`.
+        self.update_status();
+    }
+
+    pub fn disconnect(&mut self, id: u8) {
+        if let Some(p) = self.player_mut(id) {
+            if p.connected {
+                p.connected = false;
+                self.events.push(GameEvent::PlayerLeft { player: id });
+            }
+        }
+    }
+
+    /// Accepts an input frame, ignoring ones that arrive out of order.
+    ///
+    /// Inputs are unreliable and can be reordered by the network; replaying a
+    /// stale frame would jerk the vehicle backwards.
+    pub fn set_input(&mut self, id: u8, frame: InputFrame) {
+        if let Some(p) = self.player_mut(id) {
+            if frame.tick >= p.acked_input || p.acked_input == 0 {
+                p.acked_input = frame.tick;
+                p.input = frame;
+                p.input_age = 0.0;
+            }
+        }
+    }
+
+    pub fn purchase(&mut self, id: u8, powerup: PowerUp) {
+        let Some(p) = self.player_mut(id) else { return };
+        let event = if p.eliminated {
+            GameEvent::PurchaseRejected { powerup, reason: RejectReason::Eliminated }
+        } else if powerup.held(p.powerups) {
+            GameEvent::PurchaseRejected { powerup, reason: RejectReason::AlreadyOwned }
+        } else if p.credits < powerup.cost() {
+            GameEvent::PurchaseRejected { powerup, reason: RejectReason::NotEnoughCredits }
+        } else {
+            p.credits -= powerup.cost();
+            if powerup.is_consumable() {
+                p.missiles = p.missiles.saturating_add(MISSILES_PER_PACK);
+            } else {
+                p.powerups |= powerup.bit();
+                // Capacity upgrades take effect immediately rather than on the
+                // next respawn, which is what a player expects after paying.
+                let powerups = p.powerups;
+                if let Some(v) = p.tank.as_mut() {
+                    v.shield = v.shield.min(sim::max_shield(VehicleKind::Tank, powerups));
+                    v.hull = v.hull.min(sim::max_hull(VehicleKind::Tank, powerups));
+                }
+                if let Some(v) = p.harvester.as_mut() {
+                    v.shield = v.shield.min(sim::max_shield(VehicleKind::Harvester, powerups));
+                    v.hull = v.hull.min(sim::max_hull(VehicleKind::Harvester, powerups));
+                }
+            }
+            GameEvent::PurchaseAccepted { powerup, credits: p.credits }
+        };
+        self.events.push(event);
+    }
+
+    // -----------------------------------------------------------------------
+    // Simulation
+    // -----------------------------------------------------------------------
+
+    pub fn step(&mut self, dt: f32) {
+        self.tick = self.tick.wrapping_add(1);
+        self.update_status();
+        for p in self.players.iter_mut().flatten() {
+            p.input_age += dt;
+        }
+
+        if self.status == GameStatus::Finished {
+            // Let projectiles finish flying, but stop everything else.
+            self.step_projectiles(dt);
+            return;
+        }
+
+        self.step_vehicles(dt);
+        self.step_weapons(dt);
+        self.step_projectiles(dt);
+        self.step_economy(dt);
+        self.step_capture(dt);
+        self.step_respawns(dt);
+        self.check_victory();
+    }
+
+    fn update_status(&mut self) {
+        if self.status == GameStatus::Waiting && self.connected_count() >= 2 {
+            self.status = GameStatus::Running;
+            self.events.push(GameEvent::MatchStarted);
+        }
+    }
+
+    fn step_vehicles(&mut self, dt: f32) {
+        for slot_index in 0..self.players.len() {
+            let Some(p) = self.players[slot_index].as_mut() else { continue };
+            let powerups = p.powerups;
+            let input = p.effective_input();
+            let controlling = input.controlling;
+            let (throttle, steer, aim) = (input.throttle, input.steer, input.aim);
+
+            for slot in [VehicleSlot::Tank, VehicleSlot::Harvester] {
+                let kind = slot.kind();
+                let Some(v) = (match slot {
+                    VehicleSlot::Tank => p.tank.as_mut(),
+                    VehicleSlot::Harvester => p.harvester.as_mut(),
+                }) else {
+                    continue;
+                };
+
+                if v.disabled {
+                    v.mv.speed = 0.0;
+                } else if slot == controlling {
+                    sim::step_vehicle(&mut v.mv, throttle, steer, kind, powerups, &self.hills, dt);
+                } else {
+                    // An unattended vehicle coasts to a halt and holds station.
+                    // A harvester parked on ore keeps working, which is what
+                    // makes leaving it there while you fight worthwhile.
+                    sim::step_vehicle(&mut v.mv, 0.0, 0.0, kind, powerups, &self.hills, dt);
+                }
+
+                if slot == VehicleSlot::Tank {
+                    let desired = if slot == controlling { aim } else { v.mv.yaw };
+                    v.turret_yaw = sim::step_turret(v.turret_yaw, desired, dt);
+                }
+
+                // Shields come back only after a lull, so sustained fire stays
+                // meaningful.
+                v.since_damage += dt;
+                if v.since_damage >= sim::SHIELD_REGEN_DELAY && !v.disabled {
+                    let max = sim::max_shield(kind, powerups);
+                    v.shield = (v.shield + sim::shield_regen_rate(powerups) * dt).min(max);
+                }
+                v.gun_cooldown = (v.gun_cooldown - dt).max(0.0);
+                v.missile_cooldown = (v.missile_cooldown - dt).max(0.0);
+            }
+        }
+    }
+
+    fn step_weapons(&mut self, dt: f32) {
+        let _ = dt;
+        let targets = self.collect_targets();
+        let mut spawned: Vec<Projectile> = Vec::new();
+
+        for slot_index in 0..self.players.len() {
+            let Some(p) = self.players[slot_index].as_mut() else { continue };
+            if p.eliminated {
+                continue;
+            }
+            let owner = p.id;
+
+            // Tank guns, under direct control.
+            let input = p.effective_input();
+            if input.controlling == VehicleSlot::Tank {
+                let fire_primary = input.fire_primary;
+                let fire_secondary = input.fire_secondary;
+                let missiles = p.missiles;
+                if let Some(tank) = p.tank.as_mut() {
+                    let muzzle = tank.mv.pos + Vec2::from_angle(tank.turret_yaw) * 3.4;
+                    if fire_primary && tank.gun_cooldown <= 0.0 {
+                        tank.gun_cooldown = sim::BULLET_COOLDOWN;
+                        spawned.push(Projectile {
+                            id: 0,
+                            kind: ProjectileKind::Bullet,
+                            owner,
+                            pos: muzzle,
+                            yaw: tank.turret_yaw,
+                            speed: sim::BULLET_SPEED,
+                            life: sim::BULLET_LIFETIME,
+                        });
+                    }
+                    if fire_secondary && tank.missile_cooldown <= 0.0 && missiles > 0 {
+                        tank.missile_cooldown = sim::MISSILE_COOLDOWN;
+                        p.missiles = missiles - 1;
+                        spawned.push(Projectile {
+                            id: 0,
+                            kind: ProjectileKind::Missile,
+                            owner,
+                            pos: muzzle,
+                            yaw: tank.turret_yaw,
+                            speed: sim::MISSILE_LAUNCH_SPEED,
+                            life: sim::MISSILE_LIFETIME,
+                        });
+                    }
+                }
+            }
+
+            // The harvester cannot be aimed by the player; with the Auto Turret
+            // upgrade it defends itself.
+            if PowerUp::AutoTurret.held(p.powerups) {
+                if let Some(h) = p.harvester.as_mut() {
+                    if !h.disabled {
+                        let nearest = targets
+                            .iter()
+                            .filter(|t| t.player != owner)
+                            .map(|t| (t.pos.distance(h.mv.pos), t.pos))
+                            .filter(|(d, _)| *d <= sim::AUTO_TURRET_RANGE)
+                            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                        if let Some((_, target_pos)) = nearest {
+                            let desired = (target_pos - h.mv.pos).to_angle();
+                            h.turret_yaw = sim::step_turret(h.turret_yaw, desired, dt);
+                            if h.gun_cooldown <= 0.0
+                                && angle_delta(h.turret_yaw, desired).abs() < 0.15
+                            {
+                                h.gun_cooldown = sim::AUTO_TURRET_COOLDOWN;
+                                spawned.push(Projectile {
+                                    id: 0,
+                                    kind: ProjectileKind::Bullet,
+                                    owner,
+                                    pos: h.mv.pos + Vec2::from_angle(h.turret_yaw) * 3.2,
+                                    yaw: h.turret_yaw,
+                                    speed: sim::BULLET_SPEED,
+                                    life: sim::BULLET_LIFETIME * 0.7,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for mut proj in spawned {
+            proj.id = self.next_projectile_id;
+            self.next_projectile_id = self.next_projectile_id.wrapping_add(1);
+            self.projectiles.push(proj);
+        }
+    }
+
+    fn collect_targets(&self) -> Vec<Target> {
+        let mut out = Vec::new();
+        for p in self.players.iter().flatten() {
+            if p.eliminated {
+                continue;
+            }
+            if let Some(v) = &p.tank {
+                out.push(Target {
+                    player: p.id,
+                    slot: VehicleSlot::Tank,
+                    pos: v.mv.pos,
+                    radius: sim::tuning(VehicleKind::Tank).radius,
+                });
+            }
+            if let Some(v) = &p.harvester {
+                out.push(Target {
+                    player: p.id,
+                    slot: VehicleSlot::Harvester,
+                    pos: v.mv.pos,
+                    radius: sim::tuning(VehicleKind::Harvester).radius,
+                });
+            }
+        }
+        out
+    }
+
+    fn step_projectiles(&mut self, dt: f32) {
+        let targets = self.collect_targets();
+        // Moved aside for the duration: `retain_mut` below holds a mutable
+        // borrow of `self.projectiles`, and the terrain cannot change mid-tick.
+        let hills = std::mem::take(&mut self.hills);
+        let mut hits: Vec<(u8, VehicleSlot, f32, u8, f32)> = Vec::new();
+        // Moved aside for the same reason the terrain is: `retain_mut` holds
+        // `self.projectiles` for the whole pass.
+        let mut fx = std::mem::take(&mut self.fx);
+
+        self.projectiles.retain_mut(|proj| {
+            proj.life -= dt;
+            if proj.life <= 0.0 {
+                return false;
+            }
+
+            if proj.kind == ProjectileKind::Missile {
+                // Seek the nearest target inside a forward cone, so missiles can
+                // be broken off by getting out of their arc.
+                let heading = Vec2::from_angle(proj.yaw);
+                let best = targets
+                    .iter()
+                    .filter(|t| t.player != proj.owner)
+                    .filter_map(|t| {
+                        let to = t.pos - proj.pos;
+                        let dist = to.length();
+                        if dist > sim::MISSILE_SEEK_RANGE || dist < 1e-3 {
+                            return None;
+                        }
+                        let bearing = to.to_angle();
+                        if angle_delta(proj.yaw, bearing).abs() > sim::MISSILE_SEEK_CONE {
+                            return None;
+                        }
+                        Some((dist, bearing))
+                    })
+                    .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let _ = heading;
+                if let Some((_, bearing)) = best {
+                    proj.yaw = orewar_shared::math::angle_approach(
+                        proj.yaw,
+                        bearing,
+                        sim::MISSILE_TURN_RATE * dt,
+                    );
+                }
+                proj.speed = (proj.speed + sim::MISSILE_ACCEL * dt).min(sim::MISSILE_MAX_SPEED);
+            }
+
+            let from = proj.pos;
+            let to = from + Vec2::from_angle(proj.yaw) * (proj.speed * dt);
+
+            // Swept test: a projectile covers several units per tick, so a
+            // point test at each end would let glancing shots pass through.
+            let mut earliest: Option<(f32, &Target)> = None;
+            for t in targets.iter().filter(|t| t.player != proj.owner) {
+                if let Some(hit) = sim::segment_circle_hit(from, to, t.pos, t.radius) {
+                    if earliest.map_or(true, |(best, _)| hit < best) {
+                        earliest = Some((hit, t));
+                    }
+                }
+            }
+
+            // Terrain is cover: a hill in front of the target eats the shot.
+            // Tested against the same swept segment and compared on the same
+            // scale, so whichever is actually nearer is what stops it.
+            if let Some(terrain) = sim::segment_hill_hit(from, to, &hills) {
+                if earliest.map_or(true, |(best, _)| terrain < best) {
+                    if proj.kind == ProjectileKind::Missile {
+                        fx.push(HitFx::on_terrain(HitKind::Blast, from.lerp(to, terrain)));
+                    }
+                    return false;
+                }
+            }
+
+            if let Some((at, target)) = earliest {
+                let damage = match proj.kind {
+                    ProjectileKind::Bullet => sim::BULLET_DAMAGE,
+                    ProjectileKind::Missile => sim::MISSILE_DAMAGE,
+                };
+                // The bearing from the hull's centre out to where it was
+                // struck, which is the face the shield has to flash on.
+                let impact = from.lerp(to, at);
+                let bearing = (impact - target.pos).to_angle();
+                if proj.kind == ProjectileKind::Missile {
+                    fx.push(HitFx::on_terrain(HitKind::Blast, impact));
+                }
+                hits.push((target.player, target.slot, damage, proj.owner, bearing));
+                return false;
+            }
+
+            proj.pos = to;
+            let bound = world::WORLD_SIZE;
+            proj.pos.x > 0.0 && proj.pos.x < bound && proj.pos.y > 0.0 && proj.pos.y < bound
+        });
+
+        self.hills = hills;
+        self.fx = fx;
+
+        for (player, slot, damage, attacker, bearing) in hits {
+            self.damage_vehicle(player, slot, damage, attacker, bearing);
+        }
+    }
+
+    /// `bearing` is the direction the blow came in on, used only to place
+    /// the shield flash on the right face.
+    fn damage_vehicle(
+        &mut self,
+        player: u8,
+        slot: VehicleSlot,
+        damage: f32,
+        attacker: u8,
+        bearing: f32,
+    ) {
+        // Reached through the field rather than through `player_mut`, so that
+        // borrowing one player leaves the rest of the game -- `events`, `fx` --
+        // still reachable while the vehicle is in hand.
+        let Some(p) = self.players.get_mut(player as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        let powerups = p.powerups;
+        let Some(v) = (match slot {
+            VehicleSlot::Tank => p.tank.as_mut(),
+            VehicleSlot::Harvester => p.harvester.as_mut(),
+        }) else {
+            return;
+        };
+        if v.disabled {
+            return;
+        }
+
+        v.since_damage = 0.0;
+        // Read before the damage lands: afterwards a broken shield and a
+        // shield that was already down look the same.
+        let absorbed = v.shield > 0.0;
+        let at = v.mv.pos;
+        let hull = sim::apply_damage(&mut v.shield, &mut v.hull, damage);
+        if absorbed {
+            self.fx.push(HitFx::on_vehicle(HitKind::Shield, at, bearing, player, slot));
+        }
+        if hull > 0.0 {
+            return;
+        }
+
+        match slot {
+            VehicleSlot::Tank => {
+                // Tanks are replaceable; losing one costs you tempo, not the match.
+                p.tank = None;
+                p.respawn_timer = sim::TANK_RESPAWN_DELAY;
+                self.events.push(GameEvent::TankDestroyed { player, by: attacker });
+            }
+            VehicleSlot::Harvester => {
+                // Harvesters are never destroyed. They go dead in the water and
+                // become something an enemy tank has to come and take.
+                v.disabled = true;
+                v.capture_progress = 0.0;
+                v.cargo = 0.0;
+                let _ = powerups;
+                self.events.push(GameEvent::HarvesterDisabled { player });
+            }
+        }
+    }
+
+    fn step_economy(&mut self, dt: f32) {
+        for slot_index in 0..self.players.len() {
+            let Some(p) = self.players[slot_index].as_mut() else { continue };
+            if p.eliminated {
+                continue;
+            }
+            let powerups = p.powerups;
+            let id = p.id;
+            let Some(h) = p.harvester.as_mut() else { continue };
+            if h.disabled {
+                continue;
+            }
+
+            // Draw ore while stopped over a deposit.
+            let capacity = sim::cargo_capacity(powerups);
+            if h.cargo < capacity && h.mv.speed.abs() <= sim::HARVEST_MAX_SPEED {
+                let mut best: Option<usize> = None;
+                let mut best_dist = f32::MAX;
+                for (i, deposit) in self.ore.iter().enumerate() {
+                    if deposit.amount <= 0.0 {
+                        continue;
+                    }
+                    let d = deposit.pos.distance(h.mv.pos);
+                    if d <= sim::HARVEST_RADIUS && d < best_dist {
+                        best_dist = d;
+                        best = Some(i);
+                    }
+                }
+                if let Some(i) = best {
+                    let take = (sim::HARVEST_RATE * dt).min(capacity - h.cargo).min(self.ore[i].amount);
+                    self.ore[i].amount -= take;
+                    h.cargo += take;
+                    self.dirty_ore.insert(i as u16);
+                }
+            }
+
+            // Unload at the home pad.
+            if h.cargo > 0.0 && sim::is_at_base(h.mv.pos, id) {
+                let moved = (sim::UNLOAD_RATE * dt).min(h.cargo);
+                h.cargo -= moved;
+                // Credits are whole units; the fraction stays aboard rather
+                // than evaporating.
+                let whole = moved.floor().max(0.0) as u32;
+                let remainder = moved - whole as f32;
+                h.cargo += remainder;
+                p.credits += whole;
+                p.ore_mined += whole;
+            }
+        }
+    }
+
+    fn step_capture(&mut self, dt: f32) {
+        // Positions of every tank, so we can see who is standing over a wreck.
+        let tanks: Vec<(u8, Vec2)> = self
+            .players
+            .iter()
+            .flatten()
+            .filter(|p| !p.eliminated)
+            .filter_map(|p| p.tank.as_ref().map(|t| (p.id, t.mv.pos)))
+            .collect();
+
+        let mut captures: Vec<(u8, u8)> = Vec::new();
+        let mut rescued: Vec<u8> = Vec::new();
+
+        for slot_index in 0..self.players.len() {
+            let Some(p) = self.players[slot_index].as_mut() else { continue };
+            if p.eliminated {
+                continue;
+            }
+            let owner = p.id;
+            let powerups = p.powerups;
+            let Some(h) = p.harvester.as_mut() else { continue };
+            if !h.disabled {
+                continue;
+            }
+
+            let mut captor: Option<u8> = None;
+            let mut owner_present = false;
+            for (tank_owner, pos) in &tanks {
+                if pos.distance(h.mv.pos) > sim::CAPTURE_RADIUS {
+                    continue;
+                }
+                if *tank_owner == owner {
+                    owner_present = true;
+                } else if captor.is_none() {
+                    captor = Some(*tank_owner);
+                }
+            }
+
+            match (owner_present, captor) {
+                // Both sides standing on the wreck. The defender denies the
+                // capture, but repairing under the guns of the tank parked on
+                // top of it is not something they get for free: progress holds
+                // where it is, and whoever gives up the ground first decides how
+                // this ends. Without this the defender simply outran the capture
+                // -- a rescue takes about three seconds against a four-second
+                // capture -- so a contested harvester could never be taken and
+                // spent the fight flicking between wreck and running.
+                (true, Some(_)) => {}
+
+                // Your own tank alone over your harvester patches it up, which
+                // is what gives a disabled harvester a way back into the match.
+                (true, None) => {
+                    let max_hull = sim::max_hull(VehicleKind::Harvester, powerups);
+                    h.hull = (h.hull + sim::RESCUE_REPAIR_RATE * dt).min(max_hull);
+                    h.capture_progress = (h.capture_progress - dt / sim::CAPTURE_TIME).max(0.0);
+                    if h.hull >= max_hull * sim::REENABLE_HULL_FRACTION {
+                        h.disabled = false;
+                        h.capture_progress = 0.0;
+                        h.shield = 0.0;
+                        h.since_damage = 0.0;
+                        rescued.push(owner);
+                    }
+                }
+
+                (false, Some(by)) => {
+                    h.capture_progress += dt / sim::CAPTURE_TIME;
+                    if h.capture_progress >= 1.0 {
+                        captures.push((by, owner));
+                    }
+                }
+
+                // Nobody in range; progress decays so a partial attempt does
+                // not linger indefinitely.
+                (false, None) => {
+                    h.capture_progress =
+                        (h.capture_progress - dt / (sim::CAPTURE_TIME * 2.0)).max(0.0);
+                }
+            }
+        }
+
+        for player in rescued {
+            self.events.push(GameEvent::HarvesterRescued { player });
+        }
+        for (by, from) in captures {
+            self.apply_capture(by, from);
+        }
+    }
+
+    fn apply_capture(&mut self, by: u8, from: u8) {
+        if let Some(victim) = self.player_mut(from) {
+            victim.harvester = None;
+            victim.eliminated = true;
+            // A player with no harvester has nothing left to defend, so their
+            // tank leaves the field with it.
+            victim.tank = None;
+        }
+        if let Some(captor) = self.player_mut(by) {
+            captor.captures = captor.captures.saturating_add(1);
+        }
+        self.events.push(GameEvent::HarvesterCaptured { by, from });
+        self.events.push(GameEvent::PlayerEliminated { player: from });
+        // Anything still in the air belonged to a fight that is now over.
+        self.projectiles.retain(|p| p.owner != from);
+    }
+
+    fn step_respawns(&mut self, dt: f32) {
+        let mut respawned = Vec::new();
+        for slot_index in 0..self.players.len() {
+            let Some(p) = self.players[slot_index].as_mut() else { continue };
+            if p.eliminated || p.tank.is_some() {
+                continue;
+            }
+            p.respawn_timer -= dt;
+            if p.respawn_timer > 0.0 {
+                continue;
+            }
+            let base = world::base_position(p.id);
+            let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - base).to_angle();
+            p.tank = Some(Vehicle::spawn(
+                VehicleKind::Tank,
+                base + Vec2::from_angle(inward) * 7.0,
+                inward,
+                p.powerups,
+            ));
+            respawned.push(p.id);
+        }
+        for player in respawned {
+            self.events.push(GameEvent::TankRespawned { player });
+        }
+    }
+
+    fn check_victory(&mut self) {
+        if self.status != GameStatus::Running || self.joined < 2 {
+            return;
+        }
+        let alive: Vec<u8> =
+            self.players.iter().flatten().filter(|p| !p.eliminated).map(|p| p.id).collect();
+        if alive.len() == 1 {
+            let winner = alive[0];
+            self.status = GameStatus::Finished;
+            self.winner = Some(winner);
+            self.events.push(GameEvent::GameOver { winner });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshots
+    // -----------------------------------------------------------------------
+
+    /// Builds the view of the world sent to one player.
+    ///
+    /// Projectiles are ranked by distance from that player's own vehicle and cut
+    /// to a fixed budget, because bullets are dense and a far-off firefight is
+    /// not worth risking a fragmented packet over.
+    pub fn snapshot_for(&self, viewer: u8, full_ore: bool) -> Snapshot {
+        let eye = self
+            .player(viewer)
+            .and_then(|p| {
+                p.vehicle(p.input.controlling).or(p.tank.as_ref()).or(p.harvester.as_ref())
+            })
+            .map(|v| v.mv.pos)
+            .unwrap_or(Vec2::splat(world::WORLD_SIZE * 0.5));
+
+        let mut projectiles: Vec<&Projectile> = self.projectiles.iter().collect();
+        if projectiles.len() > MAX_PROJECTILES_PER_SNAPSHOT {
+            projectiles.sort_by(|a, b| {
+                a.pos.distance_squared(eye).partial_cmp(&b.pos.distance_squared(eye)).unwrap()
+            });
+            projectiles.truncate(MAX_PROJECTILES_PER_SNAPSHOT);
+        }
+
+        // Cosmetic and capped, so when more happens at once than fits, the
+        // nearest impacts are the ones worth the bytes.
+        let mut hits = self.fx.clone();
+        if hits.len() > MAX_HITS_PER_SNAPSHOT {
+            let eye = self
+                .player(viewer)
+                .and_then(|p| p.tank.as_ref().or(p.harvester.as_ref()))
+                .map_or(Vec2::splat(world::WORLD_SIZE * 0.5), |v| v.mv.pos);
+            hits.sort_by(|a, b| {
+                a.pos.distance_squared(eye).total_cmp(&b.pos.distance_squared(eye))
+            });
+            hits.truncate(MAX_HITS_PER_SNAPSHOT);
+        }
+
+        let ore = if full_ore {
+            self.ore
+                .iter()
+                .enumerate()
+                .map(|(i, o)| OreUpdate { id: i as u16, amount: o.amount.round().max(0.0) as u16 })
+                .collect()
+        } else {
+            self.dirty_ore
+                .iter()
+                .filter_map(|&id| {
+                    self.ore.get(id as usize).map(|o| OreUpdate {
+                        id,
+                        amount: o.amount.round().max(0.0) as u16,
+                    })
+                })
+                .collect()
+        };
+
+        Snapshot {
+            tick: self.tick,
+            status: self.status,
+            winner: self.winner,
+            acked_input: self.player(viewer).map_or(0, |p| p.acked_input),
+            players: self.players.iter().flatten().map(Player::to_snapshot).collect(),
+            projectiles: projectiles
+                .into_iter()
+                .map(|p| ProjectileSnapshot {
+                    id: p.id,
+                    kind: p.kind,
+                    owner: p.owner,
+                    pos: p.pos,
+                    yaw: wrap_angle(p.yaw),
+                })
+                .collect(),
+            ore_is_full_sync: full_ore,
+            ore,
+            hits,
+        }
+    }
+
+    /// Called once per tick after every client has been served.
+    pub fn clear_dirty_ore(&mut self) {
+        self.dirty_ore.clear();
+        self.fx.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orewar_shared::world::TICK_DT;
+
+    fn two_player_game() -> Game {
+        let mut g = Game::new(1234);
+        g.join(1, "one").unwrap();
+        g.join(2, "two").unwrap();
+        g.step(TICK_DT);
+        g
+    }
+
+    #[test]
+    fn a_match_starts_once_two_players_connect() {
+        let mut g = Game::new(1);
+        assert_eq!(g.status, GameStatus::Waiting);
+        g.join(1, "solo").unwrap();
+        g.step(TICK_DT);
+        assert_eq!(g.status, GameStatus::Waiting, "one player is not a match");
+        g.join(2, "other").unwrap();
+        g.step(TICK_DT);
+        assert_eq!(g.status, GameStatus::Running);
+    }
+
+    #[test]
+    fn players_start_in_their_own_corners() {
+        let g = two_player_game();
+        for id in 0..2u8 {
+            let p = g.player(id).unwrap();
+            let base = world::base_position(id);
+            assert!(p.tank.as_ref().unwrap().mv.pos.distance(base) < 15.0);
+            assert!(p.harvester.as_ref().unwrap().mv.pos.distance(base) < 15.0);
+        }
+        let a = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+        let b = g.player(1).unwrap().tank.as_ref().unwrap().mv.pos;
+        assert!(a.distance(b) > 200.0, "opponents should start far apart");
+    }
+
+    #[test]
+    fn a_reconnecting_token_resumes_the_same_player() {
+        let mut g = two_player_game();
+        g.player_mut(0).unwrap().credits = 9999;
+        g.player_mut(0).unwrap().powerups = PowerUp::Radar.bit();
+        g.disconnect(0);
+        assert!(!g.player(0).unwrap().connected);
+        // The vehicles stay on the field while the player is away.
+        assert!(g.player(0).unwrap().harvester.is_some());
+
+        let id = g.join(1, "one").unwrap();
+        assert_eq!(id, 0, "same token must resume the same slot");
+        assert_eq!(g.player(0).unwrap().credits, 9999, "state must survive the drop");
+        assert!(g.player(0).unwrap().connected);
+    }
+
+    #[test]
+    fn a_restart_keeps_the_players_and_replaces_everything_else() {
+        let mut g = two_player_game();
+        g.player_mut(0).unwrap().credits = 9999;
+        g.player_mut(0).unwrap().powerups = PowerUp::Radar.bit();
+        g.player_mut(0).unwrap().ore_mined = 500;
+        g.player_mut(0).unwrap().captures = 2;
+        g.disconnect(1);
+        let ore_before = g.ore.clone();
+        let tick_before = g.tick;
+
+        g.restart(999, 0);
+
+        // Identity survives; a restart is not a reconnect.
+        assert_eq!(g.player(0).unwrap().name, "one");
+        assert_eq!(g.player(0).unwrap().token, 1);
+        assert_eq!(g.player(1).unwrap().name, "two");
+        assert!(g.player(0).unwrap().connected);
+        assert!(!g.player(1).unwrap().connected, "who is here must not change either");
+
+        // Everything earned is gone.
+        let p = g.player(0).unwrap();
+        assert_eq!(p.credits, STARTING_CREDITS);
+        assert_eq!(p.powerups, 0);
+        assert_eq!(p.ore_mined, 0);
+        assert_eq!(p.captures, 0);
+        assert!(p.tank.is_some() && p.harvester.is_some());
+        assert_eq!(p.input, InputFrame::default(), "a held key must not cross over");
+
+        assert_eq!(g.seed, 999);
+        assert_ne!(g.ore, ore_before, "a restart is a new map");
+        assert_eq!(g.winner, None);
+        // Clients drop any snapshot not newer than the last one they hold, so
+        // winding the tick back would make them ignore the whole new match.
+        assert_eq!(g.tick, tick_before, "the tick must keep counting");
+        assert!(g.events.contains(&GameEvent::MatchReset { world_seed: 999, by: 0 }));
+    }
+
+    #[test]
+    fn a_restart_with_two_players_present_starts_straight_away() {
+        let mut g = two_player_game();
+        assert_eq!(g.status, GameStatus::Running);
+        g.restart(7, 1);
+        assert_eq!(g.status, GameStatus::Running, "nobody should have to rejoin");
+    }
+
+    #[test]
+    fn a_full_server_turns_away_a_fifth_player() {
+        let mut g = Game::new(1);
+        for i in 0..MAX_PLAYERS as u64 {
+            assert!(g.join(i + 1, "p").is_some());
+        }
+        assert_eq!(g.join(99, "late"), None);
+    }
+
+    #[test]
+    fn harvesting_moves_ore_into_cargo_then_into_credits() {
+        let mut g = two_player_game();
+        let deposit = g.ore[0].pos;
+        {
+            let h = g.player_mut(0).unwrap().harvester.as_mut().unwrap();
+            h.mv.pos = deposit;
+            h.mv.speed = 0.0;
+        }
+        let before = g.ore[0].amount;
+        for _ in 0..30 {
+            g.step(TICK_DT);
+        }
+        assert!(g.ore[0].amount < before, "deposit should deplete");
+        let cargo = g.player(0).unwrap().harvester.as_ref().unwrap().cargo;
+        assert!(cargo > 0.0, "harvester should be carrying ore");
+
+        // Teleport home and let it unload.
+        g.player_mut(0).unwrap().harvester.as_mut().unwrap().mv.pos = world::base_position(0);
+        let credits_before = g.player(0).unwrap().credits;
+        for _ in 0..60 {
+            g.step(TICK_DT);
+        }
+        assert!(g.player(0).unwrap().credits > credits_before, "ore should convert to credits");
+    }
+
+    #[test]
+    fn a_moving_harvester_cannot_harvest() {
+        let mut g = two_player_game();
+        let deposit = g.ore[0].pos;
+        {
+            let p = g.player_mut(0).unwrap();
+            p.input.controlling = VehicleSlot::Harvester;
+            p.input.throttle = 1.0;
+            let h = p.harvester.as_mut().unwrap();
+            h.mv.pos = deposit;
+            h.mv.speed = sim::HARVEST_MAX_SPEED + 3.0;
+        }
+        g.step(TICK_DT);
+        assert_eq!(g.player(0).unwrap().harvester.as_ref().unwrap().cargo, 0.0);
+    }
+
+    #[test]
+    fn purchases_are_validated_against_credits_and_duplicates() {
+        let mut g = two_player_game();
+        g.player_mut(0).unwrap().credits = 0;
+        g.events.clear();
+        g.purchase(0, PowerUp::Radar);
+        assert!(matches!(
+            g.events.last(),
+            Some(GameEvent::PurchaseRejected { reason: RejectReason::NotEnoughCredits, .. })
+        ));
+
+        g.player_mut(0).unwrap().credits = 10_000;
+        g.events.clear();
+        g.purchase(0, PowerUp::Radar);
+        assert!(matches!(g.events.last(), Some(GameEvent::PurchaseAccepted { .. })));
+        assert!(PowerUp::Radar.held(g.player(0).unwrap().powerups));
+        assert_eq!(g.player(0).unwrap().credits, 10_000 - PowerUp::Radar.cost());
+
+        g.events.clear();
+        g.purchase(0, PowerUp::Radar);
+        assert!(matches!(
+            g.events.last(),
+            Some(GameEvent::PurchaseRejected { reason: RejectReason::AlreadyOwned, .. })
+        ));
+    }
+
+    #[test]
+    fn missile_packs_stack_because_they_are_consumable() {
+        let mut g = two_player_game();
+        g.player_mut(0).unwrap().credits = 10_000;
+        let before = g.player(0).unwrap().missiles;
+        g.purchase(0, PowerUp::MissilePack);
+        g.purchase(0, PowerUp::MissilePack);
+        assert_eq!(g.player(0).unwrap().missiles, before + MISSILES_PER_PACK * 2);
+    }
+
+    #[test]
+    fn a_destroyed_tank_respawns_at_base() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Tank, 100_000.0, 1, 0.0);
+        assert!(g.player(0).unwrap().tank.is_none());
+        assert!(!g.player(0).unwrap().eliminated, "losing a tank is not elimination");
+
+        for _ in 0..((sim::TANK_RESPAWN_DELAY / TICK_DT) as usize + 4) {
+            g.step(TICK_DT);
+        }
+        let tank = g.player(0).unwrap().tank.as_ref().expect("tank should return");
+        assert!(tank.mv.pos.distance(world::base_position(0)) < 15.0);
+    }
+
+    #[test]
+    fn a_harvester_is_disabled_rather_than_destroyed() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let h = g.player(0).unwrap().harvester.as_ref().expect("harvester must remain");
+        assert!(h.disabled);
+        assert_eq!(h.hull, 0.0);
+        assert!(!g.player(0).unwrap().eliminated, "it has to be captured, not just shot");
+    }
+
+    #[test]
+    fn an_enemy_tank_captures_a_disabled_harvester_and_wins() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        // Vehicles spawn within capture range of each other, so the owner's tank
+        // has to be drawn away before the wreck is actually takeable.
+        g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = Vec2::splat(128.0);
+
+        // Park player 1's tank on top of it and hold.
+        for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 4) {
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.step(TICK_DT);
+        }
+
+        assert!(g.player(0).unwrap().eliminated);
+        assert!(g.player(0).unwrap().harvester.is_none(), "the harvester changed hands");
+        assert_eq!(g.player(1).unwrap().captures, 1);
+        assert_eq!(g.status, GameStatus::Finished);
+        assert_eq!(g.winner, Some(1));
+    }
+
+    #[test]
+    fn an_owner_can_rescue_their_own_disabled_harvester() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+
+        for _ in 0..600 {
+            g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.step(TICK_DT);
+            if !g.player(0).unwrap().harvester.as_ref().unwrap().disabled {
+                break;
+            }
+        }
+        assert!(!g.player(0).unwrap().harvester.as_ref().unwrap().disabled, "should be repaired");
+        assert!(!g.player(0).unwrap().eliminated);
+    }
+
+    #[test]
+    fn an_owner_tank_contests_an_enemy_capture() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize * 2) {
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.step(TICK_DT);
+        }
+        assert!(!g.player(0).unwrap().eliminated, "a defended harvester must not be taken");
+    }
+
+    /// The other half of contesting: standing over your own wreck denies the
+    /// capture, but it does not repair it while an enemy is there too. The
+    /// defender has to clear them off first.
+    #[test]
+    fn a_contested_wreck_is_neither_taken_nor_repaired() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        let hull = g.player(0).unwrap().harvester.as_ref().unwrap().hull;
+
+        for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize * 2) {
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
+            g.step(TICK_DT);
+        }
+
+        let h = g.player(0).unwrap().harvester.as_ref().unwrap();
+        assert!(h.disabled, "a contested wreck stays a wreck");
+        assert_eq!(h.hull, hull, "no free repairs with an enemy tank on top of it");
+        assert_eq!(g.player(1).unwrap().captures, 0, "and it is not taken either");
+    }
+
+    #[test]
+    fn bullets_damage_enemies_and_never_their_owner() {
+        let mut g = two_player_game();
+        // Put player 1's tank directly in front of player 0's gun.
+        let shooter = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+        g.player_mut(0).unwrap().tank.as_mut().unwrap().turret_yaw = 0.0;
+        let firing = |tick: u32| InputFrame {
+            tick,
+            controlling: VehicleSlot::Tank,
+            fire_primary: true,
+            aim: 0.0,
+            ..Default::default()
+        };
+        let victim_pos = shooter + Vec2::new(20.0, 0.0);
+        g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = victim_pos;
+        let own_harvester_shield = g.player(0).unwrap().harvester.as_ref().unwrap().shield;
+
+        let start = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+        for tick in 0..30u32 {
+            g.set_input(0, firing(tick + 1));
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = victim_pos;
+            g.step(TICK_DT);
+        }
+        assert!(
+            g.player(1).unwrap().tank.as_ref().unwrap().shield < start,
+            "the target should have taken fire"
+        );
+        assert_eq!(
+            g.player(0).unwrap().harvester.as_ref().unwrap().shield,
+            own_harvester_shield,
+            "a player's own vehicles must be immune to their fire"
+        );
+    }
+
+    /// A duplicate of the shooting setup above with a hill dropped in between:
+    /// the same shots that connect over open ground must not connect through
+    /// terrain.
+    #[test]
+    fn a_hill_between_two_tanks_is_cover() {
+        let fire_for_a_while = |g: &mut Game| {
+            let shooter = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+            g.player_mut(0).unwrap().tank.as_mut().unwrap().turret_yaw = 0.0;
+            let victim_pos = shooter + Vec2::new(30.0, 0.0);
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = victim_pos;
+            let start = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+            for tick in 0..40u32 {
+                g.set_input(0, InputFrame {
+                    tick: tick + 1,
+                    controlling: VehicleSlot::Tank,
+                    fire_primary: true,
+                    aim: 0.0,
+                    ..Default::default()
+                });
+                // Held in place; this test is about the shots, not the driving.
+                g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = victim_pos;
+                g.step(TICK_DT);
+            }
+            start - g.player(1).unwrap().tank.as_ref().unwrap().shield
+        };
+
+        let mut open = two_player_game();
+        open.hills.clear();
+        assert!(fire_for_a_while(&mut open) > 0.0, "the shot must land over open ground");
+
+        let mut blocked = two_player_game();
+        let shooter = blocked.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
+        blocked.hills = vec![Hill { pos: shooter + Vec2::new(15.0, 0.0), radius: 6.0 }];
+        assert_eq!(fire_for_a_while(&mut blocked), 0.0, "the hill should have eaten every shot");
+    }
+
+    #[test]
+    fn a_shield_that_soaks_a_hit_reports_a_flash_and_a_hull_hit_does_not() {
+        let mut g = two_player_game();
+        let at = g.player(1).unwrap().tank.as_ref().unwrap().mv.pos;
+
+        g.damage_vehicle(1, VehicleSlot::Tank, 10.0, 0, 1.5);
+        let fx = g.snapshot_for(0, false).hits;
+        assert_eq!(fx.len(), 1, "a soaked hit should flash");
+        assert_eq!(fx[0].kind, HitKind::Shield);
+        assert_eq!(fx[0].target(), Some((1, VehicleSlot::Tank)));
+        assert!(fx[0].pos.distance(at) < 0.02, "the flash belongs on the vehicle");
+
+        // Strip the shield, then hit the hull: nothing left to absorb anything.
+        g.clear_dirty_ore();
+        g.player_mut(1).unwrap().tank.as_mut().unwrap().shield = 0.0;
+        g.damage_vehicle(1, VehicleSlot::Tank, 10.0, 0, 1.5);
+        assert!(g.snapshot_for(0, false).hits.is_empty(), "a bare hull has no shield to flash");
+    }
+
+    #[test]
+    fn a_missile_into_a_hill_reports_a_blast() {
+        let mut g = two_player_game();
+        g.hills = vec![Hill { pos: Vec2::new(120.0, 100.0), radius: 8.0 }];
+        g.projectiles.push(Projectile {
+            id: 1,
+            kind: ProjectileKind::Missile,
+            owner: 0,
+            pos: Vec2::new(100.0, 100.0),
+            yaw: 0.0,
+            speed: sim::MISSILE_MAX_SPEED,
+            life: sim::MISSILE_LIFETIME,
+        });
+        // Long enough to cross the 12 units to the near face, short enough that
+        // it could not have crossed the whole hill.
+        for _ in 0..8 {
+            g.step(TICK_DT);
+        }
+
+        assert!(g.projectiles.is_empty(), "the hill should have stopped the missile");
+        let fx = g.snapshot_for(0, false).hits;
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].kind, HitKind::Blast);
+        assert_eq!(fx[0].target(), None, "terrain is not a vehicle");
+        assert!(fx[0].pos.x < 120.0, "the blast belongs at the near face, not the middle");
+    }
+
+    #[test]
+    fn shields_regenerate_only_after_a_lull() {
+        let mut g = two_player_game();
+        g.damage_vehicle(0, VehicleSlot::Tank, 30.0, 1, 0.0);
+        let hurt = g.player(0).unwrap().tank.as_ref().unwrap().shield;
+
+        g.step(TICK_DT);
+        assert_eq!(g.player(0).unwrap().tank.as_ref().unwrap().shield, hurt, "no instant regen");
+
+        for _ in 0..((sim::SHIELD_REGEN_DELAY / TICK_DT) as usize + 30) {
+            g.step(TICK_DT);
+        }
+        assert!(g.player(0).unwrap().tank.as_ref().unwrap().shield > hurt, "shields should recover");
+    }
+
+    /// A player who stops sending must coast to a halt, not drive on forever.
+    #[test]
+    fn input_expires_when_a_client_goes_quiet() {
+        let mut g = two_player_game();
+        g.set_input(0, InputFrame { tick: 1, throttle: 1.0, ..Default::default() });
+        for _ in 0..15 {
+            g.step(TICK_DT);
+        }
+        assert!(g.player(0).unwrap().tank.as_ref().unwrap().mv.speed > 5.0, "should be underway");
+
+        // Now go silent. Nothing refreshes the input frame.
+        for _ in 0..((INPUT_TIMEOUT / TICK_DT) as usize + 60) {
+            g.step(TICK_DT);
+        }
+        assert!(
+            g.player(0).unwrap().tank.as_ref().unwrap().mv.speed.abs() < 0.5,
+            "a silent client's tank should stop, not keep driving: speed {}",
+            g.player(0).unwrap().tank.as_ref().unwrap().mv.speed
+        );
+    }
+
+    #[test]
+    fn stale_input_frames_are_ignored() {
+        let mut g = two_player_game();
+        g.set_input(0, InputFrame { tick: 100, throttle: 1.0, ..Default::default() });
+        g.set_input(0, InputFrame { tick: 50, throttle: -1.0, ..Default::default() });
+        assert_eq!(g.player(0).unwrap().input.tick, 100);
+        assert!(g.player(0).unwrap().input.throttle > 0.0, "the older frame must not win");
+    }
+
+    #[test]
+    fn snapshots_stay_within_the_packet_budget_under_load() {
+        use orewar_shared::bytes::Encode;
+        use orewar_shared::net::MAX_UNRELIABLE;
+        use orewar_shared::protocol::ServerMessage;
+
+        let mut g = Game::new(9);
+        for i in 0..MAX_PLAYERS as u64 {
+            g.join(i + 1, "player").unwrap();
+        }
+        // Everyone firing everything, for many ticks.
+        for i in 0..MAX_PLAYERS as u8 {
+            let p = g.player_mut(i).unwrap();
+            p.credits = 100_000;
+            p.missiles = 200;
+        }
+        for i in 0..MAX_PLAYERS as u8 {
+            g.purchase(i, PowerUp::AutoTurret);
+        }
+        let firing = |tick: u32| InputFrame {
+            tick,
+            controlling: VehicleSlot::Tank,
+            fire_primary: true,
+            fire_secondary: true,
+            ..Default::default()
+        };
+        for tick in 0..400u32 {
+            // Input expires, so a live client keeps sending it every tick.
+            for id in 0..MAX_PLAYERS as u8 {
+                g.set_input(id, firing(tick + 1));
+            }
+            g.step(TICK_DT);
+            for viewer in 0..MAX_PLAYERS as u8 {
+                let snap = g.snapshot_for(viewer, tick % 30 == 0);
+                let bytes = ServerMessage::Snapshot(snap).to_vec();
+                assert!(
+                    bytes.len() <= MAX_UNRELIABLE,
+                    "snapshot grew to {} bytes at tick {tick}",
+                    bytes.len()
+                );
+            }
+        }
+        assert!(!g.projectiles.is_empty(), "the test should actually have produced traffic");
+    }
+
+    #[test]
+    fn the_simulation_is_reproducible() {
+        let run = || {
+            let mut g = Game::new(777);
+            g.join(1, "a");
+            g.join(2, "b");
+            for i in 0..300 {
+                for id in 0..2u8 {
+                    g.set_input(
+                        id,
+                        InputFrame {
+                            tick: i,
+                            controlling: VehicleSlot::Tank,
+                            throttle: 1.0,
+                            steer: ((i % 11) as f32 - 5.0) / 5.0,
+                            aim: i as f32 * 0.05,
+                            fire_primary: i % 5 == 0,
+                            fire_secondary: false,
+                        },
+                    );
+                }
+                g.step(TICK_DT);
+            }
+            let p = g.player(0).unwrap();
+            (p.tank.as_ref().unwrap().mv.pos, p.credits, g.projectiles.len())
+        };
+        assert_eq!(run(), run());
+    }
+}

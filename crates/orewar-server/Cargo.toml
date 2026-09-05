@@ -1,0 +1,9 @@
+[package]
+name = "orewar-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authoritative Orewar game server."
+
+[dependencies]
+orewar-shared.workspace = true
