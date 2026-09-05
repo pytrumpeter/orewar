@@ -10,6 +10,13 @@
 //!   your own steering is the difference between a game that feels responsive
 //!   and one that feels broken, so the client runs the shared step function on
 //!   its own input immediately, and reconciles against authority as it arrives.
+//!
+//! Both are then drawn on the *render* clock rather than the simulation one.
+//! Prediction advances in `FixedUpdate` at [`world::TICK_HZ`], so reading its
+//! state straight out would move your vehicle in 30 Hz steps however fast the
+//! screen refreshes -- which looks exactly like network stutter but has nothing
+//! to do with the network. [`Prediction::render_pos`] slides between the last
+//! two simulation steps instead.
 
 use std::collections::VecDeque;
 
@@ -127,6 +134,10 @@ pub struct Prediction {
     pub active: bool,
     pub slot: VehicleSlot,
     pub state: MoveState,
+    /// Where the vehicle was one simulation step ago, so a frame landing
+    /// between two steps can be drawn between the two positions rather than
+    /// snapped to the newer one.
+    previous: MoveState,
     /// Inputs sent but not yet confirmed, replayed after every correction.
     history: VecDeque<InputFrame>,
     /// Residual error, held separately and decayed toward zero so corrections
@@ -137,12 +148,18 @@ pub struct Prediction {
 
 impl Prediction {
     /// Position to actually draw, including the un-decayed correction.
-    pub fn render_pos(&self) -> SimVec2 {
-        self.state.pos + self.offset
+    ///
+    /// `alpha` is how far the current frame sits between the last simulation
+    /// step and the next one, from `Time<Fixed>::overstep_fraction`. Without it
+    /// the vehicle would hold still for a whole 33 ms and then jump, which at
+    /// any refresh rate above the tick rate is visible as a constant judder.
+    pub fn render_pos(&self, alpha: f32) -> SimVec2 {
+        self.previous.pos.lerp(self.state.pos, alpha) + self.offset
     }
 
-    pub fn render_yaw(&self) -> f32 {
-        math::wrap_angle(self.state.yaw + self.yaw_offset)
+    pub fn render_yaw(&self, alpha: f32) -> f32 {
+        let yaw = math::angle_lerp(self.previous.yaw, self.state.yaw, alpha);
+        math::wrap_angle(yaw + self.yaw_offset)
     }
 
     /// Steps prediction forward with the input the client just sent.
@@ -157,6 +174,7 @@ impl Prediction {
             self.history.clear();
             return;
         }
+        self.previous = self.state;
         // Impacts are the server's to charge for, and it does not tell the
         // client about the other vehicles at all, so the outcome is nothing this
         // side can act on.
@@ -211,6 +229,11 @@ impl Prediction {
                 TICK_DT,
             );
         }
+
+        // A correction is not a simulation step, so there is nothing to slide
+        // between: both ends of the interpolation become the corrected state and
+        // the residual is carried by `offset`, which decays on the render clock.
+        self.previous = self.state;
 
         if was_active {
             // Fold the difference into the visual offset instead of moving the
@@ -407,7 +430,10 @@ impl GameState {
     }
 
     /// Rebuilds [`RenderWorld`] for the current frame.
-    pub fn interpolate(&mut self, now: f64, dt: f32) {
+    ///
+    /// `alpha` is how far this frame sits between the last simulation step and
+    /// the next; see [`Prediction::render_pos`].
+    pub fn interpolate(&mut self, now: f64, dt: f32, alpha: f32) {
         self.prediction.decay(dt);
 
         let target = now - INTERP_DELAY;
@@ -461,17 +487,20 @@ impl GameState {
                 }
 
                 for pb in &b.projectiles {
-                    let pos = match a.projectiles.iter().find(|p| p.id == pb.id) {
-                        Some(pa) => pa.pos.lerp(pb.pos, t),
-                        // Newly fired: no earlier position to come from.
-                        None => pb.pos,
+                    // Heading as well as position: a missile turns as it flies,
+                    // and taking the newer yaw straight made it snap between
+                    // snapshots while its body slid smoothly.
+                    let (pos, yaw) = match a.projectiles.iter().find(|p| p.id == pb.id) {
+                        Some(pa) => (pa.pos.lerp(pb.pos, t), math::angle_lerp(pa.yaw, pb.yaw, t)),
+                        // Newly fired: no earlier state to come from.
+                        None => (pb.pos, pb.yaw),
                     };
                     projectiles.push(RenderProjectile {
                         id: pb.id,
                         kind: pb.kind,
                         owner: pb.owner,
                         pos,
-                        yaw: pb.yaw,
+                        yaw,
                     });
                 }
             }
@@ -510,8 +539,8 @@ impl GameState {
         // interpolated (and therefore stale) snapshot stream.
         if let (Some(local), true) = (self.local_player, self.prediction.active) {
             let slot = self.prediction.slot;
-            let pos = self.prediction.render_pos();
-            let yaw = self.prediction.render_yaw();
+            let pos = self.prediction.render_pos(alpha);
+            let yaw = self.prediction.render_yaw(alpha);
             if let Some(Some(player)) = players.get_mut(local as usize) {
                 let target = match slot {
                     VehicleSlot::Tank => player.tank.as_mut(),
@@ -529,10 +558,17 @@ impl GameState {
 }
 
 /// Rebuilds the render view each frame.
-pub fn interpolate_system(mut state: ResMut<GameState>, time: Res<Time>) {
+pub fn interpolate_system(
+    mut state: ResMut<GameState>,
+    time: Res<Time>,
+    fixed: Res<Time<Fixed>>,
+) {
     let now = time.elapsed_secs_f64();
     let dt = time.delta_secs();
-    state.interpolate(now, dt);
+    // How far this frame has run past the last fixed step. Prediction only
+    // advances on those steps, so this is what turns 30 Hz motion into motion at
+    // the refresh rate.
+    state.interpolate(now, dt, fixed.overstep_fraction());
 }
 
 #[cfg(test)]
@@ -564,7 +600,7 @@ mod tests {
         s.push_snapshot(0.0, snapshot(1, 0.0));
         s.push_snapshot(1.0, snapshot(2, 10.0));
         // Render time lands exactly halfway between the two.
-        s.interpolate(0.5 + INTERP_DELAY, 0.016);
+        s.interpolate(0.5 + INTERP_DELAY, 0.016, 1.0);
         let x = s.render.players[0].as_ref().unwrap().tank.unwrap().pos.x;
         assert!((x - 5.0).abs() < 1e-3, "expected the midpoint, got {x}");
     }
@@ -581,8 +617,34 @@ mod tests {
     fn the_newest_snapshot_is_shown_before_the_buffer_fills() {
         let mut s = GameState::default();
         s.push_snapshot(0.0, snapshot(1, 42.0));
-        s.interpolate(0.0, 0.016);
+        s.interpolate(0.0, 0.016, 1.0);
         assert_eq!(s.render.players[0].as_ref().unwrap().tank.unwrap().pos.x, 42.0);
+    }
+
+    /// A frame between two simulation steps has to be drawn between the two
+    /// positions.
+    ///
+    /// Prediction advances 30 times a second; the screen draws far more often
+    /// than that. Reading the stepped state straight held the vehicle still and
+    /// then jumped it, which reads as network stutter even in a local game.
+    #[test]
+    fn a_frame_between_two_steps_is_drawn_between_two_positions() {
+        let mut p = Prediction { active: true, ..Default::default() };
+        let frame =
+            InputFrame { tick: 1, controlling: VehicleSlot::Tank, throttle: 1.0, steer: 0.0, ..Default::default() };
+        // Two steps, so there is a real gap to slide across.
+        p.apply(frame, 0, &[]);
+        p.apply(InputFrame { tick: 2, ..frame }, 0, &[]);
+
+        let (start, end) = (p.previous.pos, p.state.pos);
+        assert!(end.x > start.x, "the tank has to have moved for this to mean anything");
+
+        assert!((p.render_pos(0.0) - start).length() < 1e-4, "alpha 0 draws the older step");
+        assert!((p.render_pos(1.0) - end).length() < 1e-4, "alpha 1 draws the newer step");
+
+        let mid = p.render_pos(0.5);
+        let expected = start.lerp(end, 0.5);
+        assert!((mid - expected).length() < 1e-4, "a half-step frame drew {mid:?}, not {expected:?}");
     }
 
     /// Prediction must land where authority does once inputs are replayed.
@@ -691,7 +753,7 @@ mod tests {
             &[],
         );
         assert!(
-            p.render_pos().distance(SimVec2::new(200.0, 200.0)) < 1e-3,
+            p.render_pos(1.0).distance(SimVec2::new(200.0, 200.0)) < 1e-3,
             "a large error should be taken immediately, not eased into"
         );
     }
