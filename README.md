@@ -106,16 +106,25 @@ empty bank, and every upgrade you had bought. So a bigger match has a second way
 home, for when everyone keeps coming back — three captures wins it outright.
 
 **Gunnery.** A tank shell carries about a tenth of the field and then falls
-short. A gunfight is therefore fought at a range where both hulls are already
-committed — you cannot stand off and trade — and walking into somebody's corner
-means fighting their emplacement on its own terms, since a plain shell and that
-gun cover about the same ground. **Long Barrel** doubles your reach, which is
-what buys the ability to shell an emplacement from outside its own.
+short, so a gunfight is fought at a range where both hulls are already
+committed — you cannot stand off and trade. **Long Barrel** doubles your reach
+to a fifth of the field.
 
-The emplacement and the harvester's auto turret are unaffected by any of this:
-their shells are sized from their own engagement ranges rather than from the
-tank's, so shortening the tank's gun again cannot leave either one firing at
-something it can no longer hit.
+**The emplacement**, though, reaches a *third* of the field. Nothing a tank can
+bring outranges it, so somebody's corner is ground you cross under fire and take
+by wearing the gun down, not by standing off and shelling it. What the range
+does not buy it is accuracy: it aims where a target is, and its shell takes
+nearly two seconds to cross that distance, so far out it punishes what is
+parked, approaching, or leaving rather than what is crossing. There is no ring
+drawn on the ground — you learn where it reaches by being shot at.
+
+Missiles are the way to answer one without standing in front of it: they seek,
+they will lock a standing emplacement, and they fly far enough that the tank
+launching them can sit outside its reach.
+
+Both it and the harvester's auto turret size their shells from their own
+engagement ranges rather than from the tank's, so retuning the tank's gun
+cannot leave either one firing at something it can no longer hit.
 
 **Upgrades.** Radar (a HUD contact circle), Shield Booster, Turbo Drive,
 Harvester Armor, Auto Turret (the harvester defends itself), Long Barrel, and

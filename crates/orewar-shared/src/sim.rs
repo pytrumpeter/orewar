@@ -255,13 +255,13 @@ pub const BULLET_DAMAGE: f32 = 14.0;
 /// How long a shell flies before it falls short, and so how far it reaches:
 /// [`BULLET_SPEED`] times this, about 50 units of a 480-unit field.
 ///
-/// A tenth of the field. At that reach a gunfight is fought where both hulls
-/// are already committed: you cannot stand off and trade, and walking into
-/// somebody's corner means trading with their emplacement on its own terms,
-/// since a plain shell and [`SENTINEL_RANGE`] now cover about the same ground.
-/// [`PowerUp::LongBarrel`] doubles it -- which is what buys back the ability to
-/// shell an emplacement from outside its reach, and is the whole of what that
-/// upgrade does.
+/// A tenth of the field, and [`PowerUp::LongBarrel`] doubles it to a fifth. At
+/// that reach a gunfight is fought where both hulls are already committed:
+/// there is no standing off and trading.
+///
+/// Neither figure comes near [`SENTINEL_RANGE`], which is deliberate -- an
+/// emplacement is not something a tank can outrange, and a missile is what
+/// answers one from outside its reach.
 pub const BULLET_LIFETIME: f32 = 0.55;
 pub const BULLET_COOLDOWN: f32 = 0.22;
 
@@ -306,9 +306,6 @@ pub const RAM_SPEED_LOSS: f32 = 0.55;
 /// Seconds without taking damage before shields begin to regenerate.
 pub const SHIELD_REGEN_DELAY: f32 = 4.0;
 
-/// How far a base emplacement will engage. Longer than the harvester's own
-/// turret: it is the thing that makes walking into somebody's corner cost
-/// something, so it has to reach past the pad it is defending.
 /// How long losing your harvester keeps you off the field.
 ///
 /// Long enough to be the worst thing that can happen to you and short enough
@@ -326,7 +323,22 @@ pub const CAPTURE_LOCKOUT: f32 = 60.0;
 /// it is yours whoever is still standing.
 pub const CAPTURES_TO_WIN: u8 = 3;
 
-pub const SENTINEL_RANGE: f32 = 55.0;
+/// How far a base emplacement will engage.
+///
+/// It is the thing that makes walking into somebody's corner cost something,
+/// and it reaches a long way out to do it: a third of the field, far enough
+/// that a tank crosses open ground under fire long before it can answer.
+/// Nothing a tank can bring outranges it -- a plain shell reaches about a
+/// tenth of the field and [`PowerUp::LongBarrel`] a fifth -- so a base is
+/// taken by closing on it and wearing the gun down, not by standing off.
+///
+/// Its shells are sized from this by [`shell_life_covering`], so moving it
+/// cannot leave the gun firing at what it can no longer hit. What this does
+/// not buy is accuracy: the emplacement aims where a target *is*, and a shell
+/// takes nearly two seconds to cross that range, so out at the edge it
+/// punishes anything parked, approaching, or leaving rather than anything
+/// crossing.
+pub const SENTINEL_RANGE: f32 = 165.0;
 /// One shell a second.
 pub const SENTINEL_COOLDOWN: f32 = 1.0;
 pub const SENTINEL_HULL: f32 = 120.0;
