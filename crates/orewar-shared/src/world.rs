@@ -239,16 +239,18 @@ pub enum PowerUp {
     HarvesterArmor = 3,
     AutoTurret = 4,
     MissilePack = 5,
+    LongBarrel = 6,
 }
 
 impl PowerUp {
-    pub const ALL: [PowerUp; 6] = [
+    pub const ALL: [PowerUp; 7] = [
         PowerUp::Radar,
         PowerUp::ShieldBooster,
         PowerUp::Turbo,
         PowerUp::HarvesterArmor,
         PowerUp::AutoTurret,
         PowerUp::MissilePack,
+        PowerUp::LongBarrel,
     ];
 
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -263,6 +265,7 @@ impl PowerUp {
             PowerUp::HarvesterArmor => 450,
             PowerUp::AutoTurret => 800,
             PowerUp::MissilePack => 250,
+            PowerUp::LongBarrel => 400,
         }
     }
 
@@ -274,6 +277,7 @@ impl PowerUp {
             PowerUp::HarvesterArmor => "Harvester Armor",
             PowerUp::AutoTurret => "Auto Turret",
             PowerUp::MissilePack => "Missile Pack",
+            PowerUp::LongBarrel => "Long Barrel",
         }
     }
 
@@ -285,6 +289,7 @@ impl PowerUp {
             PowerUp::HarvesterArmor => "+60 harvester hull and +25% cargo capacity",
             PowerUp::AutoTurret => "Harvester defends itself against nearby enemies",
             PowerUp::MissilePack => "+6 missiles for your tank",
+            PowerUp::LongBarrel => "Tank shells fly twice as far",
         }
     }
 

@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use orewar_shared::bytes::{Decode, Encode};
 use orewar_shared::net::{Endpoint, Incoming, MAX_PACKET, PacketKind, begin_packet, parse_packet};
 use orewar_shared::protocol::{
-    ClientMessage, GameStatus, InputFrame, PROTOCOL_ID, ServerMessage, Snapshot, VehicleSlot,
+    ClientMessage, DenyReason, GameStatus, InputFrame, PROTOCOL_ID, ServerMessage, Snapshot,
+    VehicleSlot,
 };
 use orewar_shared::world::{PowerUp, TICK_DT};
 
@@ -198,6 +199,40 @@ fn idle(slot: VehicleSlot) -> InputFrame {
     InputFrame { controlling: slot, ..Default::default() }
 }
 
+/// Asks to join and reports what the server said: the slot it handed out, or
+/// the reason it turned us away.
+///
+/// [`TestClient::connect`] insists on being let in; this is for the tests about
+/// not being.
+fn join_verdict(server: SocketAddr, token: u64, name: &str) -> Result<u8, DenyReason> {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    socket.connect(server).expect("connect to the server");
+    socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut buf = [0u8; MAX_PACKET];
+    while Instant::now() < deadline {
+        let mut w = begin_packet(PROTOCOL_ID, PacketKind::ConnectionRequest);
+        w.u64(token).string(name);
+        socket.send(w.as_slice()).expect("send a connection request");
+
+        let retry_at = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < retry_at {
+            let Ok(n) = socket.recv(&mut buf) else { continue };
+            let Ok((kind, mut r)) = parse_packet(PROTOCOL_ID, &buf[..n]) else { continue };
+            match kind {
+                PacketKind::ConnectionAccepted => return Ok(r.u8().unwrap()),
+                PacketKind::ConnectionDenied => {
+                    let raw = r.u8().unwrap();
+                    return Err(DenyReason::from_u8(raw).expect("a reason the client can show"));
+                }
+                _ => {}
+            }
+        }
+    }
+    panic!("the server never answered the handshake");
+}
+
 #[test]
 fn a_client_can_join_and_receives_the_world() {
     let server = start_server(4242);
@@ -312,6 +347,12 @@ fn reconnecting_with_the_same_token_resumes_the_same_player() {
     let player_id = one.player_id;
     drop(one);
 
+    // Long enough for the server to tell a client that is gone from one that is
+    // still playing: a request on a live connection's token is a second copy of
+    // the same client and is refused, and a real reconnect has to be on the
+    // other side of that.
+    std::thread::sleep(Duration::from_millis(700));
+
     // Come back on a brand new socket -- a different address entirely.
     let mut resumed = TestClient::connect(server.addr, 111, "One");
     assert_eq!(resumed.player_id, player_id, "the same token must resume the same slot");
@@ -332,30 +373,43 @@ fn reconnecting_with_the_same_token_resumes_the_same_player() {
 #[test]
 fn a_fifth_player_is_turned_away() {
     let server = start_server(5);
-    let mut clients: Vec<TestClient> =
-        (0..4).map(|i| TestClient::connect(server.addr, 900 + i, "Player")).collect();
+    let mut clients: Vec<TestClient> = (0..4)
+        .map(|i| TestClient::connect(server.addr, 900 + i, &format!("Player{i}")))
+        .collect();
     for c in &mut clients {
         c.drain();
     }
 
-    // The server is full, so the handshake gets a denial rather than an accept.
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.connect(server.addr).unwrap();
-    socket.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    // Refused, and told why: the client shows the reason to whoever is staring
+    // at a window that did not open.
+    assert_eq!(
+        join_verdict(server.addr, 12_345, "Latecomer"),
+        Err(DenyReason::ServerFull),
+        "a fifth player should be refused"
+    );
+}
 
-    let mut denied = false;
-    let mut buf = [0u8; MAX_PACKET];
-    for _ in 0..20 {
-        let mut w = begin_packet(PROTOCOL_ID, PacketKind::ConnectionRequest);
-        w.u64(12_345).string("Latecomer");
-        socket.send(w.as_slice()).unwrap();
-        if let Ok(n) = socket.recv(&mut buf) {
-            if let Ok((PacketKind::ConnectionDenied, _)) = parse_packet(PROTOCOL_ID, &buf[..n]) {
-                denied = true;
-                break;
-            }
-        }
-    }
-    assert!(denied, "a fifth player should be refused");
+/// Two people playing under one name is not a cosmetic problem: the client
+/// derives its identity from the name, so both would land in the same slot and
+/// each handshake would retire the other's connection, forever.
+#[test]
+fn a_name_that_is_already_playing_is_refused() {
+    let server = start_server(17);
+    let mut ash = TestClient::connect(server.addr, 1, "Ash");
+    ash.run_until(idle(VehicleSlot::Tank), 5.0, "the first snapshot", |c| c.latest.is_some());
+
+    // Somebody else's machine, same name: a different token, caught by the
+    // names already on the roster.
+    assert_eq!(join_verdict(server.addr, 2, "Ash"), Err(DenyReason::NameTaken));
+
+    // A second copy of the same client, which hashes the same name into the
+    // same token: caught by the first one still talking.
+    ash.pump(idle(VehicleSlot::Tank));
+    assert_eq!(join_verdict(server.addr, 1, "Ash"), Err(DenyReason::NameTaken));
+
+    // And neither attempt cost the player who was there first anything.
+    ash.latest = None;
+    ash.run_until(idle(VehicleSlot::Tank), 5.0, "snapshots to keep coming", |c| c.latest.is_some());
+    assert_eq!(ash.player_id, 0);
 }
 

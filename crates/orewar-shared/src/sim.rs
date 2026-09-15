@@ -89,6 +89,32 @@ pub fn speed_multiplier(powerups: u16) -> f32 {
     if PowerUp::Turbo.held(powerups) { 1.3 } else { 1.0 }
 }
 
+/// How long a shell fired by a player's *tank* lives.
+pub fn bullet_lifetime(powerups: u16) -> f32 {
+    if PowerUp::LongBarrel.held(powerups) {
+        BULLET_LIFETIME * LONG_BARREL_MULTIPLIER
+    } else {
+        BULLET_LIFETIME
+    }
+}
+
+/// Shell life for a gun that engages at a fixed range of its own.
+///
+/// The emplacement in a player's corner and the harvester's auto turret stop
+/// firing at [`SENTINEL_RANGE`] and [`AUTO_TURRET_RANGE`], so their shells are
+/// sized from those rather than from the tank's gun -- which is tuned for how a
+/// gunfight should feel and has been shortened twice.
+///
+/// A gun that fires at what its shell cannot reach is just noise: it leaves a
+/// ring at the edge of its range where it keeps shooting and nothing lands.
+/// Sharing the tank's number had already put the auto turret about two units
+/// inside that, and left the emplacement under one unit clear of it.
+///
+/// The quarter on top is for a target still moving away when the shot leaves.
+pub fn shell_life_covering(range: f32) -> f32 {
+    range * 1.25 / BULLET_SPEED
+}
+
 pub fn cargo_capacity(powerups: u16) -> f32 {
     let base = 60.0;
     if PowerUp::HarvesterArmor.held(powerups) { base * 1.25 } else { base }
@@ -225,8 +251,22 @@ pub const TURRET_TURN_RATE: f32 = 2.8;
 
 pub const BULLET_SPEED: f32 = 90.0;
 pub const BULLET_DAMAGE: f32 = 14.0;
-pub const BULLET_LIFETIME: f32 = 2.2;
+
+/// How long a shell flies before it falls short, and so how far it reaches:
+/// [`BULLET_SPEED`] times this, about 50 units of a 480-unit field.
+///
+/// A tenth of the field. At that reach a gunfight is fought where both hulls
+/// are already committed: you cannot stand off and trade, and walking into
+/// somebody's corner means trading with their emplacement on its own terms,
+/// since a plain shell and [`SENTINEL_RANGE`] now cover about the same ground.
+/// [`PowerUp::LongBarrel`] doubles it -- which is what buys back the ability to
+/// shell an emplacement from outside its reach, and is the whole of what that
+/// upgrade does.
+pub const BULLET_LIFETIME: f32 = 0.55;
 pub const BULLET_COOLDOWN: f32 = 0.22;
+
+/// What [`PowerUp::LongBarrel`] multiplies a tank shell's reach by.
+pub const LONG_BARREL_MULTIPLIER: f32 = 2.0;
 
 pub const MISSILE_LAUNCH_SPEED: f32 = 34.0;
 pub const MISSILE_MAX_SPEED: f32 = 82.0;
@@ -271,15 +311,19 @@ pub const SHIELD_REGEN_DELAY: f32 = 4.0;
 /// something, so it has to reach past the pad it is defending.
 /// How long losing your harvester keeps you off the field.
 ///
-/// Long enough to be the worst thing that can happen to you and short
-/// enough that it is a setback rather than the end of your match. You come
-/// back with your upgrades and nothing else.
+/// Long enough to be the worst thing that can happen to you and short enough
+/// that it is a setback rather than the end of your match -- as long as there
+/// is somebody else still playing to come back to. In a two-player match there
+/// is not, and losing your harvester loses it: the win goes to whoever is left
+/// on the field, and it goes the moment the capture lands.
 pub const CAPTURE_LOCKOUT: f32 = 60.0;
 
-/// Captures needed to win.
+/// Captures that win a match outright, without waiting to clear the field.
 ///
-/// A capture no longer removes anybody, so being last one standing cannot
-/// end a match any more; taking three harvesters is what does.
+/// The ending that matters is being the last one on the field. This is the
+/// other way home for a bigger match, where a capture keeps putting somebody
+/// off for a minute and everybody keeps coming back: take three harvesters and
+/// it is yours whoever is still standing.
 pub const CAPTURES_TO_WIN: u8 = 3;
 
 pub const SENTINEL_RANGE: f32 = 55.0;
@@ -772,6 +816,38 @@ mod tests {
             s
         };
         assert_eq!(run(), run());
+    }
+
+    /// A gun that fires at what its shell cannot reach is just noise, and it
+    /// would leave a ring around every base at which nobody could hit anybody.
+    ///
+    /// The tank's gun is tuned for play and keeps getting shorter; these two
+    /// are not, and must not be shortened along with it by accident.
+    #[test]
+    fn the_fixed_guns_outreach_what_they_shoot_at() {
+        for range in [SENTINEL_RANGE, AUTO_TURRET_RANGE] {
+            let reach = BULLET_SPEED * shell_life_covering(range);
+            assert!(reach > range, "a gun firing at {range} throws a shell {reach}");
+        }
+    }
+
+    /// The gun is a short-range weapon now, and the upgrade is what makes it
+    /// a medium-range one.
+    #[test]
+    fn a_long_barrel_doubles_how_far_a_shell_reaches() {
+        let plain = BULLET_SPEED * bullet_lifetime(0);
+        let upgraded = BULLET_SPEED * bullet_lifetime(PowerUp::LongBarrel.bit());
+
+        assert!(
+            (upgraded - plain * 2.0).abs() < 0.01,
+            "{upgraded} should be twice {plain}"
+        );
+        // A tenth of the field plain, a fifth upgraded: a gunfight is something
+        // you drive into, not something you open from your own quadrant.
+        assert!(plain < world::WORLD_SIZE * 0.15, "a plain shell reaches {plain}");
+        assert!(upgraded < world::WORLD_SIZE * 0.25, "even upgraded it reaches {upgraded}");
+        // Nobody else's gun is bought a longer reach.
+        assert_eq!(bullet_lifetime(PowerUp::Turbo.bit()), BULLET_LIFETIME);
     }
 
     /// The reason projectiles are swept rather than point-tested.

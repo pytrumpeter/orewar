@@ -33,6 +33,16 @@ use game::Game;
 /// on the server so they can resume where they left off.
 const TIMEOUT: f64 = 8.0;
 
+/// How recently a connection must have been heard from for a second client on
+/// the same identity to count as a duplicate rather than a reconnect.
+///
+/// A client that is playing sends input 30 times a second, so fifteen frames of
+/// silence is already far more than a bad link produces. Kept short on purpose:
+/// admitting a duplicate costs somebody a confusing match, but refusing a
+/// genuine reconnect costs them their slot, and nobody restarts a game they
+/// crashed out of in half a second.
+const DUPLICATE_WINDOW: f64 = 0.5;
+
 struct Connection {
     addr: SocketAddr,
     player_id: u8,
@@ -183,6 +193,13 @@ fn main() {
     }
 }
 
+/// Turns a client away, with the reason it can show its player.
+fn deny(socket: &UdpSocket, to: SocketAddr, reason: DenyReason) {
+    let mut w = begin_packet(PROTOCOL_ID, PacketKind::ConnectionDenied);
+    w.u8(reason as u8);
+    let _ = socket.send_to(w.as_slice(), to);
+}
+
 fn handle_packet(
     socket: &UdpSocket,
     game: &mut Game,
@@ -206,8 +223,31 @@ fn handle_packet(
                 return Ok(());
             }
 
+            // A second client on the same identity is the duplicate-name case
+            // that `Game::join` cannot see: the client hashes `--name` into its
+            // token, so two players called `Ash` arrive as one. Resuming would
+            // retire the first connection, whose client then handshakes again
+            // and retires the second, forever.
+            //
+            // Liveness decides it rather than the `connected` flag, which stays
+            // set for the whole timeout: a client that crashed goes quiet
+            // immediately, so restarting it is still allowed, while a client
+            // that is actually playing is sending input 30 times a second and
+            // is never this quiet.
+            let live_duplicate = game
+                .player_by_token(token)
+                .map(|p| p.id)
+                .and_then(|id| connections.values().find(|c| c.player_id == id))
+                .is_some_and(|c| c.endpoint.time_since_recv(now) < DUPLICATE_WINDOW);
+            if live_duplicate {
+                deny(socket, from, DenyReason::NameTaken);
+                let who = game.player_by_token(token).map_or("?", |p| p.name.as_str());
+                println!("refused {from}: {who} is already playing from another window");
+                return Ok(());
+            }
+
             match game.join(token, &name) {
-                Some(player_id) => {
+                Ok(player_id) => {
                     // The same player reconnecting from a new address: retire
                     // the old connection rather than serving both.
                     connections.retain(|_, c| c.player_id != player_id);
@@ -237,10 +277,9 @@ fn handle_packet(
                         queue(&mut conn.endpoint, &roster);
                     }
                 }
-                None => {
-                    let mut w = begin_packet(PROTOCOL_ID, PacketKind::ConnectionDenied);
-                    w.u8(DenyReason::ServerFull as u8);
-                    let _ = socket.send_to(w.as_slice(), from);
+                Err(reason) => {
+                    deny(socket, from, reason);
+                    println!("refused {from} ({name:?}): {}", reason.describe());
                 }
             }
         }

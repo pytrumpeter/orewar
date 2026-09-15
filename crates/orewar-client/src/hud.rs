@@ -261,8 +261,10 @@ pub fn setup(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 left: percent(50),
                 top: percent(50),
+                // Half its own size, to centre it on the screen: the panel
+                // grew a row taller when the seventh upgrade was added.
                 width: px(430),
-                margin: UiRect { left: px(-215), top: px(-170), ..default() },
+                margin: UiRect { left: px(-215), top: px(-180), ..default() },
                 flex_direction: FlexDirection::Column,
                 padding: UiRect::all(px(16)),
                 row_gap: px(6),

@@ -22,8 +22,10 @@ mod vehicles;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bevy::prelude::*;
+use orewar_shared::protocol::DenyReason;
 use orewar_shared::rng::Rng;
 use orewar_shared::world::{DEFAULT_PORT, TICK_HZ};
 
@@ -31,6 +33,14 @@ use input::LocalInput;
 use menu::MenuState;
 use net::NetClient;
 use state::GameState;
+
+/// How long to wait for the server's answer to the handshake before opening the
+/// window anyway.
+///
+/// Long enough for a server that is there to answer, short enough not to be a
+/// pause anybody notices. One that is not there is not an error yet -- it may
+/// still be starting -- so the game opens and keeps asking.
+const HANDSHAKE_PATIENCE: Duration = Duration::from_millis(900);
 
 struct Args {
     server: SocketAddr,
@@ -147,7 +157,7 @@ fn main() {
         }
     };
 
-    let client = match NetClient::connect(args.server, args.token, args.name.clone()) {
+    let mut client = match NetClient::connect(args.server, args.token, args.name.clone()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: could not open a socket: {e}");
@@ -155,6 +165,19 @@ fn main() {
         }
     };
     println!("Orewar: joining {} as {}", args.server, if args.name.is_empty() { "(unnamed)" } else { &args.name });
+
+    // Ask before opening a window. A refusal never becomes an acceptance, and
+    // the commonest one -- a name somebody is already playing under -- is a
+    // mistake made on the command line and best answered there.
+    if let Err(reason) = client.await_verdict(HANDSHAKE_PATIENCE) {
+        eprintln!("error: {} refused the connection: {}", args.server, reason.describe());
+        if reason == DenyReason::NameTaken {
+            eprintln!("       A name is an identity here: it is what the server knows you by,");
+            eprintln!("       and what returns you to your own ore and vehicles after a drop.");
+            eprintln!("       Two clients cannot share one. Start this one with another --name.");
+        }
+        std::process::exit(1);
+    }
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {

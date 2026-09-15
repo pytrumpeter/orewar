@@ -56,6 +56,11 @@ Your **identity** is what the server uses to recognise you. If you drop out and
 come back, you resume the same player: same ore, same upgrades, same vehicles
 where you left them.
 
+A name belongs to one player for the length of a match. Because `--name` is what
+the identity is derived from, two clients under one name would share a slot and
+spend the match kicking each other off it, so the second one is turned away at
+the handshake with an error rather than let in. Start it with another name.
+
 ---
 
 ## Controls
@@ -67,7 +72,7 @@ where you left them.
 | left mouse | fire the gun |
 | right mouse | fire a missile |
 | `Tab` | switch between tank and harvester |
-| `B` | build menu, then `1`–`6` to buy |
+| `B` | build menu, then `1`–`7` to buy |
 | `Ctrl-Q` | leave the match |
 
 ---
@@ -88,16 +93,34 @@ respawns at your base after eight seconds.
 
 **Capturing.** A harvester is never destroyed. At zero hull it is *disabled* —
 dead in the water and takeable. An enemy tank that holds station over it for four
-seconds captures it, and its owner is out. But **your own tank can rescue it**:
-park over your disabled harvester and it repairs, coming back online at a quarter
-hull. A contested wreck cannot be taken.
+seconds captures it, and its owner goes off the field. But **your own tank can
+rescue it**: park over your disabled harvester and it repairs, coming back online
+at a quarter hull. A contested wreck cannot be taken.
 
-Last player with a harvester wins.
+**Winning.** Last player on the field wins — take everybody else's harvester and
+the match is yours. In a two-player game that is one capture.
+
+Losing a harvester is otherwise a setback rather than the end: if somebody else
+is still playing, you sit out a minute and come back with fresh vehicles, an
+empty bank, and every upgrade you had bought. So a bigger match has a second way
+home, for when everyone keeps coming back — three captures wins it outright.
+
+**Gunnery.** A tank shell carries about a tenth of the field and then falls
+short. A gunfight is therefore fought at a range where both hulls are already
+committed — you cannot stand off and trade — and walking into somebody's corner
+means fighting their emplacement on its own terms, since a plain shell and that
+gun cover about the same ground. **Long Barrel** doubles your reach, which is
+what buys the ability to shell an emplacement from outside its own.
+
+The emplacement and the harvester's auto turret are unaffected by any of this:
+their shells are sized from their own engagement ranges rather than from the
+tank's, so shortening the tank's gun again cannot leave either one firing at
+something it can no longer hit.
 
 **Upgrades.** Radar (a HUD contact circle), Shield Booster, Turbo Drive,
-Harvester Armor, Auto Turret (the harvester defends itself), and Missile Packs.
-The map is generated in one quadrant and rotated into the other three, so every
-corner faces an identical distribution of ore.
+Harvester Armor, Auto Turret (the harvester defends itself), Long Barrel, and
+Missile Packs. The map is generated in one quadrant and rotated into the other
+three, so every corner faces an identical distribution of ore.
 
 ---
 

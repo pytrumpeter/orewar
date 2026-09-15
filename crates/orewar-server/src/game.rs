@@ -12,9 +12,9 @@ use std::collections::HashSet;
 
 use orewar_shared::math::{Vec2, angle_delta, wrap_angle};
 use orewar_shared::protocol::{
-    GameEvent, GameStatus, HarvesterMode, HitFx, HitKind, InputFrame, MAX_HITS_PER_SNAPSHOT,
-    OreUpdate, PlayerInfo, PlayerSnapshot, ProjectileKind, SentinelSnapshot,
-    ProjectileSnapshot, RejectReason, Snapshot, VehicleSlot, VehicleSnapshot,
+    DenyReason, GameEvent, GameStatus, HarvesterMode, HitFx, HitKind, InputFrame,
+    MAX_HITS_PER_SNAPSHOT, OreUpdate, PlayerInfo, PlayerSnapshot, ProjectileKind,
+    SentinelSnapshot, ProjectileSnapshot, RejectReason, Snapshot, VehicleSlot, VehicleSnapshot,
     MAX_PROJECTILES_PER_SNAPSHOT,
 };
 use orewar_shared::sim::{self, MoveState, VehicleKind};
@@ -376,12 +376,27 @@ impl Game {
         self.players.iter().flatten().filter(|p| p.connected).count()
     }
 
+    /// Finds the slot holding an identity, whether or not it is connected.
+    pub fn player_by_token(&self, token: u64) -> Option<&Player> {
+        self.players.iter().flatten().find(|p| p.token == token)
+    }
+
     /// Admits a player, resuming an existing slot when the token is recognised.
     ///
     /// Returning the same slot for a known token is what makes a dropped
     /// connection recoverable: ore, power-ups, and both vehicles are exactly
     /// where they were left.
-    pub fn join(&mut self, token: u64, name: &str) -> Option<u8> {
+    pub fn join(&mut self, token: u64, name: &str) -> Result<u8, DenyReason> {
+        // A name belongs to one player for the length of a match. Two of them
+        // under the same name is not a cosmetic problem: the client derives its
+        // identity token from the name, so the roster, the scoreboard, and the
+        // slot itself would all be shared between two people.
+        if !name.is_empty()
+            && self.players.iter().flatten().any(|p| p.token != token && p.name == name)
+        {
+            return Err(DenyReason::NameTaken);
+        }
+
         if let Some(p) = self.players.iter_mut().flatten().find(|p| p.token == token) {
             p.connected = true;
             if !name.is_empty() {
@@ -400,16 +415,20 @@ impl Game {
             p.input_age = 0.0;
             let id = p.id;
             self.events.push(GameEvent::PlayerJoined { player: id });
-            return Some(id);
+            return Ok(id);
         }
 
         // Finished matches take no new players; a fresh one would have nothing
         // to do but watch.
         if self.status == GameStatus::Finished {
-            return None;
+            return Err(DenyReason::MatchFinished);
         }
 
-        let slot = self.players.iter().position(Option::is_none)? as u8;
+        let slot = self
+            .players
+            .iter()
+            .position(Option::is_none)
+            .ok_or(DenyReason::ServerFull)? as u8;
         let display = if name.is_empty() {
             world::PLAYER_COLOR_NAMES[slot as usize].to_owned()
         } else {
@@ -418,7 +437,7 @@ impl Game {
         self.players[slot as usize] = Some(Player::new(slot, token, display));
         self.joined = self.joined.saturating_add(1);
         self.events.push(GameEvent::PlayerJoined { player: slot });
-        Some(slot)
+        Ok(slot)
     }
 
     /// Marks a player offline. Their state and vehicles stay on the field.
@@ -823,6 +842,7 @@ impl Game {
                 let fire_primary = input.fire_primary;
                 let fire_secondary = input.fire_secondary;
                 let missiles = p.missiles;
+                let powerups = p.powerups;
                 if let Some(tank) = p.tank.as_mut() {
                     let muzzle = tank.mv.pos + Vec2::from_angle(tank.turret_yaw) * 3.4;
                     if fire_primary && tank.gun_cooldown <= 0.0 {
@@ -834,7 +854,7 @@ impl Game {
                             pos: muzzle,
                             yaw: tank.turret_yaw,
                             speed: sim::BULLET_SPEED,
-                            life: sim::BULLET_LIFETIME,
+                            life: sim::bullet_lifetime(powerups),
                         });
                     }
                     if fire_secondary && tank.missile_cooldown <= 0.0 && missiles > 0 {
@@ -878,7 +898,7 @@ impl Game {
                                     pos: h.mv.pos + Vec2::from_angle(h.turret_yaw) * 3.2,
                                     yaw: h.turret_yaw,
                                     speed: sim::BULLET_SPEED,
-                                    life: sim::BULLET_LIFETIME * 0.7,
+                                    life: sim::shell_life_covering(sim::AUTO_TURRET_RANGE),
                                 });
                             }
                         }
@@ -951,7 +971,7 @@ impl Game {
                     pos: post + Vec2::from_angle(s.turret_yaw) * (sim::SENTINEL_RADIUS + 1.0),
                     yaw: s.turret_yaw,
                     speed: sim::BULLET_SPEED,
-                    life: sim::BULLET_LIFETIME,
+                    life: sim::shell_life_covering(sim::SENTINEL_RANGE),
                 });
             }
         }
@@ -1419,20 +1439,40 @@ impl Game {
         }
     }
 
-    /// Three harvesters wins it.
+    /// Being the only one left on the field wins it, and so does taking three
+    /// harvesters.
     ///
-    /// Being last one standing used to end a match, and cannot any more: a
-    /// capture puts its victim off the field for a minute rather than out of the
-    /// game, so there is always someone else still playing. Taking harvesters is
-    /// what accumulates toward anything now, which is also what the scoreboard
-    /// has always shown.
+    /// Last one standing is the ending the game is actually about: you win by
+    /// taking everybody else's harvester. A capture only puts its victim off the
+    /// field for a minute, so it is checked against who is on the field *now* --
+    /// in a two-player match that means one capture ends it, before the minute
+    /// has a chance to run out and hand the loser a second life nobody is left
+    /// to contest.
+    ///
+    /// Only `apply_capture` ever takes a player off the field, so "one left" is
+    /// reachable only through a capture; no separate check for that is needed.
+    /// Being disconnected is deliberately not the same as being off the field --
+    /// the vehicles of a player who drops stay where they are and can still be
+    /// taken, and a match should not change hands because somebody's wifi did.
+    ///
+    /// The three-capture ending still stands, for the matches with enough
+    /// players that everyone keeps coming back.
     fn check_victory(&mut self) {
         if self.status != GameStatus::Running || self.joined < 2 {
             return;
         }
-        let leader =
-            self.players.iter().flatten().find(|p| p.captures >= sim::CAPTURES_TO_WIN).map(|p| p.id);
-        if let Some(winner) = leader {
+        let mut standing = self.players.iter().flatten().filter(|p| !p.eliminated);
+        let last_standing = match (standing.next(), standing.next()) {
+            (Some(p), None) => Some(p.id),
+            _ => None,
+        };
+        let leader = self
+            .players
+            .iter()
+            .flatten()
+            .find(|p| p.captures >= sim::CAPTURES_TO_WIN)
+            .map(|p| p.id);
+        if let Some(winner) = last_standing.or(leader) {
             self.status = GameStatus::Finished;
             self.winner = Some(winner);
             self.events.push(GameEvent::GameOver { winner });
@@ -1535,6 +1575,25 @@ mod tests {
         let mut g = Game::new(1234);
         g.join(1, "one").unwrap();
         g.join(2, "two").unwrap();
+        g.step(TICK_DT);
+        g
+    }
+
+    /// A match with a bystander, for everything about a capture that is not the
+    /// end of the match.
+    ///
+    /// With only two players a capture clears the field and the match is over,
+    /// so the lockout, the return, and the long road to three captures all need
+    /// somebody else still playing to be observable at all.
+    ///
+    /// The third player's harvester holds station at their own base rather than
+    /// setting off across the map: these tests step minutes at a time, and an
+    /// unattended harvester wandering into somebody's sentinels is a variable
+    /// none of them are about.
+    fn three_player_game() -> Game {
+        let mut g = two_player_game();
+        g.join(3, "three").unwrap();
+        g.set_harvester_mode(2, HarvesterMode::Stop);
         g.step(TICK_DT);
         g
     }
@@ -1653,7 +1712,7 @@ mod tests {
 
         // The client restarts: same token, same slot, tick numbering from one.
         g.disconnect(0);
-        assert_eq!(g.join(1, "one"), Some(0), "same token must resume the same slot");
+        assert_eq!(g.join(1, "one"), Ok(0), "same token must resume the same slot");
 
         let before = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
         for tick in 1..60u32 {
@@ -1678,9 +1737,40 @@ mod tests {
     fn a_full_server_turns_away_a_fifth_player() {
         let mut g = Game::new(1);
         for i in 0..MAX_PLAYERS as u64 {
-            assert!(g.join(i + 1, "p").is_some());
+            assert!(g.join(i + 1, &format!("p{i}")).is_ok());
         }
-        assert_eq!(g.join(99, "late"), None);
+        assert_eq!(g.join(99, "late"), Err(DenyReason::ServerFull));
+    }
+
+    /// A name is an identity: the client hashes it into the token the server
+    /// keys players by, so two of them under one name would share a slot and
+    /// spend the match retiring each other's connection.
+    #[test]
+    fn a_name_somebody_is_already_using_is_turned_away() {
+        let mut g = Game::new(1);
+        assert_eq!(g.join(1, "Ash"), Ok(0));
+        assert_eq!(g.join(2, "Ash"), Err(DenyReason::NameTaken));
+        // The refusal must cost the newcomer nothing else: the slot they would
+        // have had is still free under any other name.
+        assert_eq!(g.join(2, "Bo"), Ok(1));
+    }
+
+    /// Turning away a duplicate must not turn away the player who owns the
+    /// name, coming back to their own slot.
+    #[test]
+    fn reclaiming_your_own_name_is_not_a_duplicate() {
+        let mut g = two_player_game();
+        g.disconnect(0);
+        assert_eq!(g.join(1, "one"), Ok(0), "your own name is yours to come back to");
+        assert!(g.player(0).unwrap().connected);
+    }
+
+    /// A finished match has to say so, rather than reporting itself full.
+    #[test]
+    fn a_finished_match_turns_away_a_newcomer_for_the_right_reason() {
+        let mut g = two_player_game();
+        g.status = GameStatus::Finished;
+        assert_eq!(g.join(3, "late"), Err(DenyReason::MatchFinished));
     }
 
     #[test]
@@ -1806,7 +1896,7 @@ mod tests {
     /// A capture takes a player off the field, not out of the match.
     #[test]
     fn a_captured_player_sits_out_a_minute_and_comes_back_rebuilt() {
-        let mut g = two_player_game();
+        let mut g = three_player_game();
         g.hills.clear();
         // Something to lose: upgrades bought, ore banked, missiles spent.
         {
@@ -1851,7 +1941,7 @@ mod tests {
     /// The vehicles have to come back where they started, not where they died.
     #[test]
     fn a_returning_player_starts_from_their_own_base() {
-        let mut g = two_player_game();
+        let mut g = three_player_game();
         g.hills.clear();
         capture_once(&mut g, 1, 0);
         // Checked the instant they return: the harvester is on autopilot and
@@ -1878,10 +1968,65 @@ mod tests {
         );
     }
 
-    /// Three harvesters is what ends a match now.
+    /// The ending the game is about: take the last harvester and it is yours.
+    #[test]
+    fn capturing_the_last_opponent_wins_the_match() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        capture_once(&mut g, 1, 0);
+
+        assert_eq!(g.status, GameStatus::Finished, "nobody else is on the field");
+        assert_eq!(g.winner, Some(1));
+        assert!(
+            g.events.contains(&GameEvent::GameOver { winner: 1 }),
+            "the win has to be announced, not just recorded"
+        );
+        assert_eq!(
+            g.player(1).unwrap().captures,
+            1,
+            "one capture, well short of the three that also win it"
+        );
+    }
+
+    /// The lockout must not be a way to win a match you have not cleared.
+    #[test]
+    fn a_capture_is_not_the_match_while_somebody_else_is_standing() {
+        let mut g = three_player_game();
+        g.hills.clear();
+        capture_once(&mut g, 1, 0);
+        assert_ne!(g.status, GameStatus::Finished, "player 2 is still out there");
+        assert_eq!(g.winner, None);
+
+        // Taking the bystander's harvester while the first victim is still in
+        // their minute leaves one player on the field, and that ends it.
+        capture_once(&mut g, 1, 2);
+        assert!(g.player(0).unwrap().eliminated, "the first victim is still down");
+        assert_eq!(g.status, GameStatus::Finished);
+        assert_eq!(g.winner, Some(1));
+    }
+
+    /// Dropping out is not the same as being taken off the field.
+    ///
+    /// A player who loses their connection leaves their vehicles where they
+    /// stand, and their harvester can still be taken -- which is how the match
+    /// is meant to be won. Handing it over the moment somebody's wifi blinks
+    /// would end matches nobody had finished.
+    #[test]
+    fn a_disconnect_does_not_win_the_match_for_whoever_is_left() {
+        let mut g = two_player_game();
+        g.disconnect(0);
+        for _ in 0..30 {
+            g.step(TICK_DT);
+        }
+        assert_eq!(g.status, GameStatus::Running);
+        assert_eq!(g.winner, None, "there is still a harvester out there to take");
+    }
+
+    /// The other way home: a match nobody can clear the field of is still won
+    /// by taking three harvesters.
     #[test]
     fn taking_three_harvesters_wins_the_match() {
-        let mut g = two_player_game();
+        let mut g = three_player_game();
         g.hills.clear();
         for round in 1..=sim::CAPTURES_TO_WIN {
             capture_once(&mut g, 1, 0);
@@ -2274,6 +2419,67 @@ mod tests {
         );
     }
 
+    /// In range has to mean in reach, out at the edge and not just in its face.
+    ///
+    /// Sized from the emplacement's own range rather than from the tank's gun,
+    /// which is tuned for play and has been shortened twice: sharing that
+    /// number left this barely a unit clear of firing at what it could not hit.
+    #[test]
+    fn a_sentinel_reaches_the_far_edge_of_its_range() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        let post = world::sentinel_position(0);
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - post).to_angle();
+        // Just inside the range it engages at, which is the shot most likely to
+        // fall short.
+        let edge = post + Vec2::from_angle(inward) * (sim::SENTINEL_RANGE - 2.0);
+
+        let full = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+        for _ in 0..300 {
+            // Held there; this test is about whether the shell arrives.
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv =
+                MoveState { pos: edge, yaw: 0.0, speed: 0.0 };
+            g.step(TICK_DT);
+        }
+        assert!(
+            g.player(1).unwrap().tank.as_ref().unwrap().shield < full,
+            "nothing landed at {:.0} units, inside a range of {:.0}",
+            edge.distance(post),
+            sim::SENTINEL_RANGE
+        );
+    }
+
+    /// The same at the harvester's own turret, which is where sharing the
+    /// tank's shell actually bit: it engaged out to `AUTO_TURRET_RANGE` while
+    /// its shell died about two units short of it.
+    #[test]
+    fn an_auto_turret_reaches_the_far_edge_of_its_range() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        g.player_mut(0).unwrap().powerups = PowerUp::AutoTurret.bit();
+        // Out in the open, far from either corner's emplacement, so the only
+        // gun that can be firing is the one under test.
+        let station = Vec2::splat(world::WORLD_SIZE * 0.5);
+        let victim = station + Vec2::new(sim::AUTO_TURRET_RANGE - 1.0, 0.0);
+
+        let full = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+        for _ in 0..300 {
+            // Both held: this is about whether the shell arrives, not about
+            // where an autopilot would rather be.
+            g.player_mut(0).unwrap().harvester.as_mut().unwrap().mv =
+                MoveState { pos: station, yaw: 0.0, speed: 0.0 };
+            g.player_mut(1).unwrap().tank.as_mut().unwrap().mv =
+                MoveState { pos: victim, yaw: 0.0, speed: 0.0 };
+            g.step(TICK_DT);
+        }
+        assert!(
+            g.player(1).unwrap().tank.as_ref().unwrap().shield < full,
+            "nothing landed at {:.0} units, inside a range of {:.0}",
+            victim.distance(station),
+            sim::AUTO_TURRET_RANGE
+        );
+    }
+
     /// Out of range is out of the fight.
     #[test]
     fn a_sentinel_ignores_what_it_cannot_reach() {
@@ -2500,6 +2706,79 @@ mod tests {
     /// A duplicate of the shooting setup above with a hill dropped in between:
     /// the same shots that connect over open ground must not connect through
     /// terrain.
+    /// The upgrade has to reach the gun it is bought for, and nobody else's.
+    #[test]
+    fn a_long_barrel_lengthens_the_shell_a_tank_fires() {
+        let mut g = two_player_game();
+        g.player_mut(1).unwrap().powerups = PowerUp::LongBarrel.bit();
+
+        for id in 0..2u8 {
+            g.set_input(id, InputFrame {
+                tick: 1,
+                controlling: VehicleSlot::Tank,
+                fire_primary: true,
+                ..Default::default()
+            });
+        }
+        g.step(TICK_DT);
+
+        let life = |owner: u8| {
+            g.projectiles
+                .iter()
+                .find(|p| p.owner == owner && p.kind == ProjectileKind::Bullet)
+                .unwrap_or_else(|| panic!("player {owner} should have a shell in the air"))
+                .life
+        };
+        // Both have flown one tick, so the difference between them is the whole
+        // of what the upgrade added.
+        assert!(
+            (life(1) - life(0) - sim::BULLET_LIFETIME).abs() < 0.001,
+            "{} against {}",
+            life(1),
+            life(0)
+        );
+    }
+
+    /// What the upgrade is worth in units of field, which is the thing a player
+    /// actually feels.
+    #[test]
+    fn a_shell_falls_short_of_a_quadrant_until_the_barrel_is_bought() {
+        let reach = |powerups: u16| {
+            let mut g = two_player_game();
+            // Nothing in the way: this is about how far a shell carries, not
+            // about what it might run into on the way.
+            g.hills.clear();
+            let start = Vec2::splat(world::WORLD_SIZE * 0.5);
+            g.projectiles.push(Projectile {
+                id: 1,
+                kind: ProjectileKind::Bullet,
+                owner: 0,
+                pos: start,
+                yaw: 0.0,
+                speed: sim::BULLET_SPEED,
+                life: sim::bullet_lifetime(powerups),
+            });
+            let mut travelled = 0.0;
+            for _ in 0..400 {
+                let Some(shell) = g.projectiles.first() else { break };
+                travelled = shell.pos.distance(start);
+                g.step(TICK_DT);
+            }
+            assert!(g.projectiles.is_empty(), "the shell should have fallen short by now");
+            travelled
+        };
+
+        let plain = reach(0);
+        let upgraded = reach(PowerUp::LongBarrel.bit());
+        let per_tick = sim::BULLET_SPEED * TICK_DT;
+
+        assert!(plain < world::WORLD_SIZE * 0.25, "a plain shell carried {plain}");
+        assert!(
+            (upgraded - plain * 2.0).abs() < per_tick * 2.0,
+            "{upgraded} should be twice {plain}"
+        );
+    }
+
     #[test]
     fn a_hill_between_two_tanks_is_cover() {
         let fire_for_a_while = |g: &mut Game| {
@@ -2632,7 +2911,7 @@ mod tests {
 
         let mut g = Game::new(9);
         for i in 0..MAX_PLAYERS as u64 {
-            g.join(i + 1, "player").unwrap();
+            g.join(i + 1, &format!("player{i}")).unwrap();
         }
         // Everyone firing everything, for many ticks.
         for i in 0..MAX_PLAYERS as u8 {
@@ -2673,8 +2952,8 @@ mod tests {
     fn the_simulation_is_reproducible() {
         let run = || {
             let mut g = Game::new(777);
-            g.join(1, "a");
-            g.join(2, "b");
+            g.join(1, "a").unwrap();
+            g.join(2, "b").unwrap();
             for i in 0..300 {
                 for id in 0..2u8 {
                     g.set_input(

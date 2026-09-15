@@ -48,13 +48,14 @@ impl Default for LocalInput {
 }
 
 /// Purchase hotkeys, in the order the build menu lists them.
-pub const BUY_KEYS: [KeyCode; 6] = [
+pub const BUY_KEYS: [KeyCode; 7] = [
     KeyCode::Digit1,
     KeyCode::Digit2,
     KeyCode::Digit3,
     KeyCode::Digit4,
     KeyCode::Digit5,
     KeyCode::Digit6,
+    KeyCode::Digit7,
 ];
 
 pub fn gather(

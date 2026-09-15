@@ -866,6 +866,13 @@ pub enum DenyReason {
     ServerFull = 0,
     BadProtocol = 1,
     MatchFinished = 2,
+    /// Somebody is already playing under that name.
+    ///
+    /// A name is an identity here -- the client hashes it into the token the
+    /// server keys players by -- so two clients sharing one would fight over a
+    /// single slot, each handshake retiring the other's connection. Turning the
+    /// second one away at the door is the only way that ends well.
+    NameTaken = 3,
 }
 
 impl DenyReason {
@@ -874,6 +881,7 @@ impl DenyReason {
             0 => Some(DenyReason::ServerFull),
             1 => Some(DenyReason::BadProtocol),
             2 => Some(DenyReason::MatchFinished),
+            3 => Some(DenyReason::NameTaken),
             _ => None,
         }
     }
@@ -883,6 +891,7 @@ impl DenyReason {
             DenyReason::ServerFull => "server is full",
             DenyReason::BadProtocol => "client and server versions do not match",
             DenyReason::MatchFinished => "the match has already finished",
+            DenyReason::NameTaken => "somebody is already playing under that name",
         }
     }
 }
@@ -966,14 +975,17 @@ mod tests {
 
     #[test]
     fn client_messages_round_trip() {
-        for msg in [
-            ClientMessage::Purchase(PowerUp::AutoTurret),
+        // Every power-up, not a sample of one: a variant added to the list
+        // without a tag the decoder knows would otherwise reach a player as a
+        // purchase the server cannot read.
+        let purchases = PowerUp::ALL.map(ClientMessage::Purchase);
+        for msg in purchases.into_iter().chain([
             ClientMessage::Leave,
             ClientMessage::NewGame,
             ClientMessage::SetHarvesterMode(HarvesterMode::Home),
             ClientMessage::SetHarvesterMode(HarvesterMode::Auto),
             ClientMessage::Input(InputFrame::default()),
-        ] {
+        ]) {
             let bytes = msg.to_vec();
             assert_eq!(ClientMessage::from_slice(&bytes).unwrap(), msg);
         }
