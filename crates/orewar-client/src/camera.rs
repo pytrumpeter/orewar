@@ -14,6 +14,8 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::view::NoIndirectDrawing;
 use orewar_shared::math::Vec2 as SimVec2;
+use orewar_shared::protocol::VehicleSlot;
+use orewar_shared::sim;
 use orewar_shared::world::WORLD_SIZE;
 
 use crate::coords;
@@ -139,7 +141,8 @@ pub fn overview_controls(
             // Start over whatever you were driving, so raising the camera does
             // not also lose your place.
             if let Some(pos) = state.local().and_then(|p| {
-                p.vehicle(input.controlling).or_else(|| p.vehicle(input.controlling.other()))
+                p.vehicle(input.controlling)
+                    .or_else(|| p.vehicle(input.controlling.next_available(|s| p.vehicle(s).is_some())))
             }) {
                 // Pulled back onto the field by the clamp below if the vehicle
                 // is hard against an edge, so the view never opens half full of
@@ -249,13 +252,16 @@ pub fn follow(
     let dt = time.delta_secs();
     let half = WORLD_SIZE * 0.5;
 
-    // Follow whichever vehicle is being driven; if it is gone (destroyed, or
-    // captured), fall back to the other one, then to the field itself.
+    // Follow whichever vehicle is being driven; if it is gone (destroyed,
+    // captured, or out of fuel), fall back to anything else the player still
+    // has, then to the field itself.
     let subject = state.local().and_then(|player| {
-        player
-            .vehicle(input.controlling)
-            .or_else(|| player.vehicle(input.controlling.other()))
-            .map(|v| (v.pos, v.yaw))
+        let slot = if player.vehicle(input.controlling).is_some() {
+            input.controlling
+        } else {
+            input.controlling.next_available(|s| player.vehicle(s).is_some())
+        };
+        player.vehicle(slot).map(|v| (v.pos, v.yaw, slot))
     });
 
     let (desired_position, desired_aim) = match subject.filter(|_| !overview.active) {
@@ -268,8 +274,13 @@ pub fn follow(
                 look,
             )
         }
-        Some((pos, yaw)) => {
-            let center = coords::sim_to_world(pos);
+        Some((pos, yaw, slot)) => {
+            // An aircraft is followed at its own altitude, so the camera rides
+            // with it rather than watching it from the grass. It is otherwise
+            // the same chase: the trail and the look-ahead are what make a
+            // vehicle feel driven, and that does not change with height.
+            let lift = if slot == VehicleSlot::Plane { sim::PLANE_ALTITUDE } else { 0.0 };
+            let center = coords::sim_to_world(pos) + Vec3::Y * lift;
             let heading = coords::yaw_to_quat(yaw) * Vec3::X;
             (
                 center - heading * TRAIL + Vec3::Y * HEIGHT,

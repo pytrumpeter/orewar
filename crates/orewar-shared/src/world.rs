@@ -240,10 +240,11 @@ pub enum PowerUp {
     AutoTurret = 4,
     MissilePack = 5,
     LongBarrel = 6,
+    Bomber = 7,
 }
 
 impl PowerUp {
-    pub const ALL: [PowerUp; 7] = [
+    pub const ALL: [PowerUp; 8] = [
         PowerUp::Radar,
         PowerUp::ShieldBooster,
         PowerUp::Turbo,
@@ -251,6 +252,7 @@ impl PowerUp {
         PowerUp::AutoTurret,
         PowerUp::MissilePack,
         PowerUp::LongBarrel,
+        PowerUp::Bomber,
     ];
 
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -266,6 +268,12 @@ impl PowerUp {
             PowerUp::AutoTurret => 800,
             PowerUp::MissilePack => 250,
             PowerUp::LongBarrel => 400,
+            // Far and away the most expensive thing on the list, because it is
+            // the only one that reaches somewhere a tank cannot drive. A whole
+            // match's harvesting buys one, and what it buys is the aircraft,
+            // not a sortie: the clock on a sortie is fuel, and the clock on the
+            // next one is [`sim::SORTIE_COOLDOWN`].
+            PowerUp::Bomber => 1000,
         }
     }
 
@@ -278,6 +286,7 @@ impl PowerUp {
             PowerUp::AutoTurret => "Auto Turret",
             PowerUp::MissilePack => "Missile Pack",
             PowerUp::LongBarrel => "Long Barrel",
+            PowerUp::Bomber => "Bomber",
         }
     }
 
@@ -290,16 +299,20 @@ impl PowerUp {
             PowerUp::AutoTurret => "Harvester defends itself against nearby enemies",
             PowerUp::MissilePack => "+6 missiles for your tank",
             PowerUp::LongBarrel => "Tank shells fly twice as far",
+            PowerUp::Bomber => "Call up a plane you fly yourself, until the fuel runs out",
         }
     }
 
     /// Consumables can be bought repeatedly; flags only once.
-    pub fn is_consumable(self) -> bool {
+    pub const fn is_consumable(self) -> bool {
         matches!(self, PowerUp::MissilePack)
     }
 
     /// Bit in a player's power-up mask. Consumables occupy no bit.
-    pub fn bit(self) -> u16 {
+    ///
+    /// `const` so that a starting mask can be written in terms of the power-ups
+    /// it holds rather than as a magic number that quietly stops matching them.
+    pub const fn bit(self) -> u16 {
         if self.is_consumable() { 0 } else { 1 << (self as u16) }
     }
 
@@ -314,6 +327,15 @@ pub const MISSILES_PER_PACK: u8 = 6;
 pub const STARTING_MISSILES: u8 = 3;
 /// Ore credits every player starts with, enough for one early purchase.
 pub const STARTING_CREDITS: u32 = 150;
+
+/// Power-ups every player is holding when a match begins.
+///
+/// TEMPORARY, while the bomber is being worked on. It is meant to be a 1000-ore
+/// purchase and the most expensive thing on the list -- see [`PowerUp::cost`] --
+/// but mining a match's worth of ore before every test flight is most of what a
+/// change to it would otherwise cost. Set this back to `0` to put the aircraft
+/// behind the shop where it belongs.
+pub const STARTING_POWERUPS: u16 = PowerUp::Bomber.bit();
 
 #[cfg(test)]
 mod tests {

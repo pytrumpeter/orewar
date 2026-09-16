@@ -15,6 +15,7 @@ use orewar_shared::sim::{self, VehicleKind};
 use orewar_shared::world::MAX_PLAYERS;
 
 use crate::coords;
+use crate::input::LocalInput;
 use crate::state::{GameState, RenderVehicle};
 
 #[derive(Component)]
@@ -39,6 +40,21 @@ pub struct CaptureBar;
 #[derive(Component)]
 pub struct ProjectileView;
 
+/// A bomb on its way down, and when this client first saw it.
+///
+/// Height is the one thing about a bomb the wire cannot afford to carry, so it
+/// is reconstructed here from how long the bomb has been on screen against
+/// [`sim::BOMB_FALL_TIME`]. Where it will land is not guesswork -- that comes
+/// from the server like everything else -- only how far down it has got.
+#[derive(Component)]
+pub struct FallingBomb {
+    released: f32,
+}
+
+/// The ring on the ground showing where a bomb released now would land.
+#[derive(Component)]
+pub struct BombSight;
+
 #[derive(Resource)]
 pub struct VehicleAssets {
     tank_chassis: Handle<Mesh>,
@@ -57,6 +73,15 @@ pub struct VehicleAssets {
     harvester_wheel: Handle<Mesh>,
     harvester_turret: Handle<Mesh>,
     harvester_barrel: Handle<Mesh>,
+    plane_fuselage: Handle<Mesh>,
+    plane_nose: Handle<Mesh>,
+    plane_wing: Handle<Mesh>,
+    plane_tailplane: Handle<Mesh>,
+    plane_fin: Handle<Mesh>,
+    plane_nacelle: Handle<Mesh>,
+    plane_propeller: Handle<Mesh>,
+    bomb: Handle<Mesh>,
+    bombsight: Handle<Mesh>,
     shield: Handle<Mesh>,
     capture_bar: Handle<Mesh>,
     bullet: Handle<Mesh>,
@@ -68,6 +93,9 @@ pub struct VehicleAssets {
     projectile: Vec<Handle<StandardMaterial>>,
     dark: Handle<StandardMaterial>,
     metal: Handle<StandardMaterial>,
+    propeller: Handle<StandardMaterial>,
+    /// Per-player bombsight rings.
+    sight: Vec<Handle<StandardMaterial>>,
     capture_material: Handle<StandardMaterial>,
 }
 
@@ -86,6 +114,7 @@ pub fn setup(
     let mut trim = Vec::new();
     let mut shield_material = Vec::new();
     let mut projectile = Vec::new();
+    let mut sight = Vec::new();
 
     for id in 0..MAX_PLAYERS as u8 {
         let color = coords::player_color(id);
@@ -121,6 +150,17 @@ pub fn setup(
             unlit: true,
             ..default()
         }));
+        // The bombsight has to be legible against grass, ore and a base pad
+        // alike, so it is unlit and glows rather than being lit like scenery.
+        sight.push(materials.add(StandardMaterial {
+            base_color: color.with_alpha(0.55),
+            emissive: LinearRgba::from(color) * 2.2,
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        }));
     }
 
     commands.insert_resource(VehicleAssets {
@@ -151,6 +191,20 @@ pub fn setup(
         harvester_wheel: meshes.add(Cylinder::new(0.38, 0.24)),
         harvester_turret: meshes.add(rounded_box(Vec3::new(1.8, 0.7, 1.0), 0.2, 3)),
         harvester_barrel: meshes.add(Cylinder::new(0.12, 1.5)),
+        // The bomber. Longer and far thinner than either ground vehicle, which
+        // is most of what makes it read as an aircraft from above -- at chase
+        // range the wing is the silhouette and everything else hangs off it.
+        plane_fuselage: meshes.add(rounded_box(Vec3::new(7.4, 1.5, 1.5), 0.45, 3)),
+        plane_nose: meshes.add(Cylinder::new(0.55, 1.2)),
+        plane_wing: meshes.add(rounded_box(Vec3::new(2.0, 0.36, 10.5), 0.17, 2)),
+        plane_tailplane: meshes.add(rounded_box(Vec3::new(1.2, 0.3, 4.0), 0.14, 2)),
+        plane_fin: meshes.add(rounded_box(Vec3::new(1.3, 1.7, 0.3), 0.14, 2)),
+        plane_nacelle: meshes.add(Cylinder::new(0.42, 2.2)),
+        // A disc, for a propeller turning too fast to have blades.
+        plane_propeller: meshes.add(Cylinder::new(0.95, 0.06)),
+        bomb: meshes.add(rounded_box(Vec3::new(1.1, 0.5, 0.5), 0.25, 3)),
+        // The sight: a ring on the ground the size of a blast.
+        bombsight: meshes.add(Torus::new(sim::BOMB_BLAST_RADIUS - 0.5, sim::BOMB_BLAST_RADIUS)),
         shield: meshes.add(Sphere::new(1.0).mesh().uv(16, 10)),
         capture_bar: meshes.add(Cuboid::new(1.0, 0.45, 0.45)),
         bullet: meshes.add(Sphere::new(0.34).mesh().uv(8, 6)),
@@ -159,6 +213,7 @@ pub fn setup(
         trim,
         shield_material,
         projectile,
+        sight,
         dark: materials.add(StandardMaterial {
             base_color: Color::srgb(0.14, 0.14, 0.16),
             perceptual_roughness: 0.85,
@@ -174,6 +229,17 @@ pub fn setup(
             metallic: 0.65,
             ..default()
         }),
+        // A propeller under power is a blur you see the field through, not a
+        // disc. Drawn opaque these were three black holes in the middle of the
+        // aircraft, which is the one thing a stylised model cannot carry.
+        propeller: materials.add(StandardMaterial {
+            base_color: Color::srgba(0.72, 0.75, 0.80, 0.3),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        }),
         capture_material: materials.add(StandardMaterial {
             base_color: Color::srgb(1.0, 0.85, 0.2),
             emissive: LinearRgba::new(2.0, 1.5, 0.2, 1.0),
@@ -182,6 +248,58 @@ pub fn setup(
         }),
     });
     commands.insert_resource(ViewRegistry::default());
+}
+
+/// Spawns the one bombsight ring, hidden until something is flying.
+pub fn setup_bombsight(mut commands: Commands, assets: Res<VehicleAssets>) {
+    commands.spawn((
+        BombSight,
+        Mesh3d(assets.bombsight.clone()),
+        MeshMaterial3d(assets.sight[0].clone()),
+        Transform::default(),
+        Visibility::Hidden,
+        NotShadowCaster,
+    ));
+}
+
+/// Puts the bombsight where a bomb released this instant would land.
+///
+/// Not a hint and not an estimate: it calls [`sim::bomb_impact`], which is the
+/// same function the server's release goes through, on a speed that is a
+/// constant both sides agree on. Bombing without it is guesswork -- from
+/// [`sim::PLANE_ALTITUDE`] up, with the aircraft throwing each bomb some 47
+/// units forward, there is nothing on screen to judge the lead against.
+pub fn sync_bombsight(
+    state: Res<GameState>,
+    input: Res<LocalInput>,
+    assets: Res<VehicleAssets>,
+    mut sight: Query<
+        (&mut Transform, &mut Visibility, &mut MeshMaterial3d<StandardMaterial>),
+        With<BombSight>,
+    >,
+) {
+    let Ok((mut transform, mut visibility, mut material)) = sight.single_mut() else { return };
+
+    // Only while you are the one flying: it is an aiming aid, not a warning to
+    // everybody else on the field about where the bombs are going.
+    let aiming = state
+        .local()
+        .filter(|_| input.controlling == VehicleSlot::Plane)
+        .and_then(|me| me.plane.map(|p| (me.id, p)));
+
+    let Some((player, plane)) = aiming else {
+        *visibility = Visibility::Hidden;
+        return;
+    };
+
+    *visibility = Visibility::Visible;
+    let idx = player as usize % MAX_PLAYERS;
+    if material.0 != assets.sight[idx] {
+        material.0 = assets.sight[idx].clone();
+    }
+    let at = sim::bomb_impact(plane.pos, plane.yaw, sim::PLANE_CRUISE);
+    // Just clear of the ground so the ring does not fight the grass for depth.
+    transform.translation = coords::sim_to_world_at(at, 0.12);
 }
 
 fn spawn_vehicle(
@@ -272,6 +390,60 @@ fn spawn_vehicle(
                     });
             });
         }
+        VehicleSlot::Plane => {
+            commands.entity(root).with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(assets.plane_fuselage.clone()),
+                    MeshMaterial3d(assets.body[idx].clone()),
+                    Transform::from_xyz(0.0, 0.0, 0.0),
+                ));
+                // A rounded nose. No propeller on it: the engines are on the
+                // wing, and from directly behind -- which is where the chase
+                // camera lives and the only place this is ever seen from -- a
+                // third disc sits squarely over the fuselage.
+                parent.spawn((
+                    Mesh3d(assets.plane_nose.clone()),
+                    MeshMaterial3d(assets.metal.clone()),
+                    Transform::from_xyz(3.6, 0.0, 0.0).with_rotation(along_x()),
+                ));
+                // The wing. Set slightly forward of the middle, which is where
+                // an eye expects it, and thin enough to read as a wing rather
+                // than as a plank.
+                parent.spawn((
+                    Mesh3d(assets.plane_wing.clone()),
+                    MeshMaterial3d(assets.body[idx].clone()),
+                    Transform::from_xyz(0.5, 0.35, 0.0),
+                ));
+                // Engines slung under it, with their own propellers: two of
+                // them is what says "bomber" rather than "fighter".
+                for z in [-2.6, 2.6] {
+                    parent.spawn((
+                        Mesh3d(assets.plane_nacelle.clone()),
+                        MeshMaterial3d(assets.metal.clone()),
+                        Transform::from_xyz(0.7, 0.0, z).with_rotation(along_x()),
+                    ));
+                    parent.spawn((
+                        Mesh3d(assets.plane_propeller.clone()),
+                        MeshMaterial3d(assets.propeller.clone()),
+                        Transform::from_xyz(1.95, 0.0, z).with_rotation(along_x()),
+                        NotShadowCaster,
+                    ));
+                }
+                // Tail: a horizontal plane and a fin, in the trim colour so the
+                // back end is legible against the wing from directly behind,
+                // which is exactly where the chase camera sits.
+                parent.spawn((
+                    Mesh3d(assets.plane_tailplane.clone()),
+                    MeshMaterial3d(assets.trim[idx].clone()),
+                    Transform::from_xyz(-3.1, 0.25, 0.0),
+                ));
+                parent.spawn((
+                    Mesh3d(assets.plane_fin.clone()),
+                    MeshMaterial3d(assets.trim[idx].clone()),
+                    Transform::from_xyz(-3.1, 1.1, 0.0),
+                ));
+            });
+        }
         VehicleSlot::Harvester => {
             commands.entity(root).with_children(|parent| {
                 parent.spawn((
@@ -347,6 +519,13 @@ fn spawn_vehicle(
         }
     }
 
+    // A shield bubble on everything that has a shield. The aircraft has none
+    // -- nothing can shoot it -- so it gets no bubble rather than a bubble that
+    // is always empty.
+    if slot == VehicleSlot::Plane {
+        return root;
+    }
+
     commands.entity(root).with_children(|parent| {
         parent.spawn((
             ShieldBubble,
@@ -390,6 +569,9 @@ pub fn sync_vehicles(
         if let Some(v) = player.harvester {
             wanted.insert((player.id, VehicleSlot::Harvester), v);
         }
+        if let Some(v) = player.plane {
+            wanted.insert((player.id, VehicleSlot::Plane), v);
+        }
     }
 
     // Retire views for vehicles that were destroyed or captured.
@@ -415,7 +597,24 @@ pub fn sync_vehicles(
     for (entity, view, mut transform) in &mut roots {
         let Some(v) = wanted.get(&(view.player, view.slot)) else { continue };
         transform.translation = coords::sim_to_world(v.pos);
+        if view.slot == VehicleSlot::Plane {
+            transform.translation.y += sim::PLANE_ALTITUDE;
+        }
         transform.rotation = coords::yaw_to_quat(v.yaw);
+        if view.slot == VehicleSlot::Plane {
+            // Rolled about its own nose-to-tail axis, applied after the
+            // heading so it turns in the model's own frame. The bank is the
+            // control the player is actually working, and seeing it is how they
+            // know how hard the aircraft is coming round -- so the wing that
+            // drops has to be the one on the inside of the turn. Banking left
+            // puts the left wing down.
+            //
+            // The sign is the subtle part, for the same reason it is subtle in
+            // `coords::yaw_to_quat`: a positive rotation about the model's
+            // nose carries its roof toward the wing that is *rising*, so the
+            // roll goes in as it is rather than negated.
+            transform.rotation *= Quat::from_rotation_x(v.roll);
+        }
         // A disabled harvester sits low and canted, so it reads as a wreck.
         if v.disabled {
             transform.translation.y -= 0.45;
@@ -435,6 +634,8 @@ pub fn sync_vehicles(
         let kind = match slot {
             VehicleSlot::Tank => VehicleKind::Tank,
             VehicleSlot::Harvester => VehicleKind::Harvester,
+            // Unreachable: `spawn_vehicle` gives the aircraft no bubble to find.
+            VehicleSlot::Plane => VehicleKind::Plane,
         };
         let powerups = state
             .render
@@ -463,7 +664,8 @@ pub fn sync_projectiles(
     assets: Res<VehicleAssets>,
     mut registry: ResMut<ViewRegistry>,
     state: Res<GameState>,
-    mut views: Query<&mut Transform, With<ProjectileView>>,
+    time: Res<Time>,
+    mut views: Query<(&mut Transform, Option<&FallingBomb>), With<ProjectileView>>,
 ) {
     let live: HashMap<u16, _> = state.render.projectiles.iter().map(|p| (p.id, p)).collect();
 
@@ -476,32 +678,61 @@ pub fn sync_projectiles(
         }
     });
 
+    let now = time.elapsed_secs();
     for projectile in &state.render.projectiles {
         let idx = projectile.owner as usize % MAX_PLAYERS;
         let entity = *registry.projectiles.entry(projectile.id).or_insert_with(|| {
-            let (mesh, height) = match projectile.kind {
-                ProjectileKind::Bullet => (assets.bullet.clone(), 2.2),
-                ProjectileKind::Missile => (assets.missile.clone(), 2.4),
+            let mesh = match projectile.kind {
+                ProjectileKind::Bullet => assets.bullet.clone(),
+                ProjectileKind::Missile => assets.missile.clone(),
+                ProjectileKind::Bomb => assets.bomb.clone(),
             };
-            commands
-                .spawn((
-                    ProjectileView,
-                    Mesh3d(mesh),
-                    MeshMaterial3d(assets.projectile[idx].clone()),
-                    Transform::from_translation(coords::sim_to_world_at(projectile.pos, height)),
-                    // Unlit tracers; shadowing them costs a shadow-pass draw
-                    // per bullet for something nobody would see.
-                    NotShadowCaster,
-                ))
-                .id()
+            // A bomb is a falling object rather than a tracer, so it is lit and
+            // painted like a piece of ordnance instead of glowing.
+            let material = match projectile.kind {
+                ProjectileKind::Bomb => assets.dark.clone(),
+                _ => assets.projectile[idx].clone(),
+            };
+            let mut view = commands.spawn((
+                ProjectileView,
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                Transform::from_translation(coords::sim_to_world_at(projectile.pos, 2.2)),
+                // Unlit tracers; shadowing them costs a shadow-pass draw
+                // per bullet for something nobody would see.
+                NotShadowCaster,
+            ));
+            if projectile.kind == ProjectileKind::Bomb {
+                view.insert(FallingBomb { released: now });
+            }
+            view.id()
         });
-        if let Ok(mut transform) = views.get_mut(entity) {
+        if let Ok((mut transform, falling)) = views.get_mut(entity) {
             let height = match projectile.kind {
                 ProjectileKind::Bullet => 2.2,
                 ProjectileKind::Missile => 2.4,
+                // How far it has left to fall. The snapshot has no room to
+                // carry a height, so it is taken from how long this client has
+                // been watching this bomb -- which is the same thing for every
+                // bomb it sees released. One seen for the first time already
+                // part-way down starts again from the top: that needs a bomb to
+                // have been culled from a full projectile list and then come
+                // back inside it mid-fall, and it is over in a second either way.
+                ProjectileKind::Bomb => {
+                    let age = falling.map_or(0.0, |f| now - f.released);
+                    let fallen = (age / sim::BOMB_FALL_TIME).clamp(0.0, 1.0);
+                    0.6 + (sim::PLANE_ALTITUDE - 0.6) * (1.0 - fallen)
+                }
             };
             transform.translation = coords::sim_to_world_at(projectile.pos, height);
             transform.rotation = coords::yaw_to_quat(projectile.yaw);
+            if projectile.kind == ProjectileKind::Bomb {
+                // Nose-down as it goes, so a stick of them reads as falling
+                // rather than as a line of boxes sliding downward.
+                let age = falling.map_or(0.0, |f| now - f.released);
+                let tipped = (age / sim::BOMB_FALL_TIME).clamp(0.0, 1.0);
+                transform.rotation *= Quat::from_rotation_z(-tipped * 1.1);
+            }
         }
     }
 }

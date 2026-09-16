@@ -13,14 +13,14 @@ use std::collections::HashSet;
 use orewar_shared::math::{Vec2, angle_delta, wrap_angle};
 use orewar_shared::protocol::{
     DenyReason, GameEvent, GameStatus, HarvesterMode, HitFx, HitKind, InputFrame,
-    MAX_HITS_PER_SNAPSHOT, OreUpdate, PlayerInfo, PlayerSnapshot, ProjectileKind,
+    MAX_HITS_PER_SNAPSHOT, OreUpdate, PlaneSnapshot, PlayerInfo, PlayerSnapshot, ProjectileKind,
     SentinelSnapshot, ProjectileSnapshot, RejectReason, Snapshot, VehicleSlot, VehicleSnapshot,
     MAX_PROJECTILES_PER_SNAPSHOT,
 };
 use orewar_shared::sim::{self, MoveState, VehicleKind};
 use orewar_shared::world::{
     self, Hill, MAX_PLAYERS, MISSILES_PER_PACK, OreDeposit, PowerUp, STARTING_CREDITS,
-    STARTING_MISSILES,
+    STARTING_MISSILES, STARTING_POWERUPS,
 };
 
 /// How long a player's last input frame stays in effect.
@@ -47,12 +47,15 @@ pub struct Vehicle {
     pub since_damage: f32,
     pub gun_cooldown: f32,
     pub missile_cooldown: f32,
+    /// Seconds of flying left. Only the bomber burns it; on the ground it stays
+    /// at zero and is never read.
+    pub fuel: f32,
 }
 
 impl Vehicle {
     fn spawn(kind: VehicleKind, pos: Vec2, yaw: f32, powerups: u16) -> Self {
         Vehicle {
-            mv: MoveState { pos, yaw, speed: 0.0 },
+            mv: MoveState { pos, yaw, speed: 0.0, roll: 0.0 },
             turret_yaw: yaw,
             shield: sim::max_shield(kind, powerups),
             hull: sim::max_hull(kind, powerups),
@@ -62,6 +65,7 @@ impl Vehicle {
             since_damage: sim::SHIELD_REGEN_DELAY,
             gun_cooldown: 0.0,
             missile_cooldown: 0.0,
+            fuel: if kind.flies() { sim::PLANE_FUEL } else { 0.0 },
         }
     }
 
@@ -95,6 +99,14 @@ pub struct Player {
     pub captures: u8,
     pub tank: Option<Vehicle>,
     pub harvester: Option<Vehicle>,
+    /// A sortie in the air. A `Vehicle` like the other two so that everything
+    /// which takes a slot -- input, prediction, the switch key -- works on it
+    /// without a second shape to special-case, even though most of a vehicle
+    /// means nothing to it.
+    pub plane: Option<Vehicle>,
+    /// Seconds until another sortie can be called. Counts from the last one
+    /// ending, so a short run does not buy a quick second one.
+    pub sortie_cooldown: f32,
     pub sentinel: Sentinel,
     /// What the harvester does when the player is driving something else.
     pub harvester_mode: HarvesterMode,
@@ -141,11 +153,23 @@ impl Player {
             eliminated: false,
             credits: STARTING_CREDITS,
             ore_mined: 0,
-            powerups: 0,
+            powerups: STARTING_POWERUPS,
             missiles: STARTING_MISSILES,
             captures: 0,
-            tank: Some(Vehicle::spawn(VehicleKind::Tank, tank_pos, inward, 0)),
-            harvester: Some(Vehicle::spawn(VehicleKind::Harvester, harvester_pos, inward, 0)),
+            tank: Some(Vehicle::spawn(
+                VehicleKind::Tank,
+                tank_pos,
+                inward,
+                STARTING_POWERUPS,
+            )),
+            harvester: Some(Vehicle::spawn(
+                VehicleKind::Harvester,
+                harvester_pos,
+                inward,
+                STARTING_POWERUPS,
+            )),
+            plane: None,
+            sortie_cooldown: 0.0,
             sentinel: Sentinel::new(id),
             harvester_mode: HarvesterMode::default(),
             stuck_for: 0.0,
@@ -176,12 +200,13 @@ impl Player {
         };
 
         // Driving a vehicle that is not there is driving nothing. A destroyed
-        // tank used to strand the player: the client kept naming the tank it no
-        // longer had, so the harvester was treated as unattended and would not
-        // respond to anything until the respawn. Falling through here fixes it
-        // for every client, including one that never notices.
+        // tank used to strand the player this way, and an aircraft running out
+        // of fuel underneath them would do the same: the slot simply stops
+        // existing mid-flight, so the fallback has to be checked every tick
+        // rather than announced.
         if self.vehicle(frame.controlling).is_none() {
-            frame.controlling = frame.controlling.other();
+            frame.controlling =
+                frame.controlling.next_available(|slot| self.vehicle(slot).is_some());
         }
         frame
     }
@@ -190,6 +215,7 @@ impl Player {
         match slot {
             VehicleSlot::Tank => self.tank.as_ref(),
             VehicleSlot::Harvester => self.harvester.as_ref(),
+            VehicleSlot::Plane => self.plane.as_ref(),
         }
     }
 
@@ -197,6 +223,7 @@ impl Player {
         match slot {
             VehicleSlot::Tank => self.tank.as_mut(),
             VehicleSlot::Harvester => self.harvester.as_mut(),
+            VehicleSlot::Plane => self.plane.as_mut(),
         }
     }
 
@@ -211,6 +238,13 @@ impl Player {
             missiles: self.missiles,
             captures: self.captures,
             harvester_mode: self.harvester_mode,
+            plane: self.plane.as_ref().map(|v| PlaneSnapshot {
+                pos: v.mv.pos,
+                yaw: v.mv.yaw,
+                roll: v.mv.roll,
+                fuel: (v.fuel / sim::PLANE_FUEL).clamp(0.0, 1.0),
+            }),
+            plane_ready_in: self.sortie_cooldown.ceil().max(0.0) as u8,
             // Rounded up, so a countdown on screen reaches zero at the moment
             // the vehicles actually come back rather than a beat before.
             respawn_in: self.down_for.max(0.0).ceil().min(255.0) as u8,
@@ -545,6 +579,33 @@ impl Game {
         self.events.push(event);
     }
 
+    /// Calls up a sortie, if the player has bought the aircraft and the last
+    /// one is far enough behind them.
+    ///
+    /// Declines quietly. Every way this can fail is something the client
+    /// already knows -- it has the power-up mask and the cooldown in every
+    /// snapshot, and greys the key out -- so a rejection event here would only
+    /// ever fire on a race, and a message about it would be noise.
+    pub fn launch_plane(&mut self, id: u8) {
+        let Some(p) = self.player_mut(id) else { return };
+        if p.eliminated || p.plane.is_some() || p.sortie_cooldown > 0.0 {
+            return;
+        }
+        if !PowerUp::Bomber.held(p.powerups) {
+            return;
+        }
+        // It comes in over the player's own corner heading for the middle of
+        // the field, which is the one bearing that is the same for everybody.
+        // Starting it under the player's hand rather than flying itself in
+        // would mean a stretch of the fuel spent getting somewhere, and there
+        // is not enough of it for that.
+        let base = world::base_position(id);
+        let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - base).to_angle();
+        let mut plane = Vehicle::spawn(VehicleKind::Plane, base, inward, p.powerups);
+        plane.mv.speed = sim::PLANE_CRUISE;
+        p.plane = Some(plane);
+    }
+
     // -----------------------------------------------------------------------
     // Simulation
     // -----------------------------------------------------------------------
@@ -563,6 +624,10 @@ impl Game {
         }
 
         self.step_vehicles(dt);
+        // After the ground and before the weapons, so a bomb released this tick
+        // leaves from where the aircraft actually is. Outside `step_collisions`
+        // entirely: nothing up there shares ground with anything.
+        self.step_planes(dt);
         // Before weapons and capture, so both read where the hulls actually
         // ended up rather than where they were before being pushed apart.
         self.step_collisions();
@@ -627,11 +692,18 @@ impl Game {
             let controlling = input.controlling;
             let (throttle, steer, aim) = (input.throttle, input.steer, input.aim);
 
+            // Ground vehicles. The sortie is flown by `step_planes`, which
+            // shares almost nothing with this loop.
+            //
+            // Reached field by field rather than through `vehicle_mut`, which
+            // would borrow the whole player and put the autopilot bookkeeping
+            // below out of reach.
             for slot in [VehicleSlot::Tank, VehicleSlot::Harvester] {
                 let kind = slot.kind();
                 let Some(v) = (match slot {
                     VehicleSlot::Tank => p.tank.as_mut(),
                     VehicleSlot::Harvester => p.harvester.as_mut(),
+                    VehicleSlot::Plane => None,
                 }) else {
                     continue;
                 };
@@ -720,6 +792,48 @@ impl Game {
         }
     }
 
+    /// Flies the sortie, and ends it when the tank runs dry.
+    ///
+    /// Separate from [`Self::step_vehicles`] because almost none of that loop
+    /// applies: there is no autopilot for an aircraft, no hull to crash, no
+    /// shield to regenerate, and no turret to slew. What it does share is that
+    /// it runs every tick whether or not the player is looking at it -- let go
+    /// of, an aircraft keeps flying straight and keeps burning fuel, which is
+    /// the difference between it and a tank left parked.
+    fn step_planes(&mut self, dt: f32) {
+        for p in self.players.iter_mut().flatten() {
+            p.sortie_cooldown = (p.sortie_cooldown - dt).max(0.0);
+
+            let input = p.effective_input();
+            let flying = input.controlling == VehicleSlot::Plane;
+            let Some(plane) = p.plane.as_mut() else { continue };
+
+            let (throttle, steer) = if flying { (input.throttle, input.steer) } else { (0.0, 0.0) };
+            let _ = sim::step_vehicle(
+                &mut plane.mv,
+                throttle,
+                steer,
+                VehicleKind::Plane,
+                p.powerups,
+                &[],
+                dt,
+            );
+            // The aircraft has no turret of its own: it bombs what it is flying
+            // over, so the hull's heading is the only bearing it has.
+            plane.turret_yaw = plane.mv.yaw;
+            plane.gun_cooldown = (plane.gun_cooldown - dt).max(0.0);
+            plane.fuel -= dt;
+
+            if plane.fuel <= 0.0 {
+                p.plane = None;
+                // Timed from the sortie ending rather than from the launch, so
+                // flying one badly and losing it early is not rewarded with a
+                // quicker second go.
+                p.sortie_cooldown = sim::SORTIE_COOLDOWN;
+            }
+        }
+    }
+
     /// Keeps hulls out of each other, and charges both for a hard meeting.
     ///
     /// Vehicles are circles that cannot share ground: anything that ends a tick
@@ -739,6 +853,9 @@ impl Game {
             if p.eliminated {
                 continue;
             }
+            // Ground vehicles only. Nothing at `sim::PLANE_ALTITUDE` shares
+            // ground with anything, and a tank bouncing off an aircraft 26
+            // units over its head is not a collision anybody would accept.
             for slot in [VehicleSlot::Tank, VehicleSlot::Harvester] {
                 let Some(v) = p.vehicle(slot) else { continue };
                 bodies.push(Body {
@@ -868,6 +985,27 @@ impl Game {
                             yaw: tank.turret_yaw,
                             speed: sim::MISSILE_LAUNCH_SPEED,
                             life: sim::MISSILE_LIFETIME,
+                        });
+                    }
+                }
+            }
+
+            // The bomb bay. There is nothing to aim: a bomb leaves with the
+            // aircraft's own velocity and falls, so where it lands is decided
+            // by where the aircraft was pointing when it was let go. The
+            // secondary trigger does nothing up here.
+            if input.controlling == VehicleSlot::Plane && input.fire_primary {
+                if let Some(plane) = p.plane.as_mut() {
+                    if plane.gun_cooldown <= 0.0 {
+                        plane.gun_cooldown = sim::BOMB_COOLDOWN;
+                        spawned.push(Projectile {
+                            id: 0,
+                            kind: ProjectileKind::Bomb,
+                            owner,
+                            pos: plane.mv.pos,
+                            yaw: plane.mv.yaw,
+                            speed: plane.mv.speed,
+                            life: sim::BOMB_FALL_TIME,
                         });
                     }
                 }
@@ -1005,6 +1143,13 @@ impl Game {
                     radius: sim::tuning(VehicleKind::Harvester).radius,
                 });
             }
+            // The aircraft is deliberately absent. Everything that shoots in
+            // this game shoots along the ground, and the one limit on a sortie
+            // is the fuel clock -- putting the plane in here would have shells
+            // that visibly pass underneath it taking it down. `HitFx` is the
+            // second reason: it packs the slot into a single bit, so a hit on
+            // the plane could not even be described to a client.
+            //
             // Rubble is not worth shooting at.
             if p.sentinel.standing() {
                 out.push(Target {
@@ -1024,6 +1169,10 @@ impl Game {
         // borrow of `self.projectiles`, and the terrain cannot change mid-tick.
         let hills = std::mem::take(&mut self.hills);
         let mut hits: Vec<(u8, Hittable, f32, u8, f32)> = Vec::new();
+        // Bombs that reached the ground this tick, as (owner, where).
+        // Collected rather than resolved in place: a blast reads the whole
+        // target list, and `retain_mut` has the projectiles in hand.
+        let mut blasts: Vec<(u8, Vec2)> = Vec::new();
         // Moved aside for the same reason the terrain is: `retain_mut` holds
         // `self.projectiles` for the whole pass.
         let mut fx = std::mem::take(&mut self.fx);
@@ -1031,7 +1180,22 @@ impl Game {
         self.projectiles.retain_mut(|proj| {
             proj.life -= dt;
             if proj.life <= 0.0 {
+                // For everything else running out of life is falling short.
+                // For a bomb it is the whole point: the life *is* the fall, so
+                // reaching the end of it is reaching the ground.
+                if proj.kind == ProjectileKind::Bomb {
+                    blasts.push((proj.owner, proj.pos));
+                }
                 return false;
+            }
+
+            if proj.kind == ProjectileKind::Bomb {
+                // Still in the air, where there is nothing to run into. It
+                // holds the velocity the aircraft let it go with, which is what
+                // makes `sim::bomb_impact` -- and so the sight on the client --
+                // exactly right rather than nearly right.
+                proj.pos += Vec2::from_angle(proj.yaw) * (proj.speed * dt);
+                return true;
             }
 
             if proj.kind == ProjectileKind::Missile {
@@ -1095,6 +1259,11 @@ impl Game {
                 let damage = match proj.kind {
                     ProjectileKind::Bullet => sim::BULLET_DAMAGE,
                     ProjectileKind::Missile => sim::MISSILE_DAMAGE,
+                    // A bomb never reaches this: it is at altitude for its
+                    // whole flight and is skipped by the pass that gets here.
+                    // What it does is done where it lands, to everything within
+                    // a radius rather than to the one thing in its way.
+                    ProjectileKind::Bomb => 0.0,
                 };
                 // The bearing from the hull's centre out to where it was
                 // struck, which is the face the shield has to flash on.
@@ -1114,6 +1283,29 @@ impl Game {
 
         self.hills = hills;
         self.fx = fx;
+
+        // A bomb is aimed at a place, not at a hull: everything standing close
+        // enough pays, on a slope from the middle of the blast out to nothing
+        // at the rim. That is the one weapon in the game where missing by a
+        // little still costs the target something, which is what a stick of
+        // them dropped across a position is for.
+        for (owner, at) in blasts {
+            self.fx.push(HitFx::on_terrain(HitKind::Blast, at));
+            for t in &targets {
+                if t.player == owner {
+                    continue;
+                }
+                let distance = t.pos.distance(at);
+                let damage = sim::blast_damage(distance, sim::BOMB_BLAST_RADIUS, sim::BOMB_DAMAGE);
+                if damage <= 0.0 {
+                    continue;
+                }
+                // The bearing from the hull out to the blast, so a shield
+                // flashes on the side the bomb went off, the same as for a shell.
+                let bearing = (at - t.pos).to_angle();
+                hits.push((t.player, t.what, damage, owner, bearing));
+            }
+        }
 
         for (player, what, damage, attacker, bearing) in hits {
             match what {
@@ -1160,12 +1352,7 @@ impl Game {
             return;
         };
         let powerups = p.powerups;
-        let Some(v) = (match slot {
-            VehicleSlot::Tank => p.tank.as_mut(),
-            VehicleSlot::Harvester => p.harvester.as_mut(),
-        }) else {
-            return;
-        };
+        let Some(v) = p.vehicle_mut(slot) else { return };
         if v.disabled {
             return;
         }
@@ -1190,6 +1377,11 @@ impl Game {
                 p.respawn_timer = sim::TANK_RESPAWN_DELAY;
                 self.events.push(GameEvent::TankDestroyed { player, by: attacker });
             }
+            // Nothing shoots at the aircraft, so nothing damages it and this
+            // is unreachable. Left explicit rather than folded into a wildcard:
+            // if something ever does learn to shoot upward, this is the line
+            // that has to decide what being hit up there means.
+            VehicleSlot::Plane => {}
             VehicleSlot::Harvester => {
                 // Harvesters are never destroyed. They go dead in the water and
                 // become something an enemy tank has to come and take.
@@ -1356,6 +1548,12 @@ impl Game {
             // out of the match: `eliminated` means "not here right now", and
             // `down_for` is how long that lasts.
             victim.tank = None;
+            // Anything in the air goes with them. The cooldown starts now and
+            // runs through the lockout, which is shorter than the lockout is --
+            // so they do come back with a sortie available. That is deliberate:
+            // they come back with nothing else.
+            victim.plane = None;
+            victim.sortie_cooldown = sim::SORTIE_COOLDOWN;
             victim.eliminated = true;
             victim.down_for = sim::CAPTURE_LOCKOUT;
             // Nothing to come back to on the tank timer; the whole player is on
@@ -1663,7 +1861,9 @@ mod tests {
         // Everything earned is gone.
         let p = g.player(0).unwrap();
         assert_eq!(p.credits, STARTING_CREDITS);
-        assert_eq!(p.powerups, 0);
+        // Back to whatever a match starts you with, which is the point: a
+        // restart is a fresh match, not a stripped one.
+        assert_eq!(p.powerups, STARTING_POWERUPS);
         assert_eq!(p.ore_mined, 0);
         assert_eq!(p.captures, 0);
         assert!(p.tank.is_some() && p.harvester.is_some());
@@ -2103,7 +2303,7 @@ mod tests {
         // Nose to nose and well inside each other, closing at twice top speed.
         {
             let a = g.player_mut(0).unwrap().tank.as_mut().unwrap();
-            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: top };
+            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: top, roll: 0.0 };
         }
         {
             let b = g.player_mut(1).unwrap().tank.as_mut().unwrap();
@@ -2111,6 +2311,7 @@ mod tests {
                 pos: Vec2::new(100.0 + touching * 0.5, 100.0),
                 yaw: std::f32::consts::PI,
                 speed: top,
+                roll: 0.0,
             };
         }
         let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
@@ -2137,7 +2338,7 @@ mod tests {
 
         {
             let a = g.player_mut(0).unwrap().tank.as_mut().unwrap();
-            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: 2.0 };
+            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: 2.0, roll: 0.0 };
         }
         {
             let b = g.player_mut(1).unwrap().tank.as_mut().unwrap();
@@ -2145,6 +2346,7 @@ mod tests {
                 pos: Vec2::new(100.0 + touching - 0.4, 100.0),
                 yaw: 0.0,
                 speed: 0.0,
+                roll: 0.0,
             };
         }
         let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
@@ -2176,6 +2378,7 @@ mod tests {
                 pos: wreck,
                 yaw: 0.0,
                 speed: sim::tuning(VehicleKind::Tank).max_speed,
+                roll: 0.0,
             };
         }
         g.step(TICK_DT);
@@ -2219,7 +2422,7 @@ mod tests {
         let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0 };
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
         }
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
             g.step(TICK_DT);
@@ -2319,6 +2522,210 @@ mod tests {
         assert!(moved > 3.0, "the harvester only moved {moved:.2}; the player is still frozen out");
     }
 
+    /// Helper: give a player the aircraft and put a sortie in the air.
+    fn launch_for(g: &mut Game, id: u8) {
+        g.player_mut(id).unwrap().powerups |= PowerUp::Bomber.bit();
+        g.launch_plane(id);
+    }
+
+    /// The aircraft is bought once and then flown on a clock.
+    ///
+    /// Everything about the sortie being an event rather than a vehicle you
+    /// keep lives here: it cannot be called without the upgrade, only one can
+    /// be up at a time, and the next one waits out the cooldown from the moment
+    /// the last one ended.
+    #[test]
+    fn a_sortie_needs_the_upgrade_and_stands_down_between_runs() {
+        let mut g = two_player_game();
+
+        // Without the upgrade the key does nothing at all. Taken away
+        // explicitly rather than assumed absent, so this keeps testing the gate
+        // whatever `STARTING_POWERUPS` happens to hand out.
+        g.player_mut(0).unwrap().powerups &= !PowerUp::Bomber.bit();
+        g.launch_plane(0);
+        assert!(g.player(0).unwrap().plane.is_none(), "a sortie flew without being bought");
+
+        launch_for(&mut g, 0);
+        assert!(g.player(0).unwrap().plane.is_some(), "the sortie never took off");
+
+        // Asking again while one is up does not stack a second.
+        g.launch_plane(0);
+        assert!(g.player(0).unwrap().plane.is_some());
+
+        // Fly it dry.
+        for _ in 0..((sim::PLANE_FUEL / TICK_DT) as usize + 5) {
+            g.step(TICK_DT);
+        }
+        let p = g.player(0).unwrap();
+        assert!(p.plane.is_none(), "the sortie outlived its fuel");
+        assert!(p.sortie_cooldown > 0.0, "nothing is standing between this and the next one");
+
+        // And the next one has to wait it out.
+        g.launch_plane(0);
+        assert!(g.player(0).unwrap().plane.is_none(), "a second sortie skipped the cooldown");
+        for _ in 0..((sim::SORTIE_COOLDOWN / TICK_DT) as usize + 5) {
+            g.step(TICK_DT);
+        }
+        g.launch_plane(0);
+        assert!(g.player(0).unwrap().plane.is_some(), "the cooldown never let go");
+    }
+
+    /// Running out of fuel puts the player back in something they still have.
+    ///
+    /// The slot simply stops existing underneath them, which no message
+    /// announces -- so if the fallback did not run every tick, a player would
+    /// be left holding controls attached to nothing until they pressed a key.
+    #[test]
+    fn an_aircraft_out_of_fuel_hands_the_controls_back() {
+        let mut g = two_player_game();
+        launch_for(&mut g, 0);
+        g.set_input(
+            0,
+            InputFrame { tick: 1, controlling: VehicleSlot::Plane, ..Default::default() },
+        );
+        g.step(TICK_DT);
+        assert_eq!(g.player(0).unwrap().effective_input().controlling, VehicleSlot::Plane);
+
+        for _ in 0..((sim::PLANE_FUEL / TICK_DT) as usize + 5) {
+            // Kept asking for the plane the whole way down, the way a client
+            // that has not seen the snapshot yet would.
+            g.set_input(
+                0,
+                InputFrame { tick: 2, controlling: VehicleSlot::Plane, ..Default::default() },
+            );
+            g.step(TICK_DT);
+        }
+
+        let p = g.player(0).unwrap();
+        assert!(p.plane.is_none());
+        assert_eq!(
+            p.effective_input().controlling,
+            VehicleSlot::Tank,
+            "the player was left driving an aircraft that is not there"
+        );
+    }
+
+    /// A hill is cover from a shell and nothing to a bomb.
+    ///
+    /// This is the whole reason the aircraft is worth a thousand ore: it
+    /// reaches what terrain protects. A bomb is at altitude for its entire
+    /// flight, so the swept test that stops a shell at the near face of a hill
+    /// has to leave it alone.
+    #[test]
+    fn a_bomb_falls_past_the_hill_that_would_have_stopped_a_shell() {
+        let target = Vec2::new(200.0, 200.0);
+        let yaw = std::f32::consts::PI;
+        // Where the aircraft has to let go for the bomb to land on the target,
+        // which is the inverse of what the bombsight computes.
+        let release = target - Vec2::from_angle(yaw) * (sim::PLANE_CRUISE * sim::BOMB_FALL_TIME);
+
+        // One hill squarely between the two, so the run is over cover.
+        let hill = Hill { pos: target.lerp(release, 0.5), radius: 10.0 };
+
+        let fire = |kind: ProjectileKind, speed: f32, life: f32| {
+            let mut g = two_player_game();
+            g.hills = vec![hill];
+            {
+                let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+                t.mv = MoveState { pos: target, yaw: 0.0, speed: 0.0, roll: 0.0 };
+            }
+            let before = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+            g.projectiles.push(Projectile {
+                id: 900,
+                kind,
+                owner: 0,
+                pos: release,
+                yaw,
+                speed,
+                life,
+            });
+            for _ in 0..((life / TICK_DT) as usize + 3) {
+                g.step(TICK_DT);
+            }
+            before - g.player(1).unwrap().tank.as_ref().unwrap().shield
+        };
+
+        // A missile on exactly that line is stopped by the hill.
+        let shell = fire(ProjectileKind::Missile, sim::MISSILE_MAX_SPEED, sim::MISSILE_LIFETIME);
+        assert_eq!(shell, 0.0, "the hill was supposed to be cover and let {shell} through");
+
+        // The bomb flies over it and lands on the tank regardless.
+        let bomb = fire(ProjectileKind::Bomb, sim::PLANE_CRUISE, sim::BOMB_FALL_TIME);
+        assert!(bomb > 0.0, "the hill ate a bomb that was 26 units above it");
+    }
+
+    /// A blast is aimed at a place: near misses hurt, far ones do not.
+    #[test]
+    fn a_bomb_hurts_what_is_near_where_it_lands() {
+        let damage_at = |offset: f32| {
+            let mut g = two_player_game();
+            g.hills.clear();
+            let at = Vec2::new(200.0, 200.0);
+            {
+                let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+                t.mv = MoveState { pos: at + Vec2::new(offset, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+            }
+            let before = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+            // Dropped straight down: no travel, so it lands exactly here.
+            g.projectiles.push(Projectile {
+                id: 901,
+                kind: ProjectileKind::Bomb,
+                owner: 0,
+                pos: at,
+                yaw: 0.0,
+                speed: 0.0,
+                life: TICK_DT * 0.5,
+            });
+            g.step(TICK_DT);
+            before - g.player(1).unwrap().tank.as_ref().unwrap().shield
+        };
+
+        let direct = damage_at(0.0);
+        let near = damage_at(sim::BOMB_BLAST_RADIUS * 0.6);
+        let clear = damage_at(sim::BOMB_BLAST_RADIUS + 5.0);
+        assert!(direct > 0.0, "a bomb landing on a tank did nothing");
+        assert!(near > 0.0 && near < direct, "the falloff is not a slope: {direct} then {near}");
+        assert_eq!(clear, 0.0, "a bomb outside its own radius still did {clear}");
+    }
+
+    /// Nothing on the ground can bring the aircraft down.
+    ///
+    /// The fuel clock is the only limit on a sortie, and that is a deliberate
+    /// choice rather than an oversight: every gun in this game fires along the
+    /// ground, so a shell that took the plane down would be one the player
+    /// watched pass visibly underneath it. The aircraft is kept out of the
+    /// target list to make that true, and this is what says so.
+    #[test]
+    fn the_aircraft_is_not_something_that_can_be_shot_at() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        launch_for(&mut g, 0);
+        let over = Vec2::new(200.0, 200.0);
+        {
+            let plane = g.player_mut(0).unwrap().plane.as_mut().unwrap();
+            plane.mv = MoveState { pos: over, yaw: 0.0, speed: sim::PLANE_CRUISE, roll: 0.0 };
+        }
+        assert!(
+            !g.collect_targets().iter().any(|t| t.what == Hittable::Vehicle(VehicleSlot::Plane)),
+            "the aircraft is in the target list and can be shot at"
+        );
+
+        // Walk a shell straight through where it is.
+        g.projectiles.push(Projectile {
+            id: 902,
+            kind: ProjectileKind::Missile,
+            owner: 1,
+            pos: over - Vec2::new(30.0, 0.0),
+            yaw: 0.0,
+            speed: sim::MISSILE_MAX_SPEED,
+            life: sim::MISSILE_LIFETIME,
+        });
+        for _ in 0..20 {
+            g.step(TICK_DT);
+        }
+        assert!(g.player(0).unwrap().plane.is_some(), "something shot the aircraft down");
+    }
+
     /// A wreck keeps its load, and the load goes to whoever takes it.
     #[test]
     fn capturing_a_loaded_harvester_seizes_its_ore() {
@@ -2338,7 +2745,7 @@ mod tests {
             sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0 };
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
         }
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
             g.step(TICK_DT);
@@ -2370,7 +2777,7 @@ mod tests {
             sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0 };
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
         }
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
             g.step(TICK_DT);
@@ -2403,8 +2810,8 @@ mod tests {
             // Held in place; this test is about who gets shot at.
             {
                 let p = g.player_mut(1).unwrap();
-                p.tank.as_mut().unwrap().mv = MoveState { pos: a, yaw: 0.0, speed: 0.0 };
-                p.harvester.as_mut().unwrap().mv = MoveState { pos: b, yaw: 0.0, speed: 0.0 };
+                p.tank.as_mut().unwrap().mv = MoveState { pos: a, yaw: 0.0, speed: 0.0, roll: 0.0 };
+                p.harvester.as_mut().unwrap().mv = MoveState { pos: b, yaw: 0.0, speed: 0.0, roll: 0.0 };
                 p.tank.as_mut().unwrap().shield = 100.0;
                 p.harvester.as_mut().unwrap().shield = 100.0;
             }
@@ -2438,7 +2845,7 @@ mod tests {
         for _ in 0..300 {
             // Held there; this test is about whether the shell arrives.
             g.player_mut(1).unwrap().tank.as_mut().unwrap().mv =
-                MoveState { pos: edge, yaw: 0.0, speed: 0.0 };
+                MoveState { pos: edge, yaw: 0.0, speed: 0.0, roll: 0.0 };
             g.step(TICK_DT);
         }
         assert!(
@@ -2467,9 +2874,9 @@ mod tests {
             // Both held: this is about whether the shell arrives, not about
             // where an autopilot would rather be.
             g.player_mut(0).unwrap().harvester.as_mut().unwrap().mv =
-                MoveState { pos: station, yaw: 0.0, speed: 0.0 };
+                MoveState { pos: station, yaw: 0.0, speed: 0.0, roll: 0.0 };
             g.player_mut(1).unwrap().tank.as_mut().unwrap().mv =
-                MoveState { pos: victim, yaw: 0.0, speed: 0.0 };
+                MoveState { pos: victim, yaw: 0.0, speed: 0.0, roll: 0.0 };
             g.step(TICK_DT);
         }
         assert!(
@@ -2490,7 +2897,7 @@ mod tests {
         let far = post + Vec2::from_angle(inward) * (sim::SENTINEL_RANGE + 25.0);
         {
             let p = g.player_mut(1).unwrap();
-            p.tank.as_mut().unwrap().mv = MoveState { pos: far, yaw: 0.0, speed: 0.0 };
+            p.tank.as_mut().unwrap().mv = MoveState { pos: far, yaw: 0.0, speed: 0.0, roll: 0.0 };
         }
         let full = g.player(1).unwrap().tank.as_ref().unwrap().shield;
         for _ in 0..300 {
@@ -2616,7 +3023,7 @@ mod tests {
         // Start it well out in the field so the trip is real.
         {
             let h = g.player_mut(0).unwrap().harvester.as_mut().unwrap();
-            h.mv = MoveState { pos: Vec2::splat(world::WORLD_SIZE * 0.4), yaw: 0.0, speed: 0.0 };
+            h.mv = MoveState { pos: Vec2::splat(world::WORLD_SIZE * 0.4), yaw: 0.0, speed: 0.0, roll: 0.0 };
             h.cargo = 20.0;
         }
         for _ in 0..5400 {

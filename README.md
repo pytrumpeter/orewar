@@ -71,9 +71,16 @@ the handshake with an error rather than let in. Start it with another name.
 | mouse | aim the turret |
 | left mouse | fire the gun |
 | right mouse | fire a missile |
-| `Tab` | switch between tank and harvester |
-| `B` | build menu, then `1`–`7` to buy |
+| `Tab` | switch between the vehicles you have |
+| `G` | call up a bombing run, once you own the **Bomber** |
+| `B` | build menu, then `1`–`8` to buy |
 | `Ctrl-Q` | leave the match |
+
+Flying is different from driving. `A` and `D` do not steer the bomber, they
+**bank** it, and a banked aircraft comes round on its own — the further over it
+is, the tighter the turn. Let go and the bank stays where you put it, so a turn
+continues until you roll back level. The throttle does nothing at all: an
+aircraft holds one speed. Left mouse releases bombs.
 
 ---
 
@@ -126,10 +133,30 @@ Both it and the harvester's auto turret size their shells from their own
 engagement ranges rather than from the tank's, so retuning the tank's gun
 cannot leave either one firing at something it can no longer hit.
 
+**The bomber** is the one thing in the game that reaches ground a tank cannot.
+It costs 1000 ore — more than everything else on the list put together — and
+what it buys is the aircraft, not a sortie. (Temporarily, every player starts a
+match already holding it, so it can be flown without mining for one first: see
+`STARTING_POWERUPS`.) Press `G` and it comes in over your
+own corner with eighteen seconds of fuel, about one crossing of the field. `Tab`
+reaches it while it is up, and when the fuel goes it is gone and the next one is
+forty-five seconds away.
+
+Nothing can shoot it down. Every gun in the game fires along the ground, so the
+clock is the only thing standing between a bombing run and the ground under it.
+What a bomb costs you instead is the run itself: it leaves with the aircraft's
+velocity and falls for a second and a half, landing some 47 units ahead of where
+you let it go, so a run is a line you commit to and fly through — and one you
+have to bank into early, because rolling level again takes as long as rolling
+over did. The ring on the
+ground is where the next one will land. Hills are cover from everything else in
+the game and nothing at all to a bomb, and a blast fades from its centre out, so
+a near miss still costs the target something.
+
 **Upgrades.** Radar (a HUD contact circle), Shield Booster, Turbo Drive,
-Harvester Armor, Auto Turret (the harvester defends itself), Long Barrel, and
-Missile Packs. The map is generated in one quadrant and rotated into the other
-three, so every corner faces an identical distribution of ore.
+Harvester Armor, Auto Turret (the harvester defends itself), Long Barrel,
+Missile Packs, and the Bomber. The map is generated in one quadrant and rotated
+into the other three, so every corner faces an identical distribution of ore.
 
 ---
 

@@ -23,11 +23,11 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 use orewar_shared::math::{self, Vec2 as SimVec2};
 use orewar_shared::protocol::{
-    GameStatus, HarvesterMode, HitFx, InputFrame, PlayerInfo, ProjectileKind, Snapshot,
-    VehicleSlot, VehicleSnapshot,
+    GameStatus, HarvesterMode, HitFx, InputFrame, PlaneSnapshot, PlayerInfo, ProjectileKind,
+    Snapshot, VehicleSlot, VehicleSnapshot,
 };
 use orewar_shared::sim::{self, MoveState};
-use orewar_shared::world::{self, Hill, MAX_PLAYERS, OreDeposit, TICK_DT};
+use orewar_shared::world::{self, Hill, MAX_PLAYERS, OreDeposit, PowerUp, TICK_DT};
 
 /// How far behind the newest snapshot the world is drawn.
 ///
@@ -50,6 +50,9 @@ const ERROR_HALF_LIFE: f32 = 0.08;
 pub struct RenderVehicle {
     pub pos: SimVec2,
     pub yaw: f32,
+    /// Bank angle. Always zero on the ground; on the aircraft it is both what
+    /// makes the turn and what the model is visibly rolled by.
+    pub roll: f32,
     pub turret_yaw: f32,
     pub shield: f32,
     pub hull: f32,
@@ -63,6 +66,7 @@ impl RenderVehicle {
         RenderVehicle {
             pos: v.pos,
             yaw: v.yaw,
+            roll: 0.0,
             turret_yaw: v.turret_yaw,
             shield: v.shield,
             hull: v.hull,
@@ -75,6 +79,7 @@ impl RenderVehicle {
     fn lerp(a: &VehicleSnapshot, b: &VehicleSnapshot, t: f32) -> Self {
         RenderVehicle {
             pos: a.pos.lerp(b.pos, t),
+            roll: 0.0,
             // Angles must take the short way around, or a vehicle crossing the
             // -pi/+pi boundary spins the long way for a frame.
             yaw: math::angle_lerp(a.yaw, b.yaw, t),
@@ -85,6 +90,30 @@ impl RenderVehicle {
             disabled: b.disabled,
             capture_progress: a.capture_progress + (b.capture_progress - a.capture_progress) * t,
         }
+    }
+}
+
+/// The aircraft as the rest of the client wants it: a vehicle like any other.
+///
+/// A [`PlaneSnapshot`] carries only what changes, because four of them have to
+/// fit in every packet. Everything downstream of here -- prediction, the
+/// camera, the HUD, the model -- is written against a vehicle, so the cheapest
+/// place to pay for that thrift is once, here. The speed is the constant it is
+/// always flying at, and the turret bearing is the airframe's own: it bombs
+/// what it is pointed at.
+fn plane_as_vehicle(p: &PlaneSnapshot) -> VehicleSnapshot {
+    VehicleSnapshot {
+        pos: p.pos,
+        yaw: p.yaw,
+        turret_yaw: p.yaw,
+        speed: sim::PLANE_CRUISE,
+        // Fuel rides in on `cargo`, which is the one field on a vehicle that
+        // means nothing to an aircraft and is already a "how full is it".
+        cargo: p.fuel,
+        shield: 0.0,
+        hull: 1.0,
+        disabled: false,
+        capture_progress: 0.0,
     }
 }
 
@@ -115,6 +144,11 @@ pub struct RenderPlayer {
     pub harvester: Option<RenderVehicle>,
     /// Absent while the emplacement is rubble.
     pub sentinel: Option<RenderSentinel>,
+    /// Present only while a sortie is in the air. Its `cargo` is the fuel left,
+    /// as a fraction.
+    pub plane: Option<RenderVehicle>,
+    /// Seconds until another sortie can be called; zero when one is ready.
+    pub plane_ready_in: u8,
 }
 
 impl RenderPlayer {
@@ -122,7 +156,14 @@ impl RenderPlayer {
         match slot {
             VehicleSlot::Tank => self.tank.as_ref(),
             VehicleSlot::Harvester => self.harvester.as_ref(),
+            VehicleSlot::Plane => self.plane.as_ref(),
         }
+    }
+
+    /// Whether a sortie can be called right now, which is what greys the key
+    /// out rather than letting the player press something that does nothing.
+    pub fn sortie_ready(&self) -> bool {
+        PowerUp::Bomber.held(self.powerups) && self.plane.is_none() && self.plane_ready_in == 0
     }
 }
 
@@ -177,6 +218,15 @@ impl Prediction {
         math::wrap_angle(yaw + self.yaw_offset)
     }
 
+    /// Bank to draw, interpolated for the same reason the heading is: the roll
+    /// changes by a fixed amount per simulation step, so drawing the current
+    /// step's value at every frame steps it at 30 Hz inside otherwise smooth
+    /// motion, and a wing that moves in visible increments is worse than one
+    /// that does not move at all.
+    pub fn render_roll(&self, alpha: f32) -> f32 {
+        math::angle_lerp(self.previous.roll, self.state.roll, alpha)
+    }
+
     /// Steps prediction forward with the input the client just sent.
     pub fn apply(&mut self, frame: InputFrame, powerups: u16, hills: &[Hill]) {
         if !self.active {
@@ -217,6 +267,7 @@ impl Prediction {
         &mut self,
         authoritative: &VehicleSnapshot,
         slot: VehicleSlot,
+        roll: f32,
         acked: u32,
         powerups: u16,
         hills: &[Hill],
@@ -225,8 +276,12 @@ impl Prediction {
         let was_active = self.active && self.slot == slot;
 
         self.slot = slot;
-        self.state =
-            MoveState { pos: authoritative.pos, yaw: authoritative.yaw, speed: authoritative.speed };
+        self.state = MoveState {
+            pos: authoritative.pos,
+            yaw: authoritative.yaw,
+            speed: authoritative.speed,
+            roll,
+        };
 
         while self.history.front().is_some_and(|f| f.tick <= acked) {
             self.history.pop_front();
@@ -411,14 +466,23 @@ impl GameState {
         if let Some(local) = self.local_player {
             if let Some(me) = snapshot.players.iter().find(|p| p.id == local) {
                 let slot = self.prediction.slot;
+                // The aircraft is widened into a full vehicle here so that
+                // prediction has one shape to reconcile against.
+                let as_plane = me.plane.as_ref().map(plane_as_vehicle);
                 let vehicle = match slot {
                     VehicleSlot::Tank => me.tank.as_ref(),
                     VehicleSlot::Harvester => me.harvester.as_ref(),
+                    VehicleSlot::Plane => as_plane.as_ref(),
                 };
+                // The bank is not on a `VehicleSnapshot` -- only an aircraft
+                // has one -- so it is handed over beside it rather than by
+                // widening a struct that four of ride in every packet.
+                let roll = me.plane.map_or(0.0, |q| q.roll);
                 match vehicle {
                     Some(v) => self.prediction.reconcile(
                         v,
                         slot,
+                        roll,
                         snapshot.acked_input,
                         me.powerups,
                         &self.hills,
@@ -497,6 +561,24 @@ impl GameState {
                         }
                         _ => None,
                     };
+                    // Interpolated like the rest. A sortie that has just taken
+                    // off has no earlier frame to come from, so it starts where
+                    // the newer snapshot puts it.
+                    let plane = match (pa.and_then(|p| p.plane), pb.plane) {
+                        (Some(qa), Some(qb)) => Some(RenderVehicle {
+                            roll: math::angle_lerp(qa.roll, qb.roll, t),
+                            ..RenderVehicle::lerp(
+                                &plane_as_vehicle(&qa),
+                                &plane_as_vehicle(&qb),
+                                t,
+                            )
+                        }),
+                        (_, Some(qb)) => Some(RenderVehicle {
+                            roll: qb.roll,
+                            ..RenderVehicle::from_snapshot(&plane_as_vehicle(&qb))
+                        }),
+                        _ => None,
+                    };
                     if let Some(slot) = players.get_mut(pb.id as usize) {
                         *slot = Some(RenderPlayer {
                             id: pb.id,
@@ -512,6 +594,8 @@ impl GameState {
                             tank,
                             harvester,
                             sentinel,
+                            plane,
+                            plane_ready_in: pb.plane_ready_in,
                         });
                     }
                 }
@@ -557,6 +641,11 @@ impl GameState {
                                     hull: s.hull,
                                     turret_yaw: s.turret_yaw,
                                 }),
+                                plane: p.plane.as_ref().map(|q| RenderVehicle {
+                                    roll: q.roll,
+                                    ..RenderVehicle::from_snapshot(&plane_as_vehicle(q))
+                                }),
+                                plane_ready_in: p.plane_ready_in,
                             });
                         }
                     }
@@ -577,14 +666,19 @@ impl GameState {
             let slot = self.prediction.slot;
             let pos = self.prediction.render_pos(alpha);
             let yaw = self.prediction.render_yaw(alpha);
+            let roll = self.prediction.render_roll(alpha);
             if let Some(Some(player)) = players.get_mut(local as usize) {
                 let target = match slot {
                     VehicleSlot::Tank => player.tank.as_mut(),
                     VehicleSlot::Harvester => player.harvester.as_mut(),
+                    VehicleSlot::Plane => player.plane.as_mut(),
                 };
                 if let Some(v) = target {
                     v.pos = pos;
                     v.yaw = yaw;
+                    if slot == VehicleSlot::Plane {
+                        v.roll = roll;
+                    }
                 }
             }
         }
@@ -738,6 +832,7 @@ mod tests {
                 ..Default::default()
             },
             VehicleSlot::Tank,
+            0.0,
             4,
             0,
             &hills,
@@ -791,6 +886,7 @@ mod tests {
         p.reconcile(
             &VehicleSnapshot { pos: SimVec2::new(200.0, 200.0), ..Default::default() },
             VehicleSlot::Tank,
+            0.0,
             1,
             0,
             &[],

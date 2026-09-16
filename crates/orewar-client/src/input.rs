@@ -48,7 +48,7 @@ impl Default for LocalInput {
 }
 
 /// Purchase hotkeys, in the order the build menu lists them.
-pub const BUY_KEYS: [KeyCode; 7] = [
+pub const BUY_KEYS: [KeyCode; 8] = [
     KeyCode::Digit1,
     KeyCode::Digit2,
     KeyCode::Digit3,
@@ -56,7 +56,11 @@ pub const BUY_KEYS: [KeyCode; 7] = [
     KeyCode::Digit5,
     KeyCode::Digit6,
     KeyCode::Digit7,
+    KeyCode::Digit8,
 ];
+
+/// Calls up a sortie.
+pub const LAUNCH_KEY: KeyCode = KeyCode::KeyG;
 
 pub fn gather(
     keys: Res<ButtonInput<KeyCode>>,
@@ -111,22 +115,43 @@ pub fn gather(
     input.fire_primary = buttons.pressed(MouseButton::Left) || keys.pressed(KeyCode::Space);
     input.fire_secondary = buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::KeyF);
 
-    // Swap which vehicle you are driving.
+    // Call up a sortie. Reliable, like a purchase, and only sent when it can
+    // actually be granted -- the client has the upgrade mask and the cooldown
+    // in every snapshot, so a key that would be declined is a key that does
+    // nothing here rather than a request the server quietly drops.
+    if keys.just_pressed(LAUNCH_KEY) && net.link == Link::Connected {
+        if state.local().is_some_and(|me| me.sortie_ready()) {
+            net.launch_plane();
+        }
+    }
+
+    // Swap which vehicle you are driving. The cycle only stops on what you
+    // actually have, so it is two vehicles until a sortie is up and three
+    // while it is, rather than a third stop that is empty most of a match.
     if keys.just_pressed(KeyCode::Tab) {
-        input.controlling = input.controlling.other();
-        state.set_predicted_slot(input.controlling);
+        if let Some(me) = state.local() {
+            let next = input.controlling.next_available(|slot| me.vehicle(slot).is_some());
+            if next != input.controlling {
+                input.controlling = next;
+                state.set_predicted_slot(next);
+            }
+        }
     }
 
     // Follow the vehicle you actually have. A destroyed tank leaves nothing
-    // to drive, and the server already falls through to the other slot, but
-    // prediction and the turret still have to be pointed at the right hull or
-    // the harvester moves under you while the camera and aim stay behind.
-    // Coming back the same way puts you in the tank the moment it respawns.
+    // to drive, and an aircraft running dry takes the controls out from under
+    // you mid-flight with nothing to announce it. The server already falls
+    // through, but prediction and the turret still have to be pointed at the
+    // right hull or the harvester moves under you while the camera and aim
+    // stay behind. Coming back the same way puts you in the tank the moment it
+    // respawns.
     if let Some(me) = state.local() {
-        let have = |slot| me.vehicle(slot).is_some();
-        if !have(input.controlling) && have(input.controlling.other()) {
-            input.controlling = input.controlling.other();
-            state.set_predicted_slot(input.controlling);
+        if me.vehicle(input.controlling).is_none() {
+            let next = input.controlling.next_available(|slot| me.vehicle(slot).is_some());
+            if next != input.controlling {
+                input.controlling = next;
+                state.set_predicted_slot(next);
+            }
         }
     }
 

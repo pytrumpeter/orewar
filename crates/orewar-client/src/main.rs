@@ -214,6 +214,8 @@ fn main() {
                 effects::setup,
             ),
         )
+        // After `vehicles::setup`, which is where the mesh it draws is built.
+        .add_systems(Startup, vehicles::setup_bombsight.after(vehicles::setup))
         // Networking runs before anything reads state, so a frame always sees
         // the freshest snapshot that has arrived.
         .add_systems(PreUpdate, net::poll)
@@ -234,6 +236,7 @@ fn main() {
                 (
                     vehicles::sync_vehicles,
                     vehicles::sync_projectiles,
+                    vehicles::sync_bombsight,
                     field::sync_ore,
                     field::sync_hills,
                     sentinels::sync,

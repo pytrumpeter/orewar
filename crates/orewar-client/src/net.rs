@@ -124,6 +124,12 @@ impl NetClient {
         self.send_reliable(&ClientMessage::Purchase(powerup));
     }
 
+    /// Asks for a sortie. Reliable for the same reason a purchase is: it
+    /// happens once, and an input frame is never retransmitted.
+    pub fn launch_plane(&mut self) {
+        self.send_reliable(&ClientMessage::LaunchPlane);
+    }
+
     /// Sends one packet carrying this tick's input.
     pub fn send_input(&mut self, frame: InputFrame) {
         if self.link != Link::Connected {

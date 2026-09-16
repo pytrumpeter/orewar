@@ -20,11 +20,12 @@ use crate::world::{MAX_PLAYERS, PowerUp, WORLD_SIZE};
 /// Bumped whenever the wire format changes, so mismatched builds fail the
 /// handshake instead of misparsing each other.
 ///
-/// Last bumped for [`HitFx`] on the snapshot.
+/// Last bumped for the bomber: a third [`VehicleSlot`], which widened the
+/// control field in [`InputFrame`] from one bit to two.
 /// Without a bump an older peer would complete the handshake and then hit an
 /// unknown tag on the reliable stream, which is a decode error rather than a
 /// recoverable one.
-pub const PROTOCOL_ID: u32 = 0x4F52_5707;
+pub const PROTOCOL_ID: u32 = 0x4F52_5708;
 
 /// Quantization ceiling for shield and hull values.
 const STAT_SCALE: f32 = 512.0;
@@ -36,7 +37,14 @@ const SPEED_SCALE: f32 = 1000.0;
 /// Snapshots carry at most this many projectiles, nearest to the receiver
 /// first. Bullets are dense and short-lived; dropping the far ones keeps
 /// packets inside the MTU and is invisible in play.
-pub const MAX_PROJECTILES_PER_SNAPSHOT: usize = 40;
+///
+/// Came down from 40 to pay for the bomber, which put a [`PlaneSnapshot`] and
+/// a cooldown on every player and took the worst-case packet one byte over the
+/// budget. This is the right place to find it: four players firing flat out
+/// keep well under a dozen shells in the air between them, so the cap is slack
+/// that only a pathological case ever reaches, where the per-player bytes are
+/// paid on every single tick.
+pub const MAX_PROJECTILES_PER_SNAPSHOT: usize = 36;
 
 /// A full ore resync is sent this often; between them only changed deposits go
 /// out. This bounds how long a client can hold a stale amount after packet loss.
@@ -46,36 +54,58 @@ pub const ORE_FULL_SYNC_INTERVAL: u32 = 30;
 // Client -> server
 // ---------------------------------------------------------------------------
 
-/// Which of a player's two vehicles they are currently driving.
+/// Which of a player's vehicles they are currently driving.
+///
+/// The first two are always theirs. [`VehicleSlot::Plane`] exists only while a
+/// sortie is in the air, which is why nothing here can answer "what do I switch
+/// to" on its own -- see [`VehicleSlot::next_available`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum VehicleSlot {
     #[default]
     Tank = 0,
     Harvester = 1,
+    Plane = 2,
 }
 
 impl VehicleSlot {
+    /// Cycling order, which is the order the switch key walks.
+    pub const ALL: [VehicleSlot; 3] =
+        [VehicleSlot::Tank, VehicleSlot::Harvester, VehicleSlot::Plane];
+
     pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(VehicleSlot::Tank),
-            1 => Some(VehicleSlot::Harvester),
-            _ => None,
-        }
+        Self::ALL.get(v as usize).copied()
     }
 
     pub fn kind(self) -> VehicleKind {
         match self {
             VehicleSlot::Tank => VehicleKind::Tank,
             VehicleSlot::Harvester => VehicleKind::Harvester,
+            VehicleSlot::Plane => VehicleKind::Plane,
         }
     }
 
-    pub fn other(self) -> Self {
-        match self {
-            VehicleSlot::Tank => VehicleSlot::Harvester,
-            VehicleSlot::Harvester => VehicleSlot::Tank,
+    /// The next slot in the cycle that the player actually has, or `self` if
+    /// they have nothing else.
+    ///
+    /// This is both the switch key and the fallback for driving something that
+    /// is no longer there -- a destroyed tank, or an aircraft that has run out
+    /// of fuel underneath you. One function for both because they are the same
+    /// question, and because a fallback that could name a slot the player does
+    /// not hold is how a player ends up driving nothing.
+    pub fn next_available(self, available: impl Fn(VehicleSlot) -> bool) -> Self {
+        let mut slot = self;
+        for _ in 0..Self::ALL.len() {
+            slot = match slot {
+                VehicleSlot::Tank => VehicleSlot::Harvester,
+                VehicleSlot::Harvester => VehicleSlot::Plane,
+                VehicleSlot::Plane => VehicleSlot::Tank,
+            };
+            if available(slot) {
+                return slot;
+            }
         }
+        self
     }
 }
 
@@ -98,9 +128,12 @@ pub struct InputFrame {
 
 impl Encode for InputFrame {
     fn encode(&self, w: &mut Writer) {
+        // Two bits for the slot since the bomber joined, so the fire bits moved
+        // up one. This is what the protocol bump is for: read by an older build
+        // the same byte says "driving the harvester and holding fire".
         let flags = self.controlling as u8
-            | (self.fire_primary as u8) << 1
-            | (self.fire_secondary as u8) << 2;
+            | (self.fire_primary as u8) << 2
+            | (self.fire_secondary as u8) << 3;
         w.u32(self.tick);
         w.u8(flags);
         w.i8((self.throttle.clamp(-1.0, 1.0) * 127.0) as i8);
@@ -118,12 +151,12 @@ impl Decode for InputFrame {
         let aim = r.angle()?;
         Ok(InputFrame {
             tick,
-            controlling: VehicleSlot::from_u8(flags & 1).unwrap_or_default(),
+            controlling: VehicleSlot::from_u8(flags & 0b11).unwrap_or_default(),
             throttle: throttle.clamp(-1.0, 1.0),
             steer: steer.clamp(-1.0, 1.0),
             aim,
-            fire_primary: flags & 0b10 != 0,
-            fire_secondary: flags & 0b100 != 0,
+            fire_primary: flags & 0b100 != 0,
+            fire_secondary: flags & 0b1000 != 0,
         })
     }
 }
@@ -144,6 +177,14 @@ pub enum ClientMessage {
     NewGame,
     /// Reliable. Changes what the harvester does when left to itself.
     SetHarvesterMode(HarvesterMode),
+    /// Reliable. Asks for a sortie. The server checks the upgrade and the
+    /// cooldown and silently declines if either says no.
+    ///
+    /// Reliable rather than a bit on [`InputFrame`] for the same reason a
+    /// purchase is: it happens once, and an input frame that goes missing is
+    /// never retransmitted. A dropped launch would read to the player as a key
+    /// that did nothing.
+    LaunchPlane,
 }
 
 impl Encode for ClientMessage {
@@ -164,6 +205,9 @@ impl Encode for ClientMessage {
             }
             ClientMessage::NewGame => {
                 w.u8(4);
+            }
+            ClientMessage::LaunchPlane => {
+                w.u8(6);
             }
         }
     }
@@ -189,6 +233,7 @@ impl Decode for ClientMessage {
                         .ok_or(DecodeError::BadTag("HarvesterMode", raw))?,
                 )
             }
+            6 => ClientMessage::LaunchPlane,
             other => return Err(DecodeError::BadTag("ClientMessage", other)),
         })
     }
@@ -303,6 +348,54 @@ impl Decode for SentinelSnapshot {
 /// Bytes one `SentinelSnapshot` occupies on the wire.
 pub const SENTINEL_SNAPSHOT_BYTES: usize = 4;
 
+/// The bomber in the air, which is a much smaller thing than a vehicle.
+///
+/// Deliberately not a [`VehicleSnapshot`]. That is 22 bytes and four of them
+/// would not fit the budget -- and most of it would be zeroes anyway, because
+/// an aircraft has no shield, no cargo, no turret of its own, and nothing that
+/// can capture it. Its speed is not sent either, because there is only one it
+/// can be: an aircraft holds [`sim::PLANE_CRUISE`] and nothing the pilot does
+/// changes it, so the client resumes prediction from that constant and is
+/// exactly right rather than nearly right. That is also what lets the bombsight
+/// promise where a bomb will land. The bank is the opposite case and does
+/// travel: it is held rather than sprung back, so it is genuine state that a
+/// client cannot infer from the inputs it happens to have seen.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlaneSnapshot {
+    pub pos: Vec2,
+    pub yaw: f32,
+    /// Bank angle. Not decoration: the bank is what turns the aircraft, so a
+    /// client that guessed it would predict a different heading within a tick.
+    /// It is also what the model is drawn rolled by.
+    pub roll: f32,
+    /// Fuel left, `0..=1`. The clock the whole sortie runs on.
+    pub fuel: f32,
+}
+
+impl Encode for PlaneSnapshot {
+    fn encode(&self, w: &mut Writer) {
+        w.vec2(self.pos);
+        w.angle(self.yaw);
+        w.angle(self.roll);
+        w.unorm8(self.fuel);
+    }
+}
+
+impl Decode for PlaneSnapshot {
+    fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        Ok(PlaneSnapshot {
+            pos: r.vec2()?,
+            yaw: r.angle()?,
+            roll: r.angle()?,
+            fuel: r.unorm8()?,
+        })
+    }
+}
+
+/// Bytes one `PlaneSnapshot` occupies on the wire. Half a vehicle, and most of
+/// that is the position, which is the one thing it cannot do without.
+pub const PLANE_SNAPSHOT_BYTES: usize = 13;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerSnapshot {
     pub id: u8,
@@ -320,6 +413,12 @@ pub struct PlayerSnapshot {
     pub harvester: Option<VehicleSnapshot>,
     /// Absent while the emplacement is rubble and rebuilding.
     pub sentinel: Option<SentinelSnapshot>,
+    /// Present only while a sortie is in the air.
+    pub plane: Option<PlaneSnapshot>,
+    /// Whole seconds until another sortie can be called, zero when one is
+    /// available now. Whole seconds because it is only ever read as a countdown
+    /// on screen, the same as `respawn_in`.
+    pub plane_ready_in: u8,
     /// What the harvester does when nobody is driving it. Sent back so the
     /// control panel shows what the server actually has, not what this client
     /// last asked for.
@@ -336,7 +435,8 @@ impl Encode for PlayerSnapshot {
             | (self.eliminated as u8) << 1
             | (self.tank.is_some() as u8) << 2
             | (self.harvester.is_some() as u8) << 3
-            | (self.sentinel.is_some() as u8) << 4;
+            | (self.sentinel.is_some() as u8) << 4
+            | (self.plane.is_some() as u8) << 5;
         w.u8(self.id);
         w.u8(flags);
         w.u32(self.credits);
@@ -346,6 +446,7 @@ impl Encode for PlayerSnapshot {
         w.u8(self.captures);
         w.u8(self.harvester_mode as u8);
         w.u8(self.respawn_in);
+        w.u8(self.plane_ready_in);
         if let Some(v) = &self.tank {
             v.encode(w);
         }
@@ -354,6 +455,9 @@ impl Encode for PlayerSnapshot {
         }
         if let Some(sentinel) = &self.sentinel {
             sentinel.encode(w);
+        }
+        if let Some(plane) = &self.plane {
+            plane.encode(w);
         }
     }
 }
@@ -371,9 +475,11 @@ impl Decode for PlayerSnapshot {
         let harvester_mode =
             HarvesterMode::from_u8(raw_mode).ok_or(DecodeError::BadTag("HarvesterMode", raw_mode))?;
         let respawn_in = r.u8()?;
+        let plane_ready_in = r.u8()?;
         let tank = if flags & 0b100 != 0 { Some(r.read()?) } else { None };
         let harvester = if flags & 0b1000 != 0 { Some(r.read()?) } else { None };
         let sentinel = if flags & 0b1_0000 != 0 { Some(r.read()?) } else { None };
+        let plane = if flags & 0b10_0000 != 0 { Some(r.read()?) } else { None };
         Ok(PlayerSnapshot {
             id,
             connected: flags & 1 != 0,
@@ -385,21 +491,27 @@ impl Decode for PlayerSnapshot {
             captures,
             harvester_mode,
             respawn_in,
+            plane_ready_in,
             tank,
             harvester,
             sentinel,
+            plane,
         })
     }
 }
 
 /// Fixed bytes per player, before optional vehicles.
-pub const PLAYER_SNAPSHOT_FIXED_BYTES: usize = 16;
+pub const PLAYER_SNAPSHOT_FIXED_BYTES: usize = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ProjectileKind {
     Bullet = 0,
     Missile = 1,
+    /// Released from the bomber. Carries the velocity it was let go with and
+    /// falls; it is at altitude for its whole life, so it passes over hills and
+    /// hulls alike and only does anything when it lands.
+    Bomb = 2,
 }
 
 impl ProjectileKind {
@@ -407,6 +519,7 @@ impl ProjectileKind {
         match v {
             0 => Some(ProjectileKind::Bullet),
             1 => Some(ProjectileKind::Missile),
+            2 => Some(ProjectileKind::Bomb),
             _ => None,
         }
     }
@@ -934,6 +1047,15 @@ mod tests {
             sentinel: Some(SentinelSnapshot { hull: 118.5, turret_yaw: 2.0 }),
             harvester_mode: HarvesterMode::Home,
             respawn_in: 41,
+            // A sortie in the air is part of the worst case: four players can
+            // all have one up at once, and that is the packet that has to fit.
+            plane: Some(PlaneSnapshot {
+                pos: vec2(201.5, 88.25),
+                yaw: -1.0,
+                roll: 0.9,
+                fuel: 0.5,
+            }),
+            plane_ready_in: 33,
         }
     }
 
@@ -1155,16 +1277,57 @@ mod tests {
         );
     }
 
+    /// Every bit the bomber moved in the input flags, exercised at once.
+    ///
+    /// The control field went from one bit to two so a third slot could fit,
+    /// which pushed both fire bits up one. Nothing else catches a half-applied
+    /// change here: the slot that reveals it is `Plane`, and it is the one
+    /// slot the older round-trip case could not name. Read with the old mask
+    /// this frame says "driving the tank", which is a bug that would present as
+    /// a launch key that flies nothing.
+    #[test]
+    fn a_frame_flying_the_plane_survives_the_wire() {
+        for controlling in VehicleSlot::ALL {
+            for (fire_primary, fire_secondary) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let f = InputFrame {
+                    tick: 7,
+                    controlling,
+                    throttle: -1.0,
+                    steer: 1.0,
+                    aim: 2.5,
+                    fire_primary,
+                    fire_secondary,
+                };
+                let got = InputFrame::from_slice(&f.to_vec()).expect("decodes");
+                assert_eq!(got.controlling, controlling);
+                assert_eq!(got.fire_primary, fire_primary, "{controlling:?}");
+                assert_eq!(got.fire_secondary, fire_secondary, "{controlling:?}");
+            }
+        }
+    }
+
     #[test]
     fn struct_size_constants_match_the_encoders() {
         assert_eq!(sample_vehicle().to_vec().len(), VEHICLE_SNAPSHOT_BYTES);
-        let bare =
-            PlayerSnapshot { tank: None, harvester: None, sentinel: None, ..sample_player(0) };
+        let bare = PlayerSnapshot {
+            tank: None,
+            harvester: None,
+            sentinel: None,
+            plane: None,
+            ..sample_player(0)
+        };
         assert_eq!(bare.to_vec().len(), PLAYER_SNAPSHOT_FIXED_BYTES);
-        let with_sentinel = PlayerSnapshot { tank: None, harvester: None, ..sample_player(0) };
+        let with_sentinel = PlayerSnapshot { sentinel: sample_player(0).sentinel, ..bare };
         assert_eq!(
             with_sentinel.to_vec().len(),
             PLAYER_SNAPSHOT_FIXED_BYTES + SENTINEL_SNAPSHOT_BYTES
+        );
+        let with_plane = PlayerSnapshot { plane: sample_player(0).plane, ..bare };
+        assert_eq!(
+            with_plane.to_vec().len(),
+            PLAYER_SNAPSHOT_FIXED_BYTES + PLANE_SNAPSHOT_BYTES
         );
         let proj = ProjectileSnapshot {
             id: 1,

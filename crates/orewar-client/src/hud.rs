@@ -322,14 +322,34 @@ pub fn update_texts(
                     Link::Denied(reason) => format!("refused: {}", reason.describe()),
                 };
                 let name = state.local_player.map(|id| state.name_of(id)).unwrap_or_default();
+                // The sortie line is only worth the room once the aircraft is
+                // bought: for most of most matches there is nothing to say.
+                let sortie = match me {
+                    Some(p) if PowerUp::Bomber.held(p.powerups) => {
+                        if let Some(plane) = p.plane {
+                            format!("\nsortie: {:.0}s of fuel", plane.cargo * sim::PLANE_FUEL)
+                        } else if p.plane_ready_in > 0 {
+                            format!("\nsortie: ready in {}s", p.plane_ready_in)
+                        } else {
+                            "\nsortie: ready  [G]".to_string()
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let weapons = if input.controlling == VehicleSlot::Plane {
+                    "WASD fly | LMB drop bombs"
+                } else {
+                    "WASD drive | mouse aim | LMB gun | RMB missile"
+                };
                 **text = format!(
-                    "OREWAR  {name}\n{link}\nore {credits}   mined {}\ndriving: {}\n\n\
-                     WASD drive | mouse aim | LMB gun | RMB missile\n\
+                    "OREWAR  {name}\n{link}\nore {credits}   mined {}\ndriving: {}{sortie}\n\n\
+                     {weapons}\n\
                      TAB swap vehicle | B build | O overview | ESC menu",
                     me.map_or(0, |p| p.ore_mined),
                     match input.controlling {
                         VehicleSlot::Tank => "TANK",
                         VehicleSlot::Harvester => "HARVESTER",
+                        VehicleSlot::Plane => "BOMBER",
                     }
                 );
             }
@@ -511,7 +531,14 @@ pub fn update_radar(
 
     // The reference frame: where the viewer is and which way they face.
     let viewer = me
-        .and_then(|p| p.vehicle(input.controlling).or_else(|| p.vehicle(input.controlling.other())))
+        .and_then(|p| {
+            let slot = if p.vehicle(input.controlling).is_some() {
+                input.controlling
+            } else {
+                input.controlling.next_available(|s| p.vehicle(s).is_some())
+            };
+            p.vehicle(slot)
+        })
         .map(|v| (v.pos, v.yaw));
 
     // Flatten every vehicle on the field into a list of contacts.
