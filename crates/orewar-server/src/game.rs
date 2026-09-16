@@ -55,7 +55,7 @@ pub struct Vehicle {
 impl Vehicle {
     fn spawn(kind: VehicleKind, pos: Vec2, yaw: f32, powerups: u16) -> Self {
         Vehicle {
-            mv: MoveState { pos, yaw, speed: 0.0, roll: 0.0 },
+            mv: MoveState { pos, yaw, speed: 0.0, roll: 0.0, alt: 0.0 },
             turret_yaw: yaw,
             shield: sim::max_shield(kind, powerups),
             hull: sim::max_hull(kind, powerups),
@@ -244,6 +244,7 @@ impl Player {
                 roll: v.mv.roll,
                 speed: v.mv.speed,
                 fuel: (v.fuel / sim::PLANE_FUEL).clamp(0.0, 1.0),
+                alt: v.mv.alt,
             }),
             plane_ready_in: self.sortie_cooldown.ceil().max(0.0) as u8,
             // Rounded up, so a countdown on screen reaches zero at the moment
@@ -617,6 +618,9 @@ impl Game {
         let inward = (Vec2::splat(world::WORLD_SIZE * 0.5) - base).to_angle();
         let mut plane = Vehicle::spawn(VehicleKind::Plane, base, inward, p.powerups);
         plane.mv.speed = sim::PLANE_CRUISE;
+        // Low in the band. Height is something a sortie has to spend fuel
+        // climbing for, so arriving on top of a fight is not free.
+        plane.mv.alt = sim::PLANE_ALTITUDE;
         p.plane = Some(plane);
     }
 
@@ -726,7 +730,7 @@ impl Game {
                     v.mv.speed = 0.0;
                     sim::StepOutcome::default()
                 } else if slot == controlling {
-                    sim::step_vehicle(&mut v.mv, throttle, steer, kind, powerups, &self.hills, dt)
+                    sim::step_vehicle(&mut v.mv, throttle, steer, 0.0, kind, powerups, &self.hills, dt)
                 } else if slot == VehicleSlot::Miner {
                     // Left alone, the miner works the field on whichever
                     // mode the player picked. This branch runs only while they
@@ -762,6 +766,7 @@ impl Game {
                         &mut v.mv,
                         auto_throttle,
                         auto_steer,
+                        0.0,
                         kind,
                         powerups,
                         &self.hills,
@@ -769,7 +774,7 @@ impl Game {
                     )
                 } else {
                     // An unattended tank coasts to a halt and holds station.
-                    sim::step_vehicle(&mut v.mv, 0.0, 0.0, kind, powerups, &self.hills, dt)
+                    sim::step_vehicle(&mut v.mv, 0.0, 0.0, 0.0, kind, powerups, &self.hills, dt)
                 };
 
                 // Driving into a hillside costs hull, above a speed that nosing
@@ -823,11 +828,16 @@ impl Game {
             let flying = input.controlling == VehicleSlot::Plane;
             let Some(plane) = p.plane.as_mut() else { continue };
 
-            let (throttle, steer) = if flying { (input.throttle, input.steer) } else { (0.0, 0.0) };
+            // Hands off the moment the player looks away: an unattended sortie
+            // holds its heading, its height and its speed, and burns fuel doing
+            // it. Zero on the yoke is "hold this altitude", not "descend".
+            let (throttle, steer, climb) =
+                if flying { (input.throttle, input.steer, input.climb) } else { (0.0, 0.0, 0.0) };
             let _ = sim::step_vehicle(
                 &mut plane.mv,
                 throttle,
                 steer,
+                climb,
                 VehicleKind::Plane,
                 p.powerups,
                 &[],
@@ -841,11 +851,12 @@ impl Game {
                 plane.fuel -= dt;
             }
 
-            // Two ways a sortie ends: the tank runs dry, or it is flown out of
-            // the match. Nothing holds the aircraft inside the field, so the
-            // second is a choice the player makes -- and the only one of the
-            // two that cheat mode does not take away.
-            if plane.fuel <= 0.0 || sim::plane_has_left(plane.mv.pos) {
+            // One way a sortie ends: the tank runs dry. Flying out of the
+            // field used to be the other, and is not any more -- the edge banks
+            // the aircraft back inside instead. At sixty seconds of fuel
+            // against a field nineteen seconds across, the wall would otherwise
+            // have finished nearly every sortie before the fuel did.
+            if plane.fuel <= 0.0 {
                 p.plane = None;
                 // Timed from the sortie ending rather than from the launch, so
                 // flying one badly and losing it early is not rewarded with a
@@ -1026,7 +1037,11 @@ impl Game {
                             pos: plane.mv.pos,
                             yaw: plane.mv.yaw,
                             speed: plane.mv.speed,
-                            life: sim::BOMB_FALL_TIME,
+                            // The fall is the height it was let go from, so a
+                            // bomb from the ceiling is a long throw and one off
+                            // the floor lands almost underneath. The client's
+                            // sight reads the same function.
+                            life: sim::bomb_fall_time(plane.mv.alt),
                         });
                     }
                 }
@@ -2335,7 +2350,7 @@ mod tests {
         // Nose to nose and well inside each other, closing at twice top speed.
         {
             let a = g.player_mut(0).unwrap().tank.as_mut().unwrap();
-            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: top, roll: 0.0 };
+            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: top, roll: 0.0, alt: 0.0 };
         }
         {
             let b = g.player_mut(1).unwrap().tank.as_mut().unwrap();
@@ -2344,6 +2359,7 @@ mod tests {
                 yaw: std::f32::consts::PI,
                 speed: top,
                 roll: 0.0,
+                alt: 0.0,
             };
         }
         let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
@@ -2370,7 +2386,7 @@ mod tests {
 
         {
             let a = g.player_mut(0).unwrap().tank.as_mut().unwrap();
-            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: 2.0, roll: 0.0 };
+            a.mv = MoveState { pos: Vec2::new(100.0, 100.0), yaw: 0.0, speed: 2.0, roll: 0.0, alt: 0.0 };
         }
         {
             let b = g.player_mut(1).unwrap().tank.as_mut().unwrap();
@@ -2379,6 +2395,7 @@ mod tests {
                 yaw: 0.0,
                 speed: 0.0,
                 roll: 0.0,
+                alt: 0.0,
             };
         }
         let full = g.player(0).unwrap().tank.as_ref().unwrap().shield;
@@ -2411,6 +2428,7 @@ mod tests {
                 yaw: 0.0,
                 speed: sim::tuning(VehicleKind::Tank).max_speed,
                 roll: 0.0,
+                alt: 0.0,
             };
         }
         g.step(TICK_DT);
@@ -2454,7 +2472,7 @@ mod tests {
         let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         }
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
             g.step(TICK_DT);
@@ -2659,7 +2677,7 @@ mod tests {
             g.hills = vec![hill];
             {
                 let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-                t.mv = MoveState { pos: target, yaw: 0.0, speed: 0.0, roll: 0.0 };
+                t.mv = MoveState { pos: target, yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
             }
             let before = g.player(1).unwrap().tank.as_ref().unwrap().shield;
             g.projectiles.push(Projectile {
@@ -2785,17 +2803,20 @@ mod tests {
         );
     }
 
-    /// Flying out of the match is a way to lose the aircraft.
+    /// The fuel is the only thing that ends a sortie.
     ///
-    /// Nothing holds it inside the field any more, so this is the other way a
-    /// sortie ends -- and the only one cheat mode does not take away.
+    /// Flying out of the match used to be the other way, and is not any more:
+    /// the edge banks the aircraft back inside. At sixty seconds of fuel against
+    /// a field about nineteen seconds across at cruise, the wall would otherwise
+    /// have ended nearly every sortie before the fuel did -- which makes a
+    /// dogfight something you lose by drifting rather than by being outflown.
     #[test]
-    fn flying_out_of_the_field_ends_the_sortie() {
+    fn the_wall_sends_a_sortie_home_instead_of_ending_it() {
         let mut g = two_player_game();
         launch_for(&mut g, 0);
-        g.toggle_cheats(); // even with the fuel switched off
+        g.toggle_cheats(); // fuel off, so only the wall could end this
 
-        // Pointed at the nearest wall and left to fly.
+        // Pointed at the nearest wall and left to fly, with no stick input.
         {
             let plane = g.player_mut(0).unwrap().plane.as_mut().unwrap();
             plane.mv = MoveState {
@@ -2803,14 +2824,25 @@ mod tests {
                 yaw: 0.0,
                 speed: sim::PLANE_CRUISE,
                 roll: 0.0,
+                alt: sim::PLANE_ALTITUDE,
             };
         }
-        for _ in 0..120 {
+        // Watched across the whole run rather than at one instant. Hands off,
+        // the aircraft comes off the wall still banked -- the turn-back hands it
+        // over the moment it is pointed inward, and the bank is held like any
+        // other -- so it circles rather than flying away in a straight line. A
+        // pilot rolls level; nobody is flying this one. What has to be true is
+        // that the wall never ends the sortie and never holds on to it.
+        let mut got_clear = false;
+        for _ in 0..600 {
             g.step(TICK_DT);
+            let p = g.player(0).unwrap();
+            let plane = p.plane.as_ref().expect("the wall ended the sortie");
+            if plane.mv.pos.x < world::WORLD_SIZE - sim::PLANE_EDGE_BAND - 10.0 {
+                got_clear = true;
+            }
         }
-        let p = g.player(0).unwrap();
-        assert!(p.plane.is_none(), "it flew off the map and stayed in the match");
-        assert!(p.sortie_cooldown > 0.0, "leaving did not start the cooldown");
+        assert!(got_clear, "it never got out of the band it started in");
     }
 
     /// A bomb takes a deposit out entirely, and only the one it landed on.
@@ -2867,7 +2899,8 @@ mod tests {
                     yaw: 0.0,
                     speed: 0.0,
                     roll: 0.0,
-                };
+                alt: 0.0,
+            };
             }
             let taken = |g: &Game| {
                 let m = g.player(1).unwrap().miner.as_ref().unwrap();
@@ -2917,7 +2950,7 @@ mod tests {
         let over = Vec2::new(200.0, 200.0);
         {
             let plane = g.player_mut(0).unwrap().plane.as_mut().unwrap();
-            plane.mv = MoveState { pos: over, yaw: 0.0, speed: sim::PLANE_CRUISE, roll: 0.0 };
+            plane.mv = MoveState { pos: over, yaw: 0.0, speed: sim::PLANE_CRUISE, roll: 0.0, alt: sim::PLANE_ALTITUDE };
         }
         assert!(
             !g.collect_targets().iter().any(|t| t.what == Hittable::Vehicle(VehicleSlot::Plane)),
@@ -2959,7 +2992,7 @@ mod tests {
             sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Miner).radius;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         }
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
             g.step(TICK_DT);
@@ -2991,7 +3024,7 @@ mod tests {
             sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Miner).radius;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+            t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         }
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize + 10) {
             g.step(TICK_DT);
@@ -3024,8 +3057,8 @@ mod tests {
             // Held in place; this test is about who gets shot at.
             {
                 let p = g.player_mut(1).unwrap();
-                p.tank.as_mut().unwrap().mv = MoveState { pos: a, yaw: 0.0, speed: 0.0, roll: 0.0 };
-                p.miner.as_mut().unwrap().mv = MoveState { pos: b, yaw: 0.0, speed: 0.0, roll: 0.0 };
+                p.tank.as_mut().unwrap().mv = MoveState { pos: a, yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
+                p.miner.as_mut().unwrap().mv = MoveState { pos: b, yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
                 p.tank.as_mut().unwrap().shield = 100.0;
                 p.miner.as_mut().unwrap().shield = 100.0;
             }
@@ -3059,7 +3092,7 @@ mod tests {
         for _ in 0..300 {
             // Held there; this test is about whether the shell arrives.
             g.player_mut(1).unwrap().tank.as_mut().unwrap().mv =
-                MoveState { pos: edge, yaw: 0.0, speed: 0.0, roll: 0.0 };
+                MoveState { pos: edge, yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
             g.step(TICK_DT);
         }
         assert!(
@@ -3088,9 +3121,9 @@ mod tests {
             // Both held: this is about whether the shell arrives, not about
             // where an autopilot would rather be.
             g.player_mut(0).unwrap().miner.as_mut().unwrap().mv =
-                MoveState { pos: station, yaw: 0.0, speed: 0.0, roll: 0.0 };
+                MoveState { pos: station, yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
             g.player_mut(1).unwrap().tank.as_mut().unwrap().mv =
-                MoveState { pos: victim, yaw: 0.0, speed: 0.0, roll: 0.0 };
+                MoveState { pos: victim, yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
             g.step(TICK_DT);
         }
         assert!(
@@ -3111,7 +3144,7 @@ mod tests {
         let far = post + Vec2::from_angle(inward) * (sim::SENTINEL_RANGE + 25.0);
         {
             let p = g.player_mut(1).unwrap();
-            p.tank.as_mut().unwrap().mv = MoveState { pos: far, yaw: 0.0, speed: 0.0, roll: 0.0 };
+            p.tank.as_mut().unwrap().mv = MoveState { pos: far, yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         }
         let full = g.player(1).unwrap().tank.as_ref().unwrap().shield;
         for _ in 0..300 {
@@ -3237,7 +3270,7 @@ mod tests {
         // Start it well out in the field so the trip is real.
         {
             let m = g.player_mut(0).unwrap().miner.as_mut().unwrap();
-            m.mv = MoveState { pos: Vec2::splat(world::WORLD_SIZE * 0.4), yaw: 0.0, speed: 0.0, roll: 0.0 };
+            m.mv = MoveState { pos: Vec2::splat(world::WORLD_SIZE * 0.4), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
             m.cargo = 20.0;
         }
         for _ in 0..5400 {
@@ -3584,6 +3617,7 @@ mod tests {
                             controlling: VehicleSlot::Tank,
                             throttle: 1.0,
                             steer: ((i % 11) as f32 - 5.0) / 5.0,
+                            climb: 0.0,
                             aim: i as f32 * 0.05,
                             fire_primary: i % 5 == 0,
                             fire_secondary: false,

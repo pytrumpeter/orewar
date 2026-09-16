@@ -23,6 +23,19 @@ pub struct LocalInput {
     pub controlling: VehicleSlot,
     pub throttle: f32,
     pub steer: f32,
+    /// Yoke: negative descends, positive climbs. Zero holds the height.
+    pub climb: f32,
+    /// Which detent the aircraft's throttle is in, `1..=5`.
+    ///
+    /// The aircraft is the one vehicle whose throttle is not a key you hold.
+    /// Held throttle and a yoke cannot share `W` and `S`, and of the two the
+    /// yoke is what wants holding -- so the airspeed became a setting you
+    /// select and leave, which is how a real throttle quadrant works and means
+    /// one less thing to keep a finger on in a turning fight.
+    ///
+    /// Only ever leaves here as [`throttle_for_detent`], so the server and the
+    /// simulation never learn that the axis is quantised.
+    pub throttle_detent: u8,
     pub aim: f32,
     pub fire_primary: bool,
     pub fire_secondary: bool,
@@ -46,6 +59,8 @@ impl Default for LocalInput {
             controlling: VehicleSlot::Tank,
             throttle: 0.0,
             steer: 0.0,
+            climb: 0.0,
+            throttle_detent: CRUISE_DETENT,
             aim: 0.0,
             fire_primary: false,
             fire_secondary: false,
@@ -54,6 +69,33 @@ impl Default for LocalInput {
             current: InputFrame::default(),
         }
     }
+}
+
+/// Throttle detents for the aircraft, slowest first.
+///
+/// Five rather than the eight the build menu uses, because there are only five
+/// distinct airspeeds worth having: the trim runs from -1 to 1 and the middle
+/// one is the cruise. Digits 6 to 8 stay purely a build-menu thing.
+pub const THROTTLE_KEYS: [KeyCode; 5] = [
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+];
+
+/// The detent a sortie arrives in: the middle one, which is the plain cruise.
+pub const CRUISE_DETENT: u8 = 3;
+
+/// Turns a detent into the throttle axis the simulation understands.
+///
+/// 1 maps to -1 and 5 to 1, so 3 is exactly zero -- the cruise, untrimmed.
+/// Keeping the mapping here rather than in the frame means `step_plane` is
+/// untouched by any of this: it still takes a continuous axis, and a gamepad or
+/// a touch slider could feed it one without the detents having to be involved.
+pub fn throttle_for_detent(detent: u8) -> f32 {
+    let clamped = detent.clamp(1, THROTTLE_KEYS.len() as u8);
+    (clamped as f32 - CRUISE_DETENT as f32) / (CRUISE_DETENT as f32 - 1.0)
 }
 
 /// Purchase hotkeys, in the order the build menu lists them.
@@ -146,6 +188,7 @@ pub fn gather(
     if !controls.live {
         input.throttle = 0.0;
         input.steer = 0.0;
+        input.climb = 0.0;
         input.fire_primary = false;
         input.fire_secondary = false;
         return;
@@ -153,12 +196,46 @@ pub fn gather(
 
     let held = |a: KeyCode, b: KeyCode| keys.pressed(a) || keys.pressed(b);
 
-    let mut throttle = 0.0;
-    if held(KeyCode::KeyW, KeyCode::ArrowUp) {
-        throttle += 1.0;
+    // `W` and `S` mean different things in the air. On the ground they are the
+    // throttle, held; in the aircraft they are the yoke, and the throttle moves
+    // to the digits -- because a yoke has to be held to be any use and a
+    // throttle does not, so the held pair goes to whichever of the two needs it.
+    let flying = input.controlling == VehicleSlot::Plane;
+
+    // Pushed away is down and pulled back is up, which is a control column
+    // rather than a scrolled screen. `W` is forward on the keyboard, so `W`
+    // descends.
+    let mut climb = 0.0;
+    if flying {
+        if held(KeyCode::KeyW, KeyCode::ArrowUp) {
+            climb -= 1.0;
+        }
+        if held(KeyCode::KeyS, KeyCode::ArrowDown) {
+            climb += 1.0;
+        }
     }
-    if held(KeyCode::KeyS, KeyCode::ArrowDown) {
-        throttle -= 1.0;
+
+    // The digits are the aircraft's throttle quadrant while the build menu is
+    // shut. Open, they buy things -- the menu owns them, which is why the buy
+    // loop below tests the same flag the other way round.
+    if flying && !input.build_menu {
+        for (i, key) in THROTTLE_KEYS.iter().enumerate() {
+            if keys.just_pressed(*key) {
+                input.throttle_detent = i as u8 + 1;
+            }
+        }
+    }
+
+    let mut throttle = 0.0;
+    if flying {
+        throttle = throttle_for_detent(input.throttle_detent);
+    } else {
+        if held(KeyCode::KeyW, KeyCode::ArrowUp) {
+            throttle += 1.0;
+        }
+        if held(KeyCode::KeyS, KeyCode::ArrowDown) {
+            throttle -= 1.0;
+        }
     }
 
     // `step_vehicle` adds `steer * turn_rate * dt` to the yaw, and increasing
@@ -174,6 +251,7 @@ pub fn gather(
 
     input.throttle = throttle;
     input.steer = steer;
+    input.climb = climb;
 
     // Space and F are already the keyboard way to fire, which is what makes
     // taking the triggers off the mouse in the overview cost nothing: up there
@@ -240,6 +318,13 @@ pub fn gather(
         if slot != input.controlling {
             input.controlling = slot;
             state.set_predicted_slot(slot);
+            // A fresh aircraft arrives at the cruise. Carrying the last
+            // sortie's detent over would have the new one leave its corner at
+            // whatever the previous one died at, which is a setting the player
+            // cannot see and did not ask for.
+            if slot == VehicleSlot::Plane {
+                input.throttle_detent = CRUISE_DETENT;
+            }
         }
     }
 
@@ -311,6 +396,7 @@ pub fn send_input(
         controlling: input.controlling,
         throttle: input.throttle,
         steer: input.steer,
+        climb: input.climb,
         aim: input.aim,
         fire_primary: input.fire_primary,
         fire_secondary: input.fire_secondary,
@@ -362,5 +448,29 @@ mod tests {
             assert!(!paused.live, "the menu left the controls live");
             assert!(!paused.mouse_fires, "a click on a menu item was a trigger pull");
         }
+    }
+
+    /// The five detents cover the trim range, with the middle one at the cruise.
+    ///
+    /// Worth pinning because the mapping is the one place the quantised throttle
+    /// meets the continuous one the simulation flies on, and because the middle
+    /// detent landing anywhere but exactly zero would mean a sortie arriving
+    /// with the throttle very slightly open -- a bombsight off by a unit or two
+    /// with nothing on screen to explain it.
+    #[test]
+    fn the_throttle_detents_span_the_trim_and_settle_on_the_cruise() {
+        assert_eq!(throttle_for_detent(1), -1.0, "detent 1 is not the slow end");
+        assert_eq!(throttle_for_detent(CRUISE_DETENT), 0.0, "the middle detent is not the cruise");
+        assert_eq!(throttle_for_detent(5), 1.0, "detent 5 is not full throttle");
+
+        // Monotonic, and one key per detent.
+        let steps: Vec<f32> = (1..=5).map(throttle_for_detent).collect();
+        assert!(steps.windows(2).all(|w| w[1] > w[0]), "detents are not in order: {steps:?}");
+        assert_eq!(THROTTLE_KEYS.len(), steps.len());
+
+        // Out-of-range input is held at the ends rather than flying off: the
+        // detent is a `u8` that other code sets, and zero is the tempting bug.
+        assert_eq!(throttle_for_detent(0), -1.0);
+        assert_eq!(throttle_for_detent(200), 1.0);
     }
 }

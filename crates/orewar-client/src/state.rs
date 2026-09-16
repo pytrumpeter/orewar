@@ -53,6 +53,10 @@ pub struct RenderVehicle {
     /// Bank angle. Always zero on the ground; on the aircraft it is both what
     /// makes the turn and what the model is visibly rolled by.
     pub roll: f32,
+    /// Height above the ground. Zero on everything but the aircraft, where it
+    /// is what the model is lifted by, what the camera follows, and -- through
+    /// `sim::bomb_fall_time` -- how far ahead the bombsight sits.
+    pub alt: f32,
     /// Signed speed along `yaw`. Carried through for the bombsight, which is
     /// this times the fall time and is wrong the moment it uses anything else.
     pub speed: f32,
@@ -70,6 +74,7 @@ impl RenderVehicle {
             pos: v.pos,
             yaw: v.yaw,
             roll: 0.0,
+            alt: 0.0,
             speed: v.speed,
             turret_yaw: v.turret_yaw,
             shield: v.shield,
@@ -84,6 +89,7 @@ impl RenderVehicle {
         RenderVehicle {
             pos: a.pos.lerp(b.pos, t),
             roll: 0.0,
+            alt: 0.0,
             speed: a.speed + (b.speed - a.speed) * t,
             // Angles must take the short way around, or a vehicle crossing the
             // -pi/+pi boundary spins the long way for a frame.
@@ -196,6 +202,18 @@ struct Step {
     pos: SimVec2,
     yaw: f32,
     roll: f32,
+    alt: f32,
+}
+
+/// The two pieces of aircraft state that do not fit on a `VehicleSnapshot`.
+///
+/// Named rather than passed as a pair of bare floats: both are angles-or-heights
+/// of the same type going into the same call, and the one way to get this wrong
+/// -- swapping them -- is the kind of thing a compiler cannot see.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Air {
+    pub roll: f32,
+    pub alt: f32,
 }
 
 /// Local prediction of the vehicle this client is driving.
@@ -241,6 +259,14 @@ impl Prediction {
         math::angle_lerp(self.previous.roll, self.state.roll, alpha)
     }
 
+    /// Height to draw at, interpolated for exactly the reason the bank is.
+    ///
+    /// A plain lerp rather than `angle_lerp`: this is a distance, and taking the
+    /// short way round a circle would be meaningless.
+    pub fn render_alt(&self, alpha: f32) -> f32 {
+        self.previous.alt + (self.state.alt - self.previous.alt) * alpha
+    }
+
     /// Steps prediction forward with the input the client just sent.
     pub fn apply(&mut self, frame: InputFrame, powerups: u16, hills: &[Hill]) {
         if !self.active {
@@ -261,6 +287,7 @@ impl Prediction {
             &mut self.state,
             frame.throttle,
             frame.steer,
+            frame.climb,
             self.slot.kind(),
             powerups,
             hills,
@@ -281,7 +308,7 @@ impl Prediction {
         &mut self,
         authoritative: &VehicleSnapshot,
         slot: VehicleSlot,
-        roll: f32,
+        air: Air,
         acked: u32,
         powerups: u16,
         hills: &[Hill],
@@ -293,6 +320,7 @@ impl Prediction {
             pos: previous.pos - self.previous.pos,
             yaw: math::angle_delta(self.previous.yaw, previous.yaw),
             roll: previous.roll - self.previous.roll,
+            alt: previous.alt - self.previous.alt,
         };
         let was_active = self.active && self.slot == slot;
 
@@ -301,7 +329,8 @@ impl Prediction {
             pos: authoritative.pos,
             yaw: authoritative.yaw,
             speed: authoritative.speed,
-            roll,
+            roll: air.roll,
+            alt: air.alt,
         };
 
         while self.history.front().is_some_and(|f| f.tick <= acked) {
@@ -318,6 +347,7 @@ impl Prediction {
                 &mut self.state,
                 frame.throttle,
                 frame.steer,
+                frame.climb,
                 slot.kind(),
                 powerups,
                 hills,
@@ -345,6 +375,7 @@ impl Prediction {
                 yaw: math::wrap_angle(self.state.yaw - step.yaw),
                 speed: self.state.speed,
                 roll: self.state.roll - step.roll,
+                alt: self.state.alt - step.alt,
             },
         };
 
@@ -534,15 +565,18 @@ impl GameState {
                     VehicleSlot::Miner => me.miner.as_ref(),
                     VehicleSlot::Plane => as_plane.as_ref(),
                 };
-                // The bank is not on a `VehicleSnapshot` -- only an aircraft
-                // has one -- so it is handed over beside it rather than by
-                // widening a struct that four of ride in every packet.
-                let roll = me.plane.map_or(0.0, |q| q.roll);
+                // The bank and the height are not on a `VehicleSnapshot` --
+                // only an aircraft has either -- so they are handed over beside
+                // it rather than by widening a struct that four of ride in
+                // every packet.
+                let air = me
+                    .plane
+                    .map_or(Air::default(), |q| Air { roll: q.roll, alt: q.alt });
                 match vehicle {
                     Some(v) => self.prediction.reconcile(
                         v,
                         slot,
-                        roll,
+                        air,
                         snapshot.acked_input,
                         me.powerups,
                         &self.hills,
@@ -627,6 +661,9 @@ impl GameState {
                     let plane = match (pa.and_then(|p| p.plane), pb.plane) {
                         (Some(qa), Some(qb)) => Some(RenderVehicle {
                             roll: math::angle_lerp(qa.roll, qb.roll, t),
+                            // A height, so a plain lerp. Left out, an enemy
+                            // aircraft would be drawn on the ground.
+                            alt: qa.alt + (qb.alt - qa.alt) * t,
                             ..RenderVehicle::lerp(
                                 &plane_as_vehicle(&qa),
                                 &plane_as_vehicle(&qb),
@@ -635,6 +672,7 @@ impl GameState {
                         }),
                         (_, Some(qb)) => Some(RenderVehicle {
                             roll: qb.roll,
+                            alt: qb.alt,
                             ..RenderVehicle::from_snapshot(&plane_as_vehicle(&qb))
                         }),
                         _ => None,
@@ -727,6 +765,7 @@ impl GameState {
             let pos = self.prediction.render_pos(alpha);
             let yaw = self.prediction.render_yaw(alpha);
             let roll = self.prediction.render_roll(alpha);
+            let alt = self.prediction.render_alt(alpha);
             let speed = self.prediction.state.speed;
             if let Some(Some(player)) = players.get_mut(local as usize) {
                 let target = match slot {
@@ -739,8 +778,13 @@ impl GameState {
                     v.yaw = yaw;
                     if slot == VehicleSlot::Plane {
                         v.roll = roll;
-                        // The sight is drawn from this, so it has to be what
-                        // prediction is flying rather than the last snapshot.
+                        v.alt = alt;
+                        // The sight is drawn from these two, so they have to be
+                        // what prediction is flying rather than the last
+                        // snapshot: at the ceiling the bomb is thrown twice as
+                        // far as it is off the floor, and a sight lagging a
+                        // snapshot behind through a climb would visibly chase
+                        // the aircraft.
                         v.speed = speed;
                     }
                 }
@@ -890,6 +934,7 @@ mod tests {
                 &mut authority,
                 drive(tick).throttle,
                 drive(tick).steer,
+                0.0,
                 VehicleSlot::Tank.kind(),
                 0,
                 &hills,
@@ -910,7 +955,7 @@ mod tests {
                     ..Default::default()
                 },
                 VehicleSlot::Tank,
-                0.0,
+                Air::default(),
                 4,
                 0,
                 &hills,
@@ -957,6 +1002,7 @@ mod tests {
                 &mut authority,
                 1.0,
                 0.0,
+                0.0,
                 VehicleSlot::Tank.kind(),
                 0,
                 &hills,
@@ -971,7 +1017,7 @@ mod tests {
                 ..Default::default()
             },
             VehicleSlot::Tank,
-            0.0,
+            Air::default(),
             4,
             0,
             &hills,
@@ -1025,7 +1071,7 @@ mod tests {
         p.reconcile(
             &VehicleSnapshot { pos: SimVec2::new(200.0, 200.0), ..Default::default() },
             VehicleSlot::Tank,
-            0.0,
+            Air::default(),
             1,
             0,
             &[],
@@ -1050,5 +1096,63 @@ mod tests {
             &[],
         );
         assert!(!p.active, "prediction for the old vehicle must not keep running");
+    }
+
+    /// Prediction has to fly the yoke, not just the stick.
+    ///
+    /// This is the altitude version of the correction jitter, and it was real:
+    /// the forward step was handed a constant zero for the climb while the
+    /// replay inside `reconcile` was handed the frame's own. So locally the
+    /// aircraft never changed height, every snapshot snapped it to the altitude
+    /// the server had actually reached, and the replay put it back -- thirty
+    /// times a second, visible as jitter that appeared only while climbing or
+    /// diving and never in level flight.
+    ///
+    /// The yoke is the only control with this shape. Throttle and steering were
+    /// wired from the start, so nothing else in the suite would have noticed.
+    #[test]
+    fn prediction_climbs_with_the_yoke() {
+        let mut p = Prediction {
+            active: true,
+            slot: VehicleSlot::Plane,
+            state: MoveState {
+                pos: SimVec2::new(240.0, 240.0),
+                yaw: 0.0,
+                speed: sim::PLANE_CRUISE,
+                roll: 0.0,
+                alt: sim::PLANE_ALTITUDE,
+            },
+            ..Default::default()
+        };
+
+        let yoke = |climb: f32, tick: u32| InputFrame {
+            tick,
+            controlling: VehicleSlot::Plane,
+            climb,
+            ..Default::default()
+        };
+
+        for tick in 1..=10 {
+            p.apply(yoke(1.0, tick), 0, &[]);
+        }
+        let climbed = p.state.alt;
+        assert!(
+            climbed > sim::PLANE_ALTITUDE + 1.0,
+            "pulling back did not climb prediction: {climbed}"
+        );
+
+        for tick in 11..=30 {
+            p.apply(yoke(-1.0, tick), 0, &[]);
+        }
+        assert!(p.state.alt < climbed, "pushing did not descend prediction");
+
+        // And the pair the interpolation is drawn between has to differ while
+        // the height is changing, or the aircraft is drawn at one step's value
+        // for the whole of that step -- which is the jitter wearing a different
+        // hat.
+        assert_ne!(
+            p.previous.alt, p.state.alt,
+            "there is nothing to interpolate between during a dive"
+        );
     }
 }

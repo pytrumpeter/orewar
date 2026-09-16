@@ -40,15 +40,24 @@ pub struct CaptureBar;
 #[derive(Component)]
 pub struct ProjectileView;
 
-/// A bomb on its way down, and when this client first saw it.
+/// A bomb on its way down, and what this client knew when it first saw it.
 ///
 /// Height is the one thing about a bomb the wire cannot afford to carry, so it
-/// is reconstructed here from how long the bomb has been on screen against
-/// [`sim::BOMB_FALL_TIME`]. Where it will land is not guesswork -- that comes
-/// from the server like everything else -- only how far down it has got.
+/// is reconstructed here from how long the bomb has been on screen. Where it
+/// will land is not guesswork -- that comes from the server like everything
+/// else -- only how far down it has got.
+///
+/// The height it fell *from* is read off the aircraft that dropped it, on the
+/// frame the bomb appears. That still costs the wire nothing: every client
+/// already has every aircraft's altitude, and the aircraft is still there in
+/// the same snapshot the bomb arrives in. It has to be recorded rather than
+/// looked up each frame, because the aircraft can fly on, climb, or be shot
+/// down while the bomb is still falling.
 #[derive(Component)]
 pub struct FallingBomb {
     released: f32,
+    /// Altitude of the aircraft that released it.
+    from: f32,
 }
 
 /// The ring on the ground showing where a bomb released now would land.
@@ -265,10 +274,16 @@ pub fn setup_bombsight(mut commands: Commands, assets: Res<VehicleAssets>) {
 /// Puts the bombsight where a bomb released this instant would land.
 ///
 /// Not a hint and not an estimate: it calls [`sim::bomb_impact`], which is the
-/// same function the server's release goes through, on a speed that is a
-/// constant both sides agree on. Bombing without it is guesswork -- from
-/// [`sim::PLANE_ALTITUDE`] up, with the aircraft throwing each bomb some 47
-/// units forward, there is nothing on screen to judge the lead against.
+/// same function the server's release goes through, on the airspeed and the
+/// height the client is predicting. Bombing without it is guesswork -- the
+/// aircraft throws each bomb tens of units forward and nothing on screen says
+/// how far.
+///
+/// Both inputs move now. The throttle shifts the aim point some twenty-two
+/// units across its range, and the yoke moves it a great deal further: from the
+/// floor the ring sits almost under the aircraft, and from the ceiling it is out
+/// past twice that. Watching the ring slide out as you climb is the clearest
+/// picture in the game of what altitude costs you on a bombing run.
 pub fn sync_bombsight(
     state: Res<GameState>,
     input: Res<LocalInput>,
@@ -297,10 +312,10 @@ pub fn sync_bombsight(
     if material.0 != assets.sight[idx] {
         material.0 = assets.sight[idx].clone();
     }
-    // The aircraft's actual airspeed, not the cruise: the throttle moves the
-    // aim point by some twenty-two units across its range, which is most of the
-    // reason to touch it.
-    let at = sim::bomb_impact(plane.pos, plane.yaw, plane.speed);
+    // What prediction is flying, not what the last snapshot said: both the
+    // airspeed and the height are being predicted locally, and a sight a
+    // snapshot behind would chase the aircraft through every climb.
+    let at = sim::bomb_impact(plane.pos, plane.yaw, plane.speed, plane.alt);
     // Just clear of the ground so the ring does not fight the grass for depth.
     transform.translation = coords::sim_to_world_at(at, 0.12);
 }
@@ -601,7 +616,9 @@ pub fn sync_vehicles(
         let Some(v) = wanted.get(&(view.player, view.slot)) else { continue };
         transform.translation = coords::sim_to_world(v.pos);
         if view.slot == VehicleSlot::Plane {
-            transform.translation.y += sim::PLANE_ALTITUDE;
+            // Whatever the aircraft is actually flying at, which is now a thing
+            // the pilot moves rather than a constant.
+            transform.translation.y += v.alt;
         }
         transform.rotation = coords::yaw_to_quat(v.yaw);
         if view.slot == VehicleSlot::Plane {
@@ -706,7 +723,18 @@ pub fn sync_projectiles(
                 NotShadowCaster,
             ));
             if projectile.kind == ProjectileKind::Bomb {
-                view.insert(FallingBomb { released: now });
+                // The aircraft that let it go, if it is still on the field.
+                // Failing that -- a sortie that left or was shot down in the
+                // same tick -- the launch altitude is the best guess available
+                // and is wrong only about the first fraction of the fall.
+                let from = state
+                    .render
+                    .players
+                    .get(projectile.owner as usize)
+                    .and_then(|p| p.as_ref())
+                    .and_then(|p| p.plane.as_ref())
+                    .map_or(sim::PLANE_ALTITUDE, |q| q.alt);
+                view.insert(FallingBomb { released: now, from });
             }
             view.id()
         });
@@ -722,9 +750,10 @@ pub fn sync_projectiles(
                 // have been culled from a full projectile list and then come
                 // back inside it mid-fall, and it is over in a second either way.
                 ProjectileKind::Bomb => {
+                    let from = falling.map_or(sim::PLANE_ALTITUDE, |f| f.from);
                     let age = falling.map_or(0.0, |f| now - f.released);
-                    let fallen = (age / sim::BOMB_FALL_TIME).clamp(0.0, 1.0);
-                    0.6 + (sim::PLANE_ALTITUDE - 0.6) * (1.0 - fallen)
+                    let fallen = (age / sim::bomb_fall_time(from)).clamp(0.0, 1.0);
+                    0.6 + (from - 0.6) * (1.0 - fallen)
                 }
             };
             transform.translation = coords::sim_to_world_at(projectile.pos, height);
@@ -733,7 +762,8 @@ pub fn sync_projectiles(
                 // Nose-down as it goes, so a stick of them reads as falling
                 // rather than as a line of boxes sliding downward.
                 let age = falling.map_or(0.0, |f| now - f.released);
-                let tipped = (age / sim::BOMB_FALL_TIME).clamp(0.0, 1.0);
+                let from = falling.map_or(sim::PLANE_ALTITUDE, |f| f.from);
+                let tipped = (age / sim::bomb_fall_time(from)).clamp(0.0, 1.0);
                 transform.rotation *= Quat::from_rotation_z(-tipped * 1.1);
             }
         }

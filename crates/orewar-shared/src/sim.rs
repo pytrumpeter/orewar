@@ -169,6 +169,11 @@ pub struct MoveState {
     /// it is state the server owns and the client has to predict like any
     /// other. Ground vehicles leave it at zero.
     pub roll: f32,
+    /// Height above the ground. Like `roll`, only the aircraft moves it, and
+    /// like `roll` it is predicted state rather than decoration: it decides
+    /// what a cannon round can reach, how long a bomb falls, and where the
+    /// model is drawn. Ground vehicles leave it at zero.
+    pub alt: f32,
 }
 
 /// What a step ran into, for a caller that needs to do more than move.
@@ -198,6 +203,10 @@ pub fn step_vehicle(
     state: &mut MoveState,
     throttle: f32,
     steer: f32,
+    // Yoke: negative descends, positive climbs. The aircraft's only. Ground
+    // vehicles are handed whatever the caller has and ignore it, the same way
+    // they ignore `hills` having nothing in it.
+    climb: f32,
     kind: VehicleKind,
     powerups: u16,
     hills: &[Hill],
@@ -210,7 +219,7 @@ pub fn step_vehicle(
     let mult = speed_multiplier(powerups);
 
     if kind.flies() {
-        step_plane(state, throttle, steer, dt);
+        step_plane(state, throttle, steer, climb, dt);
         return outcome;
     }
 
@@ -308,19 +317,52 @@ pub fn step_vehicle(
 /// wide, correctable arc and the last few degrees of a hard one are where the
 /// turn really bites.
 ///
-/// Flying out of the field ends the sortie, and nothing stops you doing it.
-/// The edge used to bank the aircraft back inside, which kept every sortie over
-/// the field but meant the boundary quietly flew the aeroplane for you -- and
-/// near a corner base, which is one of the things worth crossing the map to
-/// bomb, it wrestled you off the run every time you lined one up. Leaving is
-/// now simply a way to lose the aircraft, which is a price the player can see
-/// coming and choose to pay.
-fn step_plane(state: &mut MoveState, throttle: f32, steer: f32, dt: f32) {
+/// **The edge banks it back.** This was taken out once, on the grounds that the
+/// boundary quietly flew the aeroplane for you, and leaving became a way to lose
+/// a sortie that the player could see coming and choose to pay. That reasoning
+/// held while a sortie was eighteen seconds and one bombing line. It does not
+/// hold now: the fuel runs sixty seconds and the aircraft is something you
+/// fight in, and the field is only about nineteen seconds corner to corner at
+/// cruise. Left to end sorties, the wall -- not the fuel -- would finish nearly
+/// every one of them, and a dogfight would be lost by drifting rather than by
+/// being outflown.
+///
+/// So the fuel clock is the only thing that ends a sortie now. The band is
+/// narrow for the original reason: a corner base is worth crossing the map to
+/// bomb, and a band wide enough to cover one would wrestle the aircraft off its
+/// run every time it lined up.
+fn step_plane(state: &mut MoveState, throttle: f32, steer: f32, climb: f32, dt: f32) {
     let t = tuning(VehicleKind::Plane);
     let target = PLANE_CRUISE + throttle.clamp(-1.0, 1.0) * PLANE_SPEED_TRIM;
     state.speed = approach(state.speed, target, t.accel * dt);
-    state.roll =
-        (state.roll + steer * PLANE_ROLL_RATE * dt).clamp(-PLANE_MAX_BANK, PLANE_MAX_BANK);
+
+    // The yoke. Unlike the stick it does not hold what it is given: let go and
+    // the aircraft stays at the height it reached rather than continuing to
+    // climb. Altitude is a position, and the bank is a rate.
+    state.alt = (state.alt + climb.clamp(-1.0, 1.0) * PLANE_CLIMB_RATE * dt)
+        .clamp(PLANE_MIN_ALT, PLANE_MAX_ALT);
+    // Inside the boundary band the edge takes the stick, rolling toward
+    // whichever full bank brings the nose back toward the middle of the field.
+    let lo = t.radius;
+    let hi = WORLD_SIZE - t.radius;
+    let p = state.pos;
+    let cornered = p.x < lo + PLANE_EDGE_BAND
+        || p.x > hi - PLANE_EDGE_BAND
+        || p.y < lo + PLANE_EDGE_BAND
+        || p.y > hi - PLANE_EDGE_BAND;
+    if cornered {
+        // Banked by how far off the way home the nose is: hard over while it is
+        // pointed at the wall, and rolling level again as it comes round. A
+        // flat "full bank until it is inside" does not work, because the bank
+        // is *held* -- the aircraft would leave the band still hard over, circle
+        // straight back into it, and orbit the corner for the rest of its fuel.
+        let off = angle_delta(state.yaw, (Vec2::splat(WORLD_SIZE * 0.5) - p).to_angle());
+        let target = (off * PLANE_EDGE_GAIN).clamp(-PLANE_MAX_BANK, PLANE_MAX_BANK);
+        state.roll = approach(state.roll, target, PLANE_EDGE_ROLL_RATE * dt);
+    } else {
+        state.roll =
+            (state.roll + steer * PLANE_ROLL_RATE * dt).clamp(-PLANE_MAX_BANK, PLANE_MAX_BANK);
+    }
 
     // Lift leans over with the wings, and its sideways part is the turn.
     // Normalised on the tangent at full bank so `PLANE_TURN_RATE` stays the
@@ -328,18 +370,12 @@ fn step_plane(state: &mut MoveState, throttle: f32, steer: f32, dt: f32) {
     let rate = t.turn_rate * state.roll.tan() / PLANE_MAX_BANK.tan();
     state.yaw = wrap_angle(state.yaw + rate * dt);
     state.pos += Vec2::from_angle(state.yaw) * (state.speed * dt);
-}
 
-/// Whether a sortie has flown out of the match.
-///
-/// Measured past the wall rather than at it, so the aircraft is seen to leave
-/// -- crossing the boundary and vanishing on the same frame reads as a bug
-/// rather than as a decision the player just made.
-pub fn plane_has_left(pos: Vec2) -> bool {
-    pos.x < -PLANE_EXIT_MARGIN
-        || pos.y < -PLANE_EXIT_MARGIN
-        || pos.x > WORLD_SIZE + PLANE_EXIT_MARGIN
-        || pos.y > WORLD_SIZE + PLANE_EXIT_MARGIN
+    // A backstop behind the band, which should never be the thing that acts:
+    // if it ever does, the turn-back was too weak or the band too narrow for
+    // the speed, and the aircraft would be sliding along the wall.
+    state.pos.x = state.pos.x.clamp(lo, hi);
+    state.pos.y = state.pos.y.clamp(lo, hi);
 }
 
 /// Where a bomb released now will land.
@@ -348,8 +384,27 @@ pub fn plane_has_left(pos: Vec2) -> bool {
 /// [`BOMB_FALL_TIME`], so the impact point is pure geometry. Both the server
 /// and the bombsight on the client call this, which is what makes the sight
 /// honest rather than an approximation of it.
-pub fn bomb_impact(pos: Vec2, yaw: f32, speed: f32) -> Vec2 {
-    pos + Vec2::from_angle(yaw) * (speed * BOMB_FALL_TIME)
+pub fn bomb_impact(pos: Vec2, yaw: f32, speed: f32, alt: f32) -> Vec2 {
+    pos + Vec2::from_angle(yaw) * (speed * bomb_fall_time(alt))
+}
+
+/// How long a bomb released at `alt` takes to reach the ground.
+///
+/// [`BOMB_FALL_TIME`] used to be the whole answer, because there was only one
+/// altitude to fall from. Now that the yoke moves it, the fall has to come off
+/// the height -- and the square root is not decoration, it is the shape of
+/// falling: twice as high is not twice as long, it is about one and a half
+/// times. Written so that at [`PLANE_ALTITUDE`] it returns exactly
+/// [`BOMB_FALL_TIME`], which keeps every number that constant was tuned against
+/// true at the altitude it was tuned at.
+///
+/// What it costs the player is the point. High up, a bomb is thrown much further
+/// ahead and spends longer going there, so the run has to be set up from further
+/// out and anything that moves has longer to leave. Down on the floor the sight
+/// is nearly under the aircraft and the bomb lands almost at once -- which is
+/// the trade for being where the cannons and the hills are.
+pub fn bomb_fall_time(alt: f32) -> f32 {
+    BOMB_FALL_TIME * (alt.max(0.0) / PLANE_ALTITUDE).sqrt()
 }
 
 /// Damage a blast does at `distance` from where it went off.
@@ -410,13 +465,52 @@ pub const MISSILE_SEEK_RANGE: f32 = 120.0;
 // The bomber
 // ---------------------------------------------------------------------------
 
-/// How high the bomber flies, in world units.
+/// How high a sortie arrives, in world units.
 ///
-/// High enough to be plainly out of the fight rather than a very fast tank:
-/// nothing on the ground reaches it, and it reaches the ground only by letting
-/// something fall. It is also what the bombs fall through, so it and
-/// [`BOMB_FALL_TIME`] have to move together.
+/// Was the altitude the aircraft flew at, full stop; now that the yoke moves it
+/// this is only where it comes in -- low in the band, so the first thing the
+/// climb is good for is getting above somebody who arrived after you.
+///
+/// It remains the altitude [`BOMB_FALL_TIME`] is quoted at. The fall is no
+/// longer a constant, because the height it falls through is not: see
+/// [`bomb_fall_time`].
 pub const PLANE_ALTITUDE: f32 = 26.0;
+
+/// The floor. Below this the aircraft would be flying through the scenery.
+///
+/// The tallest thing on the field is a hill, and the biggest hill is eleven
+/// units of radius standing a little over half that high -- about 6.3 units at
+/// the worst roll of the dice. Ten clears it with room left over, which is what the
+/// floor is for: hitting it should read as the aircraft refusing to go lower,
+/// never as clipping a summit that happened to be tall.
+pub const PLANE_MIN_ALT: f32 = 10.0;
+
+/// The ceiling, ten times the floor.
+///
+/// Ten is the ratio rather than a height picked for feel, so the band is
+/// obviously a band: the whole of it is ninety units, which at
+/// [`PLANE_CLIMB_RATE`] is a little over six seconds bottom to top. Long enough
+/// that altitude is a commitment you spend fuel on, short enough that it is a
+/// move in a fight rather than a journey.
+pub const PLANE_MAX_ALT: f32 = PLANE_MIN_ALT * 10.0;
+
+/// How fast the yoke moves the aircraft up or down, in units per second.
+///
+/// The same rate both ways. A real aeroplane dives faster than it climbs, and
+/// modelling that would make the high ground strictly better than it already
+/// is -- whoever is above can choose the moment to come down, and should not
+/// also get there quicker than his opponent can follow.
+pub const PLANE_CLIMB_RATE: f32 = 14.0;
+
+/// How far apart two aircraft can be vertically and still reach each other.
+///
+/// This is what makes the yoke a weapon rather than a view: cannon rounds fly
+/// level at the height they were fired from, so climbing out of somebody's
+/// plane is how you break off, and getting back to his height is the price of
+/// shooting at him. Generous enough -- most of the aircraft's own length --
+/// that a near miss in altitude still connects, because a dogfight decided by
+/// a unit and a half of height would be decided by luck.
+pub const PLANE_HIT_HEIGHT: f32 = 7.0;
 
 /// Airspeed with the stick centred. Getting on twice a tank's top speed, so
 /// crossing ground a tank has to fight across is most of what the aircraft is
@@ -446,18 +540,40 @@ pub const PLANE_ROLL_RATE: f32 = 1.9;
 /// How far over it will go, in radians. Sixty degrees.
 pub const PLANE_MAX_BANK: f32 = 1.047;
 
-/// How far past the wall a sortie flies before it is gone for good.
+/// How fast the field edge rolls it away, in radians per second.
 ///
-/// Comfortably more than the aircraft is long, so it leaves the field rather
-/// than blinking out on the boundary.
-pub const PLANE_EXIT_MARGIN: f32 = 14.0;
+/// Faster than the pilot's own stick, so the boundary is firm, and fast enough
+/// to reach a full bank while crossing [`PLANE_EDGE_BAND`] at cruise.
+pub const PLANE_EDGE_ROLL_RATE: f32 = 4.0;
+
+/// Bank the field edge asks for per radian the nose is off the way home.
+///
+/// Above one, so anything more than a modest angle away from the middle of the
+/// field asks for everything the wings have, and the last of the bank comes off
+/// only as the aircraft is very nearly pointed home.
+pub const PLANE_EDGE_GAIN: f32 = 1.6;
+
+/// How far in from the wall the aircraft starts being banked back.
+///
+/// Deliberately narrow. A corner base is one of the things worth flying all that
+/// way to bomb, and a band wide enough to cover one would wrestle the aircraft
+/// off its run every time it lined up. A bomb is released a long way short of
+/// where it lands, so a base can still be hit from well outside this.
+pub const PLANE_EDGE_BAND: f32 = 14.0;
 
 /// Seconds of fuel in one sortie.
 ///
-/// At [`PLANE_CRUISE`] this is about 610 units of flying, against a field 480
-/// across and 679 corner to corner: enough to reach anywhere from your own
-/// corner and bomb it, and not enough to loiter once you are there.
-pub const PLANE_FUEL: f32 = 18.0;
+/// Eighteen bought exactly one bombing run: about 610 units of flying against a
+/// field 480 across, which reached anywhere from your own corner and left
+/// nothing over. That is too short to fight in. A dogfight is two aircraft
+/// spending altitude and turns on each other, and at eighteen seconds the fuel
+/// clock decided it before either pilot did.
+///
+/// Sixty is about 2000 units of flying -- three crossings of the field, or one
+/// crossing and a genuine fight at the far end. The sortie is still an event
+/// rather than a state: [`SORTIE_COOLDOWN`] is unchanged, so the aircraft is
+/// available for a minute out of every minute and three quarters at best.
+pub const PLANE_FUEL: f32 = 60.0;
 
 /// Seconds between one sortie ending and the next being available.
 ///
@@ -786,9 +902,9 @@ mod tests {
 
     #[test]
     fn a_vehicle_drives_along_its_heading() {
-        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         for _ in 0..60 {
-            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
         }
         // Facing +X at yaw 0, so it must have moved in +X and nowhere else.
         assert!(s.pos.x > 110.0, "expected forward motion, got {:?}", s.pos);
@@ -806,6 +922,7 @@ mod tests {
                     &mut s,
                     1.0,
                     0.0,
+                    0.0,
                     VehicleKind::Tank,
                     powerups,
                     &[],
@@ -821,9 +938,9 @@ mod tests {
 
     #[test]
     fn vehicles_cannot_leave_the_field() {
-        let mut s = MoveState { pos: vec2(10.0, 10.0), yaw: std::f32::consts::PI, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(10.0, 10.0), yaw: std::f32::consts::PI, speed: 0.0, roll: 0.0, alt: 0.0 };
         for _ in 0..600 {
-            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
         }
         let r = tuning(VehicleKind::Tank).radius;
         assert!(s.pos.x >= r - 1e-3 && s.pos.x <= WORLD_SIZE - r + 1e-3, "{:?}", s.pos);
@@ -834,9 +951,9 @@ mod tests {
     #[test]
     fn a_vehicle_cannot_drive_onto_a_hill() {
         let hill = Hill { pos: vec2(140.0, 100.0), radius: 9.0 };
-        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         for _ in 0..300 {
-            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
         }
         let clear = hill.radius + tuning(VehicleKind::Tank).radius;
         assert!(
@@ -856,9 +973,9 @@ mod tests {
         let hill = Hill { pos: vec2(130.0, 100.0), radius: 9.0 };
         let clear = hill.radius + tuning(VehicleKind::Tank).radius;
         // Offset enough that the hull catches the shoulder rather than the face.
-        let mut s = MoveState { pos: vec2(100.0, 110.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 110.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         for _ in 0..150 {
-            let _ = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            let _ = step_vehicle(&mut s, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
         }
         assert!(s.pos.distance(hill.pos) >= clear - 1e-3, "ended inside the hill: {:?}", s.pos);
         assert!(s.pos.x > hill.pos.x + hill.radius, "should have got past, at {:?}", s.pos);
@@ -876,8 +993,8 @@ mod tests {
     #[test]
     fn a_vehicle_inside_a_hill_is_pushed_clear() {
         let hill = Hill { pos: vec2(100.0, 100.0), radius: 9.0 };
-        let mut s = MoveState { pos: hill.pos, yaw: 0.7, speed: 0.0, roll: 0.0 };
-        let _ = step_vehicle(&mut s, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+        let mut s = MoveState { pos: hill.pos, yaw: 0.7, speed: 0.0, roll: 0.0, alt: 0.0 };
+        let _ = step_vehicle(&mut s, 0.0, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
         let clear = hill.radius + tuning(VehicleKind::Tank).radius;
         assert!((s.pos.distance(hill.pos) - clear).abs() < 1e-3, "{:?}", s.pos);
     }
@@ -903,9 +1020,9 @@ mod tests {
     fn hills_are_nothing_to_an_aircraft() {
         let hill = Hill { pos: vec2(160.0, 100.0), radius: 12.0 };
         let fly = |hills: &[Hill]| {
-            let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
+            let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0, alt: PLANE_ALTITUDE };
             for _ in 0..90 {
-                let _ = step_vehicle(&mut s, 0.0, 0.0, VehicleKind::Plane, 0, hills, world::TICK_DT);
+                let _ = step_vehicle(&mut s, 0.0, 0.0, 0.0, VehicleKind::Plane, 0, hills, world::TICK_DT);
             }
             s.pos
         };
@@ -913,9 +1030,9 @@ mod tests {
         assert!(fly(&[hill]).x > 180.0, "it should have flown clean over and past");
 
         // The same run on the ground is stopped by it.
-        let mut tank = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut tank = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         for _ in 0..90 {
-            let _ = step_vehicle(&mut tank, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            let _ = step_vehicle(&mut tank, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
         }
         assert!(tank.pos.x < 150.0, "the tank should be stopped at the hill: {:?}", tank.pos);
     }
@@ -930,10 +1047,10 @@ mod tests {
     fn the_throttle_trims_the_airspeed_but_never_stops_it() {
         let settle = |throttle: f32| {
             let mut s =
-                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
+                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0, alt: PLANE_ALTITUDE };
             for _ in 0..120 {
                 let _ =
-                    step_vehicle(&mut s, throttle, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
+                    step_vehicle(&mut s, throttle, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
             }
             s.speed
         };
@@ -953,6 +1070,108 @@ mod tests {
         assert!(slow > fastest_tank, "held back it does {slow}, under a tank's {fastest_tank}");
     }
 
+    /// Pushing goes down and pulling goes up.
+    ///
+    /// Worth a test of its own rather than trusting the sign, because the sign
+    /// is exactly what went wrong when the bank went in: it was mirrored, and
+    /// nothing in the suite noticed because a mirrored turn is still a turn. A
+    /// mirrored yoke is likewise still a climb. The convention being pinned
+    /// here is a control yoke -- push the column away to go down, pull it back
+    /// to come up -- which is why `W` descends and `S` climbs and not the other
+    /// way round.
+    #[test]
+    fn the_yoke_pushes_down_and_pulls_up() {
+        let fly = |climb: f32| {
+            let mut s = MoveState {
+                pos: vec2(240.0, 240.0),
+                yaw: 0.0,
+                speed: PLANE_CRUISE,
+                roll: 0.0,
+                alt: PLANE_ALTITUDE,
+            };
+            for _ in 0..10 {
+                let _ =
+                    step_vehicle(&mut s, 0.0, 0.0, climb, VehicleKind::Plane, 0, &[], world::TICK_DT);
+            }
+            s.alt
+        };
+
+        assert!(fly(-1.0) < PLANE_ALTITUDE, "pushing the yoke climbed to {}", fly(-1.0));
+        assert!(fly(1.0) > PLANE_ALTITUDE, "pulling the yoke descended to {}", fly(1.0));
+        assert_eq!(fly(0.0), PLANE_ALTITUDE, "hands off did not hold the height");
+    }
+
+    /// The band has a floor and a ceiling and the aircraft stays inside them.
+    ///
+    /// The floor is the one that matters: below it the aircraft would be flying
+    /// through hills, and a hill is not in the collision pass at altitude, so
+    /// there is nothing under here to stop it except this clamp.
+    #[test]
+    fn the_aircraft_cannot_leave_the_altitude_band() {
+        let held = |climb: f32| {
+            let mut s = MoveState {
+                pos: vec2(240.0, 240.0),
+                yaw: 0.0,
+                speed: PLANE_CRUISE,
+                roll: 0.0,
+                alt: PLANE_ALTITUDE,
+            };
+            // Far longer than the band takes to cross, so this settles against
+            // the clamp rather than merely approaching it.
+            for _ in 0..600 {
+                let _ =
+                    step_vehicle(&mut s, 0.0, 0.0, climb, VehicleKind::Plane, 0, &[], world::TICK_DT);
+            }
+            s.alt
+        };
+
+        assert_eq!(held(-1.0), PLANE_MIN_ALT, "the floor did not hold");
+        assert_eq!(held(1.0), PLANE_MAX_ALT, "the ceiling did not hold");
+        // The floor clears the tallest hill the generator can produce, which is
+        // what makes it a floor rather than a collision waiting to happen.
+        assert!(PLANE_MIN_ALT > 7.0, "the floor is inside the scenery");
+        assert_eq!(PLANE_MAX_ALT, PLANE_MIN_ALT * 10.0, "the band is not the stated ratio");
+    }
+
+    /// Height decides the fall, and at the height it was tuned at nothing moved.
+    ///
+    /// `BOMB_FALL_TIME` was a constant for as long as there was one altitude to
+    /// fall from. Every number quoted against it -- the 47-unit throw, the
+    /// bombsight, the blast spacing across the throttle range -- was tuned at
+    /// `PLANE_ALTITUDE`, so the derived version has to agree with the constant
+    /// exactly there or all of that quietly drifts.
+    #[test]
+    fn the_fall_comes_off_the_height_and_agrees_at_the_old_one() {
+        assert_eq!(bomb_fall_time(PLANE_ALTITUDE), BOMB_FALL_TIME);
+
+        let low = bomb_fall_time(PLANE_MIN_ALT);
+        let high = bomb_fall_time(PLANE_MAX_ALT);
+        assert!(low < BOMB_FALL_TIME, "the floor did not shorten the fall: {low}");
+        assert!(high > BOMB_FALL_TIME, "the ceiling did not lengthen it: {high}");
+
+        // Falling, not lerping: four times the height is twice the time. This is
+        // what stops the ceiling being a free bombsight extension -- the throw
+        // grows, but far more slowly than the climb costs in reaching it.
+        let quad = bomb_fall_time(PLANE_ALTITUDE * 4.0);
+        assert!(
+            (quad - BOMB_FALL_TIME * 2.0).abs() < 1e-4,
+            "four times as high fell for {quad}, not {}",
+            BOMB_FALL_TIME * 2.0
+        );
+
+        // And the sight moves with it: high up a bomb is thrown much further
+        // ahead, which is the whole cost of bombing from the ceiling.
+        let throw = |alt: f32| {
+            bomb_impact(vec2(100.0, 100.0), 0.0, PLANE_CRUISE, alt).distance(vec2(100.0, 100.0))
+        };
+        assert!(
+            throw(PLANE_MAX_ALT) > throw(PLANE_MIN_ALT) * 2.0,
+            "the ceiling threw {} against the floor's {}",
+            throw(PLANE_MAX_ALT),
+            throw(PLANE_MIN_ALT)
+        );
+    }
+
     /// Changing speed changes where the bombs go, and the sight knows it.
     ///
     /// The throw ahead is the airspeed times the fall, so a slower run puts the
@@ -963,12 +1182,12 @@ mod tests {
     fn a_slower_run_drops_its_bombs_shorter() {
         let throw = |throttle: f32| {
             let mut s =
-                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
+                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0, alt: PLANE_ALTITUDE };
             for _ in 0..120 {
                 let _ =
-                    step_vehicle(&mut s, throttle, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
+                    step_vehicle(&mut s, throttle, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
             }
-            bomb_impact(s.pos, s.yaw, s.speed).distance(s.pos)
+            bomb_impact(s.pos, s.yaw, s.speed, s.alt).distance(s.pos)
         };
         let slow = throw(-1.0);
         let fast = throw(1.0);
@@ -986,12 +1205,12 @@ mod tests {
     fn the_stick_banks_the_aircraft_and_the_bank_turns_it() {
         let fly = |steer: f32, ticks: usize, s: &mut MoveState| {
             for _ in 0..ticks {
-                let _ = step_vehicle(s, 0.0, steer, VehicleKind::Plane, 0, &[], world::TICK_DT);
+                let _ = step_vehicle(s, 0.0, steer, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
             }
         };
 
         // Wings level, stick central: it flies straight.
-        let mut s = MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0, alt: PLANE_ALTITUDE };
         fly(0.0, 30, &mut s);
         assert_eq!(s.roll, 0.0, "the wings dropped on their own");
         assert!(s.yaw.abs() < 1e-4, "it turned without being banked: {}", s.yaw);
@@ -1047,9 +1266,9 @@ mod tests {
     fn a_harder_bank_is_a_tighter_turn() {
         let turn_from = |roll: f32| {
             let mut s =
-                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll };
+                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll, alt: PLANE_ALTITUDE };
             for _ in 0..30 {
-                let _ = step_vehicle(&mut s, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
+                let _ = step_vehicle(&mut s, 0.0, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
             }
             s.yaw
         };
@@ -1066,53 +1285,77 @@ mod tests {
         assert!(half < full * 0.45, "half bank did {half} against a full {full}");
     }
 
-    /// Nothing holds the aircraft inside the field, and leaving is leaving.
+    /// The edge brings it home rather than ending the sortie.
     ///
-    /// The boundary used to bank it back in, which kept every sortie over the
-    /// field at the cost of the boundary flying the aeroplane -- and it fought
-    /// the player hardest exactly where a corner base makes it worth being.
-    /// Flying out is now a thing you can do and a way to lose the aircraft, so
-    /// the wall has to let it through and `plane_has_left` has to say when it
-    /// has gone far enough to count.
+    /// This rule has been both ways round. It banked the aircraft back, then
+    /// the turn-back came out so that flying off the map was a mistake a pilot
+    /// could choose to make, and now it is back -- because the fuel went to
+    /// sixty seconds and the field is about nineteen across at cruise. Left to
+    /// end sorties, the wall would finish nearly every one of them before the
+    /// fuel did, and a dogfight would be decided by drifting rather than by
+    /// flying.
+    ///
+    /// So: held straight at the wall with no stick at all, the aircraft must
+    /// still be over the field a long time later, and must have got there by
+    /// banking rather than by being teleported off the clamp behind the band.
     #[test]
-    fn an_aircraft_can_be_flown_out_of_the_match() {
-        let mut s =
-            MoveState { pos: vec2(WORLD_SIZE - 20.0, 100.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
-        assert!(!plane_has_left(s.pos), "it started outside the field");
+    fn the_edge_banks_a_sortie_back_over_the_field() {
+        let mut s = MoveState {
+            pos: vec2(WORLD_SIZE - 20.0, 100.0),
+            yaw: 0.0,
+            speed: PLANE_CRUISE,
+            roll: 0.0,
+            alt: PLANE_ALTITUDE,
+        };
 
-        // Held straight at the wall, wings level, with no stick input at all.
-        let mut crossed_the_wall = None;
-        let mut gone = None;
-        for tick in 0..120 {
-            let _ = step_vehicle(&mut s, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
-            if crossed_the_wall.is_none() && s.pos.x > WORLD_SIZE {
-                crossed_the_wall = Some(tick);
+        let mut banked = false;
+        // Three hundred ticks is ten seconds, far longer than flying out would
+        // have taken from twenty units short of the wall.
+        for _ in 0..300 {
+            let _ = step_vehicle(&mut s, 0.0, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
+            if s.roll.abs() > 0.1 {
+                banked = true;
             }
-            if gone.is_none() && plane_has_left(s.pos) {
-                gone = Some(tick);
+            let t = tuning(VehicleKind::Plane);
+            assert!(
+                s.pos.x <= WORLD_SIZE - t.radius + 1e-3 && s.pos.x >= t.radius - 1e-3,
+                "it left the field at {:?}",
+                s.pos
+            );
+        }
+        assert!(banked, "the edge never took the stick");
+
+        // And it is genuinely back over the middle rather than grinding along
+        // the wall, which is what the clamp alone would produce.
+        let mut came_home = false;
+        for _ in 0..600 {
+            let _ = step_vehicle(&mut s, 0.0, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
+            if s.pos.x < WORLD_SIZE - PLANE_EDGE_BAND * 3.0 {
+                came_home = true;
+                break;
             }
         }
-        let crossed = crossed_the_wall.expect("it never reached the wall");
-        let gone = gone.expect("it never counted as having left");
-        assert!(
-            gone > crossed,
-            "the aircraft has to be seen to leave, not blink out on the boundary"
-        );
-        assert_eq!(s.roll, 0.0, "the boundary is not allowed to fly it any more");
+        assert!(came_home, "it never got clear of the wall, ending at {:?}", s.pos);
     }
 
-    /// Being near the edge is not being over it.
+    /// A sortie over its own corner is not being turned back off its run.
+    ///
+    /// The band is narrow on purpose: a corner base is one of the things worth
+    /// crossing the map to bomb, and a band wide enough to cover one would
+    /// wrestle the aircraft off the run every time it lined one up.
     #[test]
-    fn a_sortie_over_its_own_corner_has_not_left() {
-        // A base pad sits `BASE_INSET` in from two walls, and bombing one is
-        // among the things worth crossing the map for, so flying over one must
-        // not end the sortie.
+    fn the_band_is_narrower_than_a_corner_base() {
         for player in 0..world::MAX_PLAYERS as u8 {
             let base = world::base_position(player);
-            assert!(!plane_has_left(base), "a base pad counts as off the field");
+            let t = tuning(VehicleKind::Plane);
+            let lo = t.radius;
+            let hi = WORLD_SIZE - t.radius;
+            let inside = base.x > lo + PLANE_EDGE_BAND
+                && base.x < hi - PLANE_EDGE_BAND
+                && base.y > lo + PLANE_EDGE_BAND
+                && base.y < hi - PLANE_EDGE_BAND;
+            assert!(inside, "player {player}'s base sits inside the turn-back band");
         }
-        assert!(!plane_has_left(vec2(0.0, 0.0)), "the corner itself counts as off the field");
-        assert!(!plane_has_left(vec2(WORLD_SIZE, WORLD_SIZE)));
     }
 
     /// The bombsight has to be exactly where the bomb lands.
@@ -1123,11 +1366,11 @@ mod tests {
     /// bomb is what checks that, rather than restating the formula.
     #[test]
     fn a_bomb_lands_where_the_sight_says_it_will() {
-        let mut plane = MoveState { pos: vec2(120.0, 200.0), yaw: 0.7, speed: PLANE_CRUISE, roll: 0.0 };
+        let mut plane = MoveState { pos: vec2(120.0, 200.0), yaw: 0.7, speed: PLANE_CRUISE, roll: 0.0, alt: PLANE_ALTITUDE };
         for _ in 0..30 {
-            let _ = step_vehicle(&mut plane, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
+            let _ = step_vehicle(&mut plane, 0.0, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
         }
-        let aimed = bomb_impact(plane.pos, plane.yaw, plane.speed);
+        let aimed = bomb_impact(plane.pos, plane.yaw, plane.speed, plane.alt);
 
         // The bomb keeps the velocity it was released with and falls.
         let mut bomb = plane.pos;
@@ -1227,19 +1470,19 @@ mod tests {
         let hill = Hill { pos: vec2(140.0, 100.0), radius: 9.0 };
 
         // Open ground reports nothing at all.
-        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         let mut worst: f32 = 0.0;
         for _ in 0..60 {
-            let out = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
+            let out = step_vehicle(&mut s, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[], world::TICK_DT);
             worst = worst.max(out.terrain_impact);
         }
         assert_eq!(worst, 0.0, "nothing was hit");
 
         // Straight into the face at speed: the impact is most of the top speed.
-        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         let mut worst: f32 = 0.0;
         for _ in 0..90 {
-            let out = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            let out = step_vehicle(&mut s, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
             worst = worst.max(out.terrain_impact);
         }
         assert!(
@@ -1248,10 +1491,10 @@ mod tests {
         );
 
         // Clipping a shoulder is not a crash.
-        let mut s = MoveState { pos: vec2(100.0, 110.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 110.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         let mut worst: f32 = 0.0;
         for _ in 0..150 {
-            let out = step_vehicle(&mut s, 1.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
+            let out = step_vehicle(&mut s, 1.0, 0.0, 0.0, VehicleKind::Tank, 0, &[hill], world::TICK_DT);
             worst = worst.max(out.terrain_impact);
         }
         assert!(worst < IMPACT_THRESHOLD, "a graze reported {worst} and would have cost hull");
@@ -1268,11 +1511,11 @@ mod tests {
         let turbo = crate::world::PowerUp::Turbo.bit();
 
         // Facing away from the hill and reversing straight into it.
-        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         let mut worst: f32 = 0.0;
         for _ in 0..90 {
             let out =
-                step_vehicle(&mut s, -1.0, 0.0, VehicleKind::Tank, turbo, &[hill], world::TICK_DT);
+                step_vehicle(&mut s, -1.0, 0.0, 0.0, VehicleKind::Tank, turbo, &[hill], world::TICK_DT);
             worst = worst.max(out.terrain_impact);
         }
         assert!(
@@ -1299,7 +1542,7 @@ mod tests {
     #[test]
     fn the_autopilot_rounds_a_hill_on_the_way_to_its_target() {
         let hill = Hill { pos: vec2(130.0, 100.0), radius: 10.0 };
-        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let mut s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         let target = vec2(180.0, 100.0);
 
         // Straight through the middle, so the direct bearing is useless.
@@ -1313,6 +1556,7 @@ mod tests {
                 &mut s,
                 throttle,
                 steer,
+                0.0,
                 VehicleKind::Miner,
                 0,
                 &[hill],
@@ -1331,7 +1575,7 @@ mod tests {
 
     #[test]
     fn the_autopilot_stops_when_it_arrives() {
-        let s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+        let s = MoveState { pos: vec2(100.0, 100.0), yaw: 0.0, speed: 0.0, roll: 0.0, alt: 0.0 };
         let (throttle, steer) = autopilot(&s, vec2(103.0, 100.0), 6.0, &[]);
         assert_eq!((throttle, steer), (0.0, 0.0), "inside the stop radius it coasts");
     }
@@ -1364,7 +1608,7 @@ mod tests {
     #[test]
     fn stepping_is_deterministic() {
         let run = || {
-            let mut s = MoveState { pos: vec2(40.0, 60.0), yaw: 0.3, speed: 2.0, roll: 0.0 };
+            let mut s = MoveState { pos: vec2(40.0, 60.0), yaw: 0.3, speed: 2.0, roll: 0.0, alt: 0.0 };
             for i in 0..500 {
                 let throttle = if i % 7 == 0 { -1.0 } else { 1.0 };
                 let steer = ((i % 13) as f32 - 6.0) / 6.0;
@@ -1372,6 +1616,7 @@ mod tests {
                     &mut s,
                     throttle,
                     steer,
+                    0.0,
                     VehicleKind::Miner,
                     0,
                     &[],

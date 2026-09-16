@@ -336,7 +336,15 @@ pub fn update_texts(
                             } else {
                                 format!("{:.0}s of fuel", plane.cargo * sim::PLANE_FUEL)
                             };
-                            format!("\nsortie: {fuel}   {:.0} kts", plane.speed)
+                            // Altitude for the same reason, and more so: the
+                            // yoke is the one control whose effect the pilot
+                            // cannot see from the cockpit. Looking along your
+                            // own nose, ten units up and a hundred are the same
+                            // picture until the ground comes back into it.
+                            format!(
+                                "\nsortie: {fuel}   {:.0} kts   {:.0} alt",
+                                plane.speed, plane.alt
+                            )
                         } else if p.plane_ready_in > 0 {
                             format!("\nsortie: ready in {}s", p.plane_ready_in)
                         } else {
@@ -347,7 +355,7 @@ pub fn update_texts(
                 };
                 let cheat_line = if cheats { "\nCHEATS ON  [Alt-C]" } else { "" };
                 let weapons = if input.controlling == VehicleSlot::Plane {
-                    "WASD fly | LMB drop bombs"
+                    "AD bank | WS yoke | 1-5 throttle | LMB drop bombs"
                 } else {
                     "WASD drive | mouse aim | LMB gun | RMB missile"
                 };

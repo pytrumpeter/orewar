@@ -14,8 +14,6 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::view::NoIndirectDrawing;
 use orewar_shared::math::Vec2 as SimVec2;
-use orewar_shared::protocol::VehicleSlot;
-use orewar_shared::sim;
 use orewar_shared::world::WORLD_SIZE;
 
 use crate::coords;
@@ -261,7 +259,7 @@ pub fn follow(
         } else {
             input.controlling.next_available(|s| player.vehicle(s).is_some())
         };
-        player.vehicle(slot).map(|v| (v.pos, v.yaw, slot))
+        player.vehicle(slot).map(|v| (v.pos, v.yaw, v.alt))
     });
 
     let (desired_position, desired_aim) = match subject.filter(|_| !overview.active) {
@@ -274,13 +272,16 @@ pub fn follow(
                 look,
             )
         }
-        Some((pos, yaw, slot)) => {
+        Some((pos, yaw, alt)) => {
             // An aircraft is followed at its own altitude, so the camera rides
             // with it rather than watching it from the grass. It is otherwise
             // the same chase: the trail and the look-ahead are what make a
             // vehicle feel driven, and that does not change with height.
-            let lift = if slot == VehicleSlot::Plane { sim::PLANE_ALTITUDE } else { 0.0 };
-            let center = coords::sim_to_world(pos) + Vec3::Y * lift;
+            //
+            // Taken from the vehicle rather than from a constant, so the camera
+            // climbs and dives with the aircraft. Ground vehicles report zero,
+            // which is what the constant used to be for them.
+            let center = coords::sim_to_world(pos) + Vec3::Y * alt;
             let heading = coords::yaw_to_quat(yaw) * Vec3::X;
             (
                 center - heading * TRAIL + Vec3::Y * HEIGHT,

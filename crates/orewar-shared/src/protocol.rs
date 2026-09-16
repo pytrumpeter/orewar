@@ -14,18 +14,18 @@
 
 use crate::bytes::{Decode, DecodeError, Encode, Reader, Result, Writer};
 use crate::math::Vec2;
-use crate::sim::VehicleKind;
+use crate::sim::{self, VehicleKind};
 use crate::world::{MAX_PLAYERS, PowerUp, WORLD_SIZE};
 
 /// Bumped whenever the wire format changes, so mismatched builds fail the
 /// handshake instead of misparsing each other.
 ///
-/// Last bumped for the bomber's throttle, which made its airspeed something
-/// that varies and so something the snapshot has to carry.
+/// Last bumped for the bomber's altitude, which the yoke made something that
+/// varies: it joins the snapshot, and a yoke axis joins the input frame.
 /// Without a bump an older peer would complete the handshake and then hit an
 /// unknown tag on the reliable stream, which is a decode error rather than a
 /// recoverable one.
-pub const PROTOCOL_ID: u32 = 0x4F52_570A;
+pub const PROTOCOL_ID: u32 = 0x4F52_570B;
 
 /// Quantization ceiling for shield and hull values.
 const STAT_SCALE: f32 = 512.0;
@@ -136,6 +136,10 @@ pub struct InputFrame {
     pub throttle: f32,
     /// Left/right, `-1..=1`.
     pub steer: f32,
+    /// Yoke, `-1..=1`. Negative descends and positive climbs, which is a yoke
+    /// pushed and pulled rather than a screen scrolled. The aircraft's only;
+    /// everything else sends zero.
+    pub climb: f32,
     /// Desired turret bearing in world radians.
     pub aim: f32,
     pub fire_primary: bool,
@@ -154,6 +158,11 @@ impl Encode for InputFrame {
         w.u8(flags);
         w.i8((self.throttle.clamp(-1.0, 1.0) * 127.0) as i8);
         w.i8((self.steer.clamp(-1.0, 1.0) * 127.0) as i8);
+        // A byte, like the other two axes, rather than two of the four spare
+        // flag bits. The keyboard only ever sends -1, 0 or 1, but an axis is
+        // what this is, and the frame is client-to-server where the packet
+        // budget that governs snapshots does not apply.
+        w.i8((self.climb.clamp(-1.0, 1.0) * 127.0) as i8);
         w.angle(self.aim);
     }
 }
@@ -164,12 +173,14 @@ impl Decode for InputFrame {
         let flags = r.u8()?;
         let throttle = r.i8()? as f32 / 127.0;
         let steer = r.i8()? as f32 / 127.0;
+        let climb = r.i8()? as f32 / 127.0;
         let aim = r.angle()?;
         Ok(InputFrame {
             tick,
             controlling: VehicleSlot::from_u8(flags & 0b11).unwrap_or_default(),
             throttle: throttle.clamp(-1.0, 1.0),
             steer: steer.clamp(-1.0, 1.0),
+            climb: climb.clamp(-1.0, 1.0),
             aim,
             fire_primary: flags & 0b100 != 0,
             fire_secondary: flags & 0b1000 != 0,
@@ -400,6 +411,12 @@ pub struct PlaneSnapshot {
     pub speed: f32,
     /// Fuel left, `0..=1`. The clock the whole sortie runs on.
     pub fuel: f32,
+    /// Height above the ground. Carried for the same reason `roll` is: the
+    /// client predicts it, so a guess would diverge within a tick. It also
+    /// decides how long this aircraft's bombs fall and whether its rounds can
+    /// reach anything, so every client needs every aircraft's altitude, not
+    /// just its own.
+    pub alt: f32,
 }
 
 impl Encode for PlaneSnapshot {
@@ -409,6 +426,11 @@ impl Encode for PlaneSnapshot {
         w.angle(self.roll);
         w.signed_fixed16(self.speed, PLANE_SPEED_SCALE);
         w.unorm8(self.fuel);
+        // Sixteen bits rather than eight. Prediction reconciles against this
+        // number, and a byte over the band would land the aircraft on one of
+        // 256 rungs 0.4 units apart -- visible as a stutter in the climb, and
+        // worse through `sim::bomb_fall_time`, which would step the bombsight.
+        w.unorm16(self.alt, sim::PLANE_MAX_ALT);
     }
 }
 
@@ -420,13 +442,14 @@ impl Decode for PlaneSnapshot {
             roll: r.angle()?,
             speed: r.signed_fixed16(PLANE_SPEED_SCALE)?,
             fuel: r.unorm8()?,
+            alt: r.unorm16(sim::PLANE_MAX_ALT)?,
         })
     }
 }
 
 /// Bytes one `PlaneSnapshot` occupies on the wire. Half a vehicle, and most of
 /// that is the position, which is the one thing it cannot do without.
-pub const PLANE_SNAPSHOT_BYTES: usize = 15;
+pub const PLANE_SNAPSHOT_BYTES: usize = 17;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerSnapshot {
@@ -1097,6 +1120,7 @@ mod tests {
                 roll: 0.9,
                 speed: 41.5,
                 fuel: 0.5,
+                alt: 71.5,
             }),
             plane_ready_in: 33,
         }
@@ -1122,12 +1146,17 @@ mod tests {
             controlling: VehicleSlot::Miner,
             throttle: -1.0,
             steer: 0.5,
+            climb: -0.25,
             aim: 2.5,
             fire_primary: true,
             fire_secondary: false,
         };
         let bytes = f.to_vec();
-        assert_eq!(bytes.len(), 9, "input frames should stay tiny");
+        // Ten since the yoke joined the throttle and the stick. The number is
+        // pinned rather than computed because the client sends every unacked
+        // frame on every tick, so a frame quietly doubling is a thing worth
+        // failing a build over.
+        assert_eq!(bytes.len(), 10, "input frames should stay tiny");
         let got = InputFrame::from_slice(&bytes).unwrap();
         assert_eq!(got.tick, f.tick);
         assert_eq!(got.controlling, f.controlling);
@@ -1336,19 +1365,30 @@ mod tests {
             for (fire_primary, fire_secondary) in
                 [(false, false), (true, false), (false, true), (true, true)]
             {
-                let f = InputFrame {
-                    tick: 7,
-                    controlling,
-                    throttle: -1.0,
-                    steer: 1.0,
-                    aim: 2.5,
-                    fire_primary,
-                    fire_secondary,
-                };
-                let got = InputFrame::from_slice(&f.to_vec()).expect("decodes");
-                assert_eq!(got.controlling, controlling);
-                assert_eq!(got.fire_primary, fire_primary, "{controlling:?}");
-                assert_eq!(got.fire_secondary, fire_secondary, "{controlling:?}");
+                // Every value the yoke is ever sent with. Descending is the one
+                // worth naming: it is negative, so a decoder that read the byte
+                // unsigned would climb when the pilot pushed.
+                for climb in [-1.0, 0.0, 1.0] {
+                    let f = InputFrame {
+                        tick: 7,
+                        controlling,
+                        throttle: -1.0,
+                        steer: 1.0,
+                        climb,
+                        aim: 2.5,
+                        fire_primary,
+                        fire_secondary,
+                    };
+                    let got = InputFrame::from_slice(&f.to_vec()).expect("decodes");
+                    assert_eq!(got.controlling, controlling);
+                    assert_eq!(got.fire_primary, fire_primary, "{controlling:?}");
+                    assert_eq!(got.fire_secondary, fire_secondary, "{controlling:?}");
+                    assert!(
+                        (got.climb - climb).abs() < 0.01,
+                        "yoke sent {climb} came back {}",
+                        got.climb
+                    );
+                }
             }
         }
     }
@@ -1366,7 +1406,8 @@ mod tests {
         for step in 0..=20 {
             let throttle = -1.0 + step as f32 * 0.1;
             let speed = crate::sim::PLANE_CRUISE + throttle * crate::sim::PLANE_SPEED_TRIM;
-            let sent = PlaneSnapshot { pos: vec2(1.0, 2.0), yaw: 0.5, roll: -0.3, speed, fuel: 0.5 };
+            let sent =
+                PlaneSnapshot { pos: vec2(1.0, 2.0), yaw: 0.5, roll: -0.3, speed, fuel: 0.5, alt: 40.0 };
             let got = PlaneSnapshot::from_slice(&sent.to_vec()).expect("decodes");
             assert!(
                 (got.speed - speed).abs() < 0.01,

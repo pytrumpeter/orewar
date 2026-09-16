@@ -67,7 +67,8 @@ the handshake with an error rather than let in. Start it with another name.
 
 | | |
 |---|---|
-| `W` `A` `S` `D` | drive; in the air, `W`/`S` trim speed and `A`/`D` bank |
+| `W` `A` `S` `D` | drive; in the air, `W`/`S` are the yoke and `A`/`D` bank |
+| `1`–`5` | in the air, the throttle: `1` slowest, `3` cruise, `5` full |
 | mouse | aim the turret |
 | left mouse *or* `Space` | fire the gun |
 | right mouse *or* `F` | fire a missile |
@@ -147,27 +148,45 @@ cannot leave either one firing at something it can no longer hit.
 **The bomber** is the one thing in the game that reaches ground a tank cannot.
 It costs 1000 ore — more than everything else on the list put together — and
 what it buys is the aircraft, not a sortie. Press `G` and it comes in over your
-own corner with eighteen seconds of fuel — about one crossing of the field — and
-you are flying it the moment it arrives. `G` again is the way back to it if you
-have switched away, `Tab` reaches it like anything else, and when the fuel goes
-it is gone and the next one is forty-five seconds away.
+own corner with sixty seconds of fuel — three crossings of the field, or one
+crossing and a fight at the far end — and you are flying it the moment it
+arrives. `G` again is the way back to it if you have switched away, `Tab` reaches
+it like anything else, and when the fuel goes it is gone and the next one is
+forty-five seconds away.
 
-Nothing can shoot it down. Every gun in the game fires along the ground, so the
-clock is the only thing standing between a bombing run and the ground under it.
-What a bomb costs you instead is the run itself: it leaves with the aircraft's
-velocity and falls for a second and a half, landing some 47 units ahead of where
-you let it go, so a run is a line you commit to and fly through — and one you
-have to bank into early, because rolling level again takes as long as rolling
-over did. Nothing holds the aircraft inside the field either: fly off the map
-and the sortie is over, which is the second way to lose one. The ring on the
-ground is where the next one will land. Hills are cover from everything else in
+**Flying it** is not driving it. `A` and `D` do not steer — they bank, and a
+banked aircraft comes round on its own at a rate set by how far over it is. Let
+go and the bank stays where you put it, so a turn has to be rolled out of as
+well as into. The throttle is not a key you hold either: `1` to `5` are detents,
+`3` being the plain cruise, and the aircraft holds whichever you select.
+
+`W` and `S` are the yoke, and they work like a control column rather than a
+scrolled screen: push forward to go down, pull back to come up. The aircraft
+flies anywhere between ten units off the ground — low enough to be among the
+hills, though still clear of them — and a hundred, and it holds whatever height
+you leave it at. Height is not just a view. It changes where the bombs go: the
+sight ring sits almost under the aircraft down on the floor and out past twice
+that from the ceiling, because a bomb dropped from higher up falls for longer and
+is thrown further ahead. Watching that ring slide out as you climb is the whole
+trade in one picture.
+
+Nothing on the ground can shoot it down. Every gun down there fires along the
+ground, so the clock is the only thing standing between a bombing run and the
+ground under it. What a bomb costs you instead is the run itself: it leaves with
+the aircraft's velocity and falls, landing well ahead of where you let it go, so
+a run is a line you commit to and fly through — and one you have to bank into
+early, because rolling level again takes as long as rolling over did. You cannot
+fly off the map: near a wall the aircraft rolls itself back toward the middle of
+the field, so the fuel is the only thing that ends a sortie. The band is narrow
+enough to leave a run at a corner base alone. The ring on the ground is where the
+next bomb will land. Hills are cover from everything else in
 the game and nothing at all to a bomb, and a blast fades from its centre out, so
 a near miss still costs the target something.
 
 A hit is worth the wait. Square on, a bomb takes a miner's shield entirely
 and half of the hull under it, and a tank that has not bought a Shield Booster
-does not survive one at all. That is deliberate: a bomb is released some 47
-units before it lands, from an aircraft committed to a line and unable to stop,
+does not survive one at all. That is deliberate: a bomb is released a long way
+before it lands, from an aircraft committed to a line and unable to stop,
 out of a sortie that comes round every forty-five seconds at best — against
 anything moving and paying attention, most of them miss.
 
