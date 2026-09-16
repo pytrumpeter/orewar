@@ -67,20 +67,31 @@ the handshake with an error rather than let in. Start it with another name.
 
 | | |
 |---|---|
-| `W` `A` `S` `D` | drive |
+| `W` `A` `S` `D` | drive; in the air, `W`/`S` trim speed and `A`/`D` bank |
 | mouse | aim the turret |
-| left mouse | fire the gun |
-| right mouse | fire a missile |
+| left mouse *or* `Space` | fire the gun |
+| right mouse *or* `F` | fire a missile |
 | `Tab` | switch between the vehicles you have |
-| `G` | call up a bombing run, once you own the **Bomber** |
+| `G` | call up a bombing run and take its controls; once you own the **Bomber** |
 | `B` | build menu, then `1`–`8` to buy |
+| `Alt-C` | cheat mode on or off, for everybody in the match |
+| `O` | overview camera; right-drag to pan, `+`/`-` to zoom |
 | `Ctrl-Q` | leave the match |
+
+Everything keeps working with the overview up — you can fly, drive, shoot, buy
+and call up a sortie while looking at the whole field. The mouse is the one
+thing that changes hands: up there it drags the map and reaches the harvester's
+mode buttons, so the two triggers come off it and `Space` and `F` do the firing.
+Aim still follows the cursor, which from that height means aiming at a place on
+the map rather than at a point just ahead of the hull.
 
 Flying is different from driving. `A` and `D` do not steer the bomber, they
 **bank** it, and a banked aircraft comes round on its own — the further over it
 is, the tighter the turn. Let go and the bank stays where you put it, so a turn
-continues until you roll back level. The throttle does nothing at all: an
-aircraft holds one speed. Left mouse releases bombs.
+continues until you roll back level. `W` and `S` trim the airspeed either side
+of the cruise — never near a stop, since held hard back it still outruns a tank
+under Turbo — and because the bombs are thrown ahead by the airspeed, a slower
+run drops them some twenty-two units shorter. Left mouse releases bombs.
 
 ---
 
@@ -135,12 +146,11 @@ cannot leave either one firing at something it can no longer hit.
 
 **The bomber** is the one thing in the game that reaches ground a tank cannot.
 It costs 1000 ore — more than everything else on the list put together — and
-what it buys is the aircraft, not a sortie. (Temporarily, every player starts a
-match already holding it, so it can be flown without mining for one first: see
-`STARTING_POWERUPS`.) Press `G` and it comes in over your
-own corner with eighteen seconds of fuel, about one crossing of the field. `Tab`
-reaches it while it is up, and when the fuel goes it is gone and the next one is
-forty-five seconds away.
+what it buys is the aircraft, not a sortie. Press `G` and it comes in over your
+own corner with eighteen seconds of fuel — about one crossing of the field — and
+you are flying it the moment it arrives. `G` again is the way back to it if you
+have switched away, `Tab` reaches it like anything else, and when the fuel goes
+it is gone and the next one is forty-five seconds away.
 
 Nothing can shoot it down. Every gun in the game fires along the ground, so the
 clock is the only thing standing between a bombing run and the ground under it.
@@ -148,15 +158,34 @@ What a bomb costs you instead is the run itself: it leaves with the aircraft's
 velocity and falls for a second and a half, landing some 47 units ahead of where
 you let it go, so a run is a line you commit to and fly through — and one you
 have to bank into early, because rolling level again takes as long as rolling
-over did. The ring on the
+over did. Nothing holds the aircraft inside the field either: fly off the map
+and the sortie is over, which is the second way to lose one. The ring on the
 ground is where the next one will land. Hills are cover from everything else in
 the game and nothing at all to a bomb, and a blast fades from its centre out, so
 a near miss still costs the target something.
+
+A hit is worth the wait. Square on, a bomb takes a harvester's shield entirely
+and half of the hull under it, and a tank that has not bought a Shield Booster
+does not survive one at all. That is deliberate: a bomb is released some 47
+units before it lands, from an aircraft committed to a line and unable to stop,
+out of a sortie that comes round every forty-five seconds at best — against
+anything moving and paying attention, most of them miss.
+
+Ore in a blast is not reduced, it is **gone**. A deposit is the one thing on the
+field that cannot be driven out of the way, and one bomb empties it — which is
+the reason to spend a sortie on open ground rather than on somebody's hull.
 
 **Upgrades.** Radar (a HUD contact circle), Shield Booster, Turbo Drive,
 Harvester Armor, Auto Turret (the harvester defends itself), Long Barrel,
 Missile Packs, and the Bomber. The map is generated in one quadrant and rotated
 into the other three, so every corner faces an identical distribution of ore.
+
+**Cheat mode** is `Alt-C`. Everything on the build list becomes free and a
+sortie never runs out of fuel, so the bomber can be flown without mining a
+match's worth of ore for one first. Any player can toggle it and it lands on
+everybody — a cheat that applied only to whoever pressed the key would be an
+advantage rather than a way to look at something quickly. Flying off the map
+still ends a sortie; that is the one rule it does not lift.
 
 ---
 

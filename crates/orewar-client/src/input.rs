@@ -27,6 +27,14 @@ pub struct LocalInput {
     pub fire_primary: bool,
     pub fire_secondary: bool,
     pub build_menu: bool,
+    /// A sortie has been asked for and has not arrived yet.
+    ///
+    /// The launch key cannot hand over the controls on the spot, because the
+    /// aircraft does not exist here until the server says so -- and the
+    /// fallback below, which keeps the player on something they actually have,
+    /// would bounce them straight back off a slot that is still empty. So the
+    /// intent is remembered and spent the moment the sortie shows up.
+    pub awaiting_sortie: bool,
     /// The frame sent this tick, kept so prediction applies exactly what was sent.
     pub current: InputFrame,
 }
@@ -42,6 +50,7 @@ impl Default for LocalInput {
             fire_primary: false,
             fire_secondary: false,
             build_menu: false,
+            awaiting_sortie: false,
             current: InputFrame::default(),
         }
     }
@@ -60,7 +69,44 @@ pub const BUY_KEYS: [KeyCode; 8] = [
 ];
 
 /// Calls up a sortie.
-pub const LAUNCH_KEY: KeyCode = KeyCode::KeyG;
+const LAUNCH_KEY: KeyCode = KeyCode::KeyG;
+
+/// Turns cheat mode on or off, held with either Alt.
+///
+/// Behind a modifier on purpose: it changes the rules for everybody in the
+/// match, so it should not be one letter away from the keys used to drive.
+///
+/// Private, along with [`LAUNCH_KEY`], so that a binding whose handler goes
+/// missing is an unused-constant warning rather than silence. Published for no
+/// reason, that is precisely how this one was lost once already.
+const CHEAT_KEY: KeyCode = KeyCode::KeyC;
+
+/// How much of the controls is live, given what else is on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Controls {
+    /// Whether the vehicle can be driven and fired at all.
+    pub live: bool,
+    /// Whether the mouse buttons pull the triggers. The keyboard ones always
+    /// do while the controls are live.
+    pub mouse_fires: bool,
+}
+
+/// Works out the two answers above.
+///
+/// A plain function rather than a couple of conditions inside [`gather`], which
+/// would need a whole Bevy world to exercise. What it decides is a rule about
+/// the game and worth pinning down on its own.
+pub fn controls_for(menu_open: bool, overview_active: bool) -> Controls {
+    Controls {
+        // Only the pause menu takes the controls away. The overview does not:
+        // an aircraft keeps flying whether or not you are watching it.
+        live: !menu_open,
+        // Up in the overview the mouse belongs to the camera and the panels --
+        // right-drag pans the map, and the harvester's mode buttons float over
+        // it -- so the triggers come off the mouse while it is up.
+        mouse_fires: !menu_open && !overview_active,
+    }
+}
 
 pub fn gather(
     keys: Res<ButtonInput<KeyCode>>,
@@ -73,15 +119,31 @@ pub fn gather(
     mut state: ResMut<GameState>,
     mut net: ResMut<NetClient>,
 ) {
-    // With the menu up, or the camera lifted off the vehicle, it coasts: it
-    // should not carry on driving on whatever was held at the time, and a
-    // click on a menu item or a mode button is not a trigger pull. Gating the
-    // overview this way is also what keeps it from being free reconnaissance:
-    // looking at the whole field means not fighting while you do it.
+    // With the menu up the vehicle coasts: it should not carry on driving on
+    // whatever was held at the time, and a click on a menu item is not a
+    // trigger pull.
+    //
+    // The pause menu is the only thing that takes the controls away. Raising
+    // the overview used to as well, on the reasoning that looking at the whole
+    // field meant not fighting while you did it -- but an aircraft keeps flying
+    // whether or not you are watching it, and a fuel clock does not stop for
+    // the camera, so being unable to fly while looking is a way to lose a
+    // sortie rather than a considered restriction.
     //
     // Aim is left where it was, exactly as it is when input stops arriving at
     // all -- a turret that snaps is worse than one that waits.
-    if menu.open || overview.active {
+    // Cheat mode, for everybody. Sent rather than applied: the server owns the
+    // rules, and the flag comes back on the next snapshot.
+    //
+    // Above the gate deliberately. It is not a control -- it changes what the
+    // match is -- so it should work whatever else happens to be on screen.
+    let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    if alt && keys.just_pressed(CHEAT_KEY) && net.link == Link::Connected {
+        net.toggle_cheats();
+    }
+
+    let controls = controls_for(menu.open, overview.active);
+    if !controls.live {
         input.throttle = 0.0;
         input.steer = 0.0;
         input.fire_primary = false;
@@ -112,17 +174,39 @@ pub fn gather(
 
     input.throttle = throttle;
     input.steer = steer;
-    input.fire_primary = buttons.pressed(MouseButton::Left) || keys.pressed(KeyCode::Space);
-    input.fire_secondary = buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::KeyF);
+
+    // Space and F are already the keyboard way to fire, which is what makes
+    // taking the triggers off the mouse in the overview cost nothing: up there
+    // the keyboard flies and fights, and the mouse looks.
+    input.fire_primary = (controls.mouse_fires && buttons.pressed(MouseButton::Left))
+        || keys.pressed(KeyCode::Space);
+    input.fire_secondary = (controls.mouse_fires && buttons.pressed(MouseButton::Right))
+        || keys.pressed(KeyCode::KeyF);
+
+    // What to drive by the end of this frame, if anything below changes it.
+    let mut take: Option<VehicleSlot> = None;
 
     // Call up a sortie. Reliable, like a purchase, and only sent when it can
     // actually be granted -- the client has the upgrade mask and the cooldown
     // in every snapshot, so a key that would be declined is a key that does
     // nothing here rather than a request the server quietly drops.
     if keys.just_pressed(LAUNCH_KEY) && net.link == Link::Connected {
-        if state.local().is_some_and(|me| me.sortie_ready()) {
+        // One key, one meaning: get me to the bomber. With a sortie already up
+        // that is just a switch; without one it is a request, and the switch
+        // happens when it arrives.
+        let already_up = state.local().is_some_and(|me| me.plane.is_some());
+        if already_up {
+            take = Some(VehicleSlot::Plane);
+        } else if state.local().is_some_and(|me| me.sortie_ready()) {
             net.launch_plane();
+            input.awaiting_sortie = true;
         }
+    }
+
+    // The sortie asked for above has arrived: take it.
+    if input.awaiting_sortie && state.local().is_some_and(|me| me.plane.is_some()) {
+        take = Some(VehicleSlot::Plane);
+        input.awaiting_sortie = false;
     }
 
     // Swap which vehicle you are driving. The cycle only stops on what you
@@ -130,12 +214,11 @@ pub fn gather(
     // while it is, rather than a third stop that is empty most of a match.
     if keys.just_pressed(KeyCode::Tab) {
         if let Some(me) = state.local() {
-            let next = input.controlling.next_available(|slot| me.vehicle(slot).is_some());
-            if next != input.controlling {
-                input.controlling = next;
-                state.set_predicted_slot(next);
-            }
+            take = Some(input.controlling.next_available(|slot| me.vehicle(slot).is_some()));
         }
+        // Choosing something by hand is the player saying where they want to
+        // be, so a sortie still in the post no longer gets to move them.
+        input.awaiting_sortie = false;
     }
 
     // Follow the vehicle you actually have. A destroyed tank leaves nothing
@@ -147,11 +230,16 @@ pub fn gather(
     // respawns.
     if let Some(me) = state.local() {
         if me.vehicle(input.controlling).is_none() {
-            let next = input.controlling.next_available(|slot| me.vehicle(slot).is_some());
-            if next != input.controlling {
-                input.controlling = next;
-                state.set_predicted_slot(next);
-            }
+            take = Some(input.controlling.next_available(|slot| me.vehicle(slot).is_some()));
+        }
+    }
+
+    // Applied in one place at the end: every route above decides *what* to
+    // drive, and prediction has to be restarted exactly once for whatever wins.
+    if let Some(slot) = take {
+        if slot != input.controlling {
+            input.controlling = slot;
+            state.set_predicted_slot(slot);
         }
     }
 
@@ -236,4 +324,43 @@ pub fn send_input(
     // fields the compiler can see are different.
     let state = &mut *state;
     state.prediction.apply(frame, powerups, &state.hills);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Raising the overview must not put the vehicle down.
+    ///
+    /// It used to: the camera lifting off the hull zeroed the throttle, the
+    /// steering and both triggers, on the reasoning that looking at the whole
+    /// field meant not fighting while you did it. That reasoning does not
+    /// survive an aircraft. A sortie keeps flying and keeps burning fuel
+    /// whether or not anybody is watching it, so being unable to fly while
+    /// looking is a way to lose one rather than a considered restriction --
+    /// and the same key that lifts the camera is the one you want while
+    /// working out where to go next.
+    ///
+    /// What the overview does take is the mouse, because up there it already
+    /// has two jobs: the right button drags the map and the left one reaches
+    /// the harvester's mode buttons floating over it. Neither should also pull
+    /// a trigger. Nothing is lost by it -- `Space` and `F` fire.
+    #[test]
+    fn only_the_pause_menu_takes_the_controls_away() {
+        let playing = controls_for(false, false);
+        assert!(playing.live);
+        assert!(playing.mouse_fires, "the mouse fires when nothing else wants it");
+
+        let looking = controls_for(false, true);
+        assert!(looking.live, "the overview put the vehicle down");
+        assert!(!looking.mouse_fires, "dragging the map would also have fired");
+
+        // The menu is the one thing that stops everything, and it stops it
+        // whether or not the overview happens to be up behind it.
+        for overview in [false, true] {
+            let paused = controls_for(true, overview);
+            assert!(!paused.live, "the menu left the controls live");
+            assert!(!paused.mouse_fires, "a click on a menu item was a trigger pull");
+        }
+    }
 }

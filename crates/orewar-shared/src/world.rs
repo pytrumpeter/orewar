@@ -330,12 +330,11 @@ pub const STARTING_CREDITS: u32 = 150;
 
 /// Power-ups every player is holding when a match begins.
 ///
-/// TEMPORARY, while the bomber is being worked on. It is meant to be a 1000-ore
-/// purchase and the most expensive thing on the list -- see [`PowerUp::cost`] --
-/// but mining a match's worth of ore before every test flight is most of what a
-/// change to it would otherwise cost. Set this back to `0` to put the aircraft
-/// behind the shop where it belongs.
-pub const STARTING_POWERUPS: u16 = PowerUp::Bomber.bit();
+/// Nothing: everything on the list is earned. Flying the bomber without mining
+/// for one first is what cheat mode is for -- see [`crate::protocol::Snapshot`]
+/// and the `Alt-C` toggle -- rather than a default that quietly changes what a
+/// match is.
+pub const STARTING_POWERUPS: u16 = 0;
 
 #[cfg(test)]
 mod tests {

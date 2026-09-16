@@ -324,10 +324,19 @@ pub fn update_texts(
                 let name = state.local_player.map(|id| state.name_of(id)).unwrap_or_default();
                 // The sortie line is only worth the room once the aircraft is
                 // bought: for most of most matches there is nothing to say.
+                let cheats = state.cheats();
                 let sortie = match me {
                     Some(p) if PowerUp::Bomber.held(p.powerups) => {
                         if let Some(plane) = p.plane {
-                            format!("\nsortie: {:.0}s of fuel", plane.cargo * sim::PLANE_FUEL)
+                            // Airspeed alongside the fuel: the throttle is a
+                            // slow, small change and without a number on it the
+                            // player cannot tell it is doing anything.
+                            let fuel = if cheats {
+                                "fuel unlimited".to_string()
+                            } else {
+                                format!("{:.0}s of fuel", plane.cargo * sim::PLANE_FUEL)
+                            };
+                            format!("\nsortie: {fuel}   {:.0} kts", plane.speed)
                         } else if p.plane_ready_in > 0 {
                             format!("\nsortie: ready in {}s", p.plane_ready_in)
                         } else {
@@ -336,13 +345,14 @@ pub fn update_texts(
                     }
                     _ => String::new(),
                 };
+                let cheat_line = if cheats { "\nCHEATS ON  [Alt-C]" } else { "" };
                 let weapons = if input.controlling == VehicleSlot::Plane {
                     "WASD fly | LMB drop bombs"
                 } else {
                     "WASD drive | mouse aim | LMB gun | RMB missile"
                 };
                 **text = format!(
-                    "OREWAR  {name}\n{link}\nore {credits}   mined {}\ndriving: {}{sortie}\n\n\
+                    "OREWAR  {name}\n{link}\nore {credits}   mined {}\ndriving: {}{sortie}{cheat_line}\n\n\
                      {weapons}\n\
                      TAB swap vehicle | B build | O overview | ESC menu",
                     me.map_or(0, |p| p.ore_mined),
@@ -433,6 +443,8 @@ pub fn update_texts(
                     let owned = powerup.held(powerups);
                     let status = if owned {
                         "OWNED".to_string()
+                    } else if state.cheats() {
+                        "free".to_string()
                     } else if credits >= powerup.cost() {
                         format!("{} ore", powerup.cost())
                     } else {

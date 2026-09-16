@@ -20,19 +20,35 @@ use crate::world::{MAX_PLAYERS, PowerUp, WORLD_SIZE};
 /// Bumped whenever the wire format changes, so mismatched builds fail the
 /// handshake instead of misparsing each other.
 ///
-/// Last bumped for the bomber: a third [`VehicleSlot`], which widened the
-/// control field in [`InputFrame`] from one bit to two.
+/// Last bumped for the bomber's throttle, which made its airspeed something
+/// that varies and so something the snapshot has to carry.
 /// Without a bump an older peer would complete the handshake and then hit an
 /// unknown tag on the reliable stream, which is a decode error rather than a
 /// recoverable one.
-pub const PROTOCOL_ID: u32 = 0x4F52_5708;
+pub const PROTOCOL_ID: u32 = 0x4F52_570A;
 
 /// Quantization ceiling for shield and hull values.
 const STAT_SCALE: f32 = 512.0;
 /// Quantization ceiling for cargo.
 const CARGO_SCALE: f32 = 256.0;
 /// Fixed-point steps per world unit per second for vehicle speed.
+///
+/// A signed 16-bit field, so this scale also fixes the fastest speed that can
+/// be described: `i16::MAX / SPEED_SCALE`, a little under 33 units per second.
+/// That is comfortably clear of anything on the ground -- a tank under Turbo
+/// manages 24.7 -- but not of the aircraft, which cruises above it. See
+/// [`PLANE_SPEED_SCALE`].
 const SPEED_SCALE: f32 = 1000.0;
+
+/// The same, for the aircraft, which flies faster than [`SPEED_SCALE`] can say.
+///
+/// Sharing the ground vehicles' scale silently clipped the airspeed to 32.7 on
+/// the way out: full throttle went over the wire slower than the cruise it had
+/// been asked to beat, and the client -- which reconciles prediction against
+/// exactly this number -- drew a bombsight for a speed the aircraft was not
+/// doing. Halved, it reaches 65 units per second with 0.002 of precision left,
+/// which is far more than a bombsight can tell.
+const PLANE_SPEED_SCALE: f32 = 500.0;
 
 /// Snapshots carry at most this many projectiles, nearest to the receiver
 /// first. Bullets are dense and short-lived; dropping the far ones keeps
@@ -177,6 +193,13 @@ pub enum ClientMessage {
     NewGame,
     /// Reliable. Changes what the harvester does when left to itself.
     SetHarvesterMode(HarvesterMode),
+    /// Reliable. Turns cheat mode on or off for the whole match.
+    ///
+    /// Any player may ask, and it lands on everybody -- the same reasoning as
+    /// [`ClientMessage::NewGame`]. There is no host in this protocol, and a
+    /// mode that applied to one player would be worse than useless: it would be
+    /// an advantage rather than a way to look at something quickly.
+    ToggleCheats,
     /// Reliable. Asks for a sortie. The server checks the upgrade and the
     /// cooldown and silently declines if either says no.
     ///
@@ -209,6 +232,9 @@ impl Encode for ClientMessage {
             ClientMessage::LaunchPlane => {
                 w.u8(6);
             }
+            ClientMessage::ToggleCheats => {
+                w.u8(7);
+            }
         }
     }
 }
@@ -234,6 +260,7 @@ impl Decode for ClientMessage {
                 )
             }
             6 => ClientMessage::LaunchPlane,
+            7 => ClientMessage::ToggleCheats,
             other => return Err(DecodeError::BadTag("ClientMessage", other)),
         })
     }
@@ -353,13 +380,13 @@ pub const SENTINEL_SNAPSHOT_BYTES: usize = 4;
 /// Deliberately not a [`VehicleSnapshot`]. That is 22 bytes and four of them
 /// would not fit the budget -- and most of it would be zeroes anyway, because
 /// an aircraft has no shield, no cargo, no turret of its own, and nothing that
-/// can capture it. Its speed is not sent either, because there is only one it
-/// can be: an aircraft holds [`sim::PLANE_CRUISE`] and nothing the pilot does
-/// changes it, so the client resumes prediction from that constant and is
-/// exactly right rather than nearly right. That is also what lets the bombsight
-/// promise where a bomb will land. The bank is the opposite case and does
-/// travel: it is held rather than sprung back, so it is genuine state that a
-/// client cannot infer from the inputs it happens to have seen.
+/// can capture it.
+///
+/// The airspeed and the bank both travel, and for the same reason: the throttle
+/// trims one and the stick holds the other, so neither can be inferred from a
+/// constant or from the inputs a client happens to have seen. The airspeed in
+/// particular is what the bombsight multiplies by the fall time, so a client
+/// guessing at it would draw a ring the bombs miss.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlaneSnapshot {
     pub pos: Vec2,
@@ -368,6 +395,9 @@ pub struct PlaneSnapshot {
     /// client that guessed it would predict a different heading within a tick.
     /// It is also what the model is drawn rolled by.
     pub roll: f32,
+    /// Airspeed, which the throttle trims. Prediction resumes from it, and the
+    /// bombsight is it times [`sim::BOMB_FALL_TIME`].
+    pub speed: f32,
     /// Fuel left, `0..=1`. The clock the whole sortie runs on.
     pub fuel: f32,
 }
@@ -377,6 +407,7 @@ impl Encode for PlaneSnapshot {
         w.vec2(self.pos);
         w.angle(self.yaw);
         w.angle(self.roll);
+        w.signed_fixed16(self.speed, PLANE_SPEED_SCALE);
         w.unorm8(self.fuel);
     }
 }
@@ -387,6 +418,7 @@ impl Decode for PlaneSnapshot {
             pos: r.vec2()?,
             yaw: r.angle()?,
             roll: r.angle()?,
+            speed: r.signed_fixed16(PLANE_SPEED_SCALE)?,
             fuel: r.unorm8()?,
         })
     }
@@ -394,7 +426,7 @@ impl Decode for PlaneSnapshot {
 
 /// Bytes one `PlaneSnapshot` occupies on the wire. Half a vehicle, and most of
 /// that is the position, which is the one thing it cannot do without.
-pub const PLANE_SNAPSHOT_BYTES: usize = 13;
+pub const PLANE_SNAPSHOT_BYTES: usize = 15;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerSnapshot {
@@ -697,6 +729,13 @@ pub struct Snapshot {
     pub ore: Vec<OreUpdate>,
     /// Impacts that happened during this tick, for the client to draw.
     pub hits: Vec<HitFx>,
+    /// Whether cheat mode is on for this match.
+    ///
+    /// On the snapshot rather than announced as an event, because an event is
+    /// only heard by whoever was connected when it happened -- a client joining
+    /// a match already in cheat mode would show the ordinary rules and be
+    /// wrong about them until somebody toggled it again.
+    pub cheats: bool,
 }
 
 impl Encode for Snapshot {
@@ -707,6 +746,7 @@ impl Encode for Snapshot {
         w.u32(self.acked_input);
         w.list(&self.players, |w, p| p.encode(w));
         w.list(&self.projectiles, |w, p| p.encode(w));
+        w.bool(self.cheats);
         w.bool(self.ore_is_full_sync);
         w.list(&self.ore, |w, o| {
             w.u16(o.id).u16(o.amount);
@@ -727,6 +767,7 @@ impl Decode for Snapshot {
         let acked_input = r.u32()?;
         let players = r.list(|r| r.read())?;
         let projectiles = r.list(|r| r.read())?;
+        let cheats = r.bool()?;
         let ore_is_full_sync = r.bool()?;
         let ore = r.list(|r| Ok(OreUpdate { id: r.u16()?, amount: r.u16()? }))?;
         let hits = r.list(|r| r.read())?;
@@ -737,6 +778,7 @@ impl Decode for Snapshot {
             acked_input,
             players,
             projectiles,
+            cheats,
             ore_is_full_sync,
             ore,
             hits,
@@ -1053,6 +1095,7 @@ mod tests {
                 pos: vec2(201.5, 88.25),
                 yaw: -1.0,
                 roll: 0.9,
+                speed: 41.5,
                 fuel: 0.5,
             }),
             plane_ready_in: 33,
@@ -1172,6 +1215,7 @@ mod tests {
                     yaw: i as f32 * 0.1,
                 })
                 .collect(),
+            cheats: true,
             ore_is_full_sync: true,
             ore: (0..48).map(|i| OreUpdate { id: i, amount: i * 7 }).collect(),
             hits: vec![
@@ -1256,6 +1300,7 @@ mod tests {
                     yaw: 3.0,
                 })
                 .collect(),
+            cheats: true,
             ore_is_full_sync: true,
             ore: (0..64).map(|i| OreUpdate { id: i, amount: u16::MAX }).collect(),
             hits: (0..MAX_HITS_PER_SNAPSHOT)
@@ -1305,6 +1350,29 @@ mod tests {
                 assert_eq!(got.fire_primary, fire_primary, "{controlling:?}");
                 assert_eq!(got.fire_secondary, fire_secondary, "{controlling:?}");
             }
+        }
+    }
+
+    /// Every airspeed the aircraft can actually fly has to survive the wire.
+    ///
+    /// A fixed-point field has a ceiling as well as a precision, and this one
+    /// was originally sized for vehicles that cannot exceed 25 units per
+    /// second. The aircraft cruises above that, so sharing the scale clipped
+    /// full throttle down to *below* the cruise -- which presents as a throttle
+    /// that does nothing in one direction and works in the other, and is
+    /// invisible to any test that does not go through an encoder.
+    #[test]
+    fn every_airspeed_the_aircraft_can_fly_survives_the_wire() {
+        for step in 0..=20 {
+            let throttle = -1.0 + step as f32 * 0.1;
+            let speed = crate::sim::PLANE_CRUISE + throttle * crate::sim::PLANE_SPEED_TRIM;
+            let sent = PlaneSnapshot { pos: vec2(1.0, 2.0), yaw: 0.5, roll: -0.3, speed, fuel: 0.5 };
+            let got = PlaneSnapshot::from_slice(&sent.to_vec()).expect("decodes");
+            assert!(
+                (got.speed - speed).abs() < 0.01,
+                "{speed} came back as {} -- the field cannot hold it",
+                got.speed
+            );
         }
     }
 

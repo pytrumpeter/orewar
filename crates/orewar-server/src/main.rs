@@ -303,6 +303,7 @@ fn handle_packet(
                 match ClientMessage::from_slice(&message) {
                     Ok(ClientMessage::Purchase(p)) => game.purchase(player_id, p),
                     Ok(ClientMessage::LaunchPlane) => game.launch_plane(player_id),
+                    Ok(ClientMessage::ToggleCheats) => game.toggle_cheats(),
                     Ok(ClientMessage::SetHarvesterMode(m)) => {
                         game.set_harvester_mode(player_id, m)
                     }

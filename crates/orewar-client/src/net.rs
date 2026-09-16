@@ -130,6 +130,11 @@ impl NetClient {
         self.send_reliable(&ClientMessage::LaunchPlane);
     }
 
+    /// Asks for cheat mode to be turned on or off, for everybody.
+    pub fn toggle_cheats(&mut self) {
+        self.send_reliable(&ClientMessage::ToggleCheats);
+    }
+
     /// Sends one packet carrying this tick's input.
     pub fn send_input(&mut self, frame: InputFrame) {
         if self.link != Link::Connected {

@@ -53,6 +53,9 @@ pub struct RenderVehicle {
     /// Bank angle. Always zero on the ground; on the aircraft it is both what
     /// makes the turn and what the model is visibly rolled by.
     pub roll: f32,
+    /// Signed speed along `yaw`. Carried through for the bombsight, which is
+    /// this times the fall time and is wrong the moment it uses anything else.
+    pub speed: f32,
     pub turret_yaw: f32,
     pub shield: f32,
     pub hull: f32,
@@ -67,6 +70,7 @@ impl RenderVehicle {
             pos: v.pos,
             yaw: v.yaw,
             roll: 0.0,
+            speed: v.speed,
             turret_yaw: v.turret_yaw,
             shield: v.shield,
             hull: v.hull,
@@ -80,6 +84,7 @@ impl RenderVehicle {
         RenderVehicle {
             pos: a.pos.lerp(b.pos, t),
             roll: 0.0,
+            speed: a.speed + (b.speed - a.speed) * t,
             // Angles must take the short way around, or a vehicle crossing the
             // -pi/+pi boundary spins the long way for a frame.
             yaw: math::angle_lerp(a.yaw, b.yaw, t),
@@ -106,7 +111,7 @@ fn plane_as_vehicle(p: &PlaneSnapshot) -> VehicleSnapshot {
         pos: p.pos,
         yaw: p.yaw,
         turret_yaw: p.yaw,
-        speed: sim::PLANE_CRUISE,
+        speed: p.speed,
         // Fuel rides in on `cargo`, which is the one field on a vehicle that
         // means nothing to an aircraft and is already a "how full is it".
         cargo: p.fuel,
@@ -380,6 +385,10 @@ pub struct GameState {
     pub roster: Vec<PlayerInfo>,
     pub status: GameStatus,
     pub winner: Option<u8>,
+    /// Cheat mode, as the server reports it. Any player can toggle it and it
+    /// lands on everybody, so this is read from the snapshot rather than
+    /// remembered from having asked.
+    cheats: bool,
     /// Newest last, paired with the client time each arrived.
     snapshots: VecDeque<(f64, Snapshot)>,
     pub render: RenderWorld,
@@ -406,6 +415,7 @@ impl Default for GameState {
             roster: Vec::new(),
             status: GameStatus::Waiting,
             winner: None,
+            cheats: false,
             snapshots: VecDeque::new(),
             render: RenderWorld { players: vec![None; MAX_PLAYERS], projectiles: Vec::new() },
             prediction: Prediction::default(),
@@ -475,6 +485,12 @@ impl GameState {
     }
 
     /// Accepts a snapshot and updates everything derived from it.
+    /// Whether the match is in cheat mode. Taken from the server rather than
+    /// from whether this client asked for it, since any player can toggle it.
+    pub fn cheats(&self) -> bool {
+        self.cheats
+    }
+
     pub fn push_snapshot(&mut self, now: f64, snapshot: Snapshot) {
         // Snapshots ride an unreliable channel and can arrive out of order.
         // An older one has nothing to add.
@@ -486,6 +502,12 @@ impl GameState {
 
         self.status = snapshot.status;
         self.winner = snapshot.winner;
+        if snapshot.cheats != self.cheats {
+            self.cheats = snapshot.cheats;
+            // Worth saying out loud: it is match-wide, so somebody else may
+            // have been the one who turned it on.
+            self.note(if self.cheats { "Cheat mode ON" } else { "Cheat mode off" });
+        }
         self.server_tick = snapshot.tick;
         // Stale snapshots were rejected above, so each tick's impacts are
         // picked up exactly once. `now` is when this snapshot arrived, and
@@ -705,6 +727,7 @@ impl GameState {
             let pos = self.prediction.render_pos(alpha);
             let yaw = self.prediction.render_yaw(alpha);
             let roll = self.prediction.render_roll(alpha);
+            let speed = self.prediction.state.speed;
             if let Some(Some(player)) = players.get_mut(local as usize) {
                 let target = match slot {
                     VehicleSlot::Tank => player.tank.as_mut(),
@@ -716,6 +739,9 @@ impl GameState {
                     v.yaw = yaw;
                     if slot == VehicleSlot::Plane {
                         v.roll = roll;
+                        // The sight is drawn from this, so it has to be what
+                        // prediction is flying rather than the last snapshot.
+                        v.speed = speed;
                     }
                 }
             }

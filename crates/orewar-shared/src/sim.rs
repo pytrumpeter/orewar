@@ -283,12 +283,16 @@ pub fn step_vehicle(
 /// no wall to be stopped by. What it shares is that both the server and the
 /// client run it, so it stays as pure as the rest of this module.
 ///
-/// The throttle does nothing. An aircraft holds one speed and is steered, which
-/// is not a limitation but the point of it: a bombing run is a line you commit
-/// to and fly through, and every way of letting the player slow down turns the
-/// thing into a gun platform that happens to be airborne. It also makes the
-/// speed a constant that never has to travel on the wire, which is what lets
-/// [`bomb_impact`] promise the client exactly where a bomb will land.
+/// The throttle trims the cruise rather than setting it. Forward and back move
+/// the airspeed [`PLANE_SPEED_TRIM`] either way and no further, so it can be
+/// pushed along or held back but never brought near a stop -- an aircraft that
+/// can be parked in the air is a gun platform, and the fuel clock stops meaning
+/// much if you can sit still on it.
+///
+/// What the trim buys is a real choice rather than a bigger number. Slow, and a
+/// run is easier to line up and the bombs land closer together; the fuel clock
+/// is unchanged, so the same eighteen seconds covers less ground. Fast, and the
+/// map shrinks at the cost of a run that has to be set up much further out.
 ///
 /// **The stick rolls; the roll turns.** Left and right do not steer the
 /// aircraft -- they bank it, and a banked aircraft comes round on its own at a
@@ -304,40 +308,19 @@ pub fn step_vehicle(
 /// wide, correctable arc and the last few degrees of a hard one are where the
 /// turn really bites.
 ///
-/// The field edge banks it away rather than stopping it. Clamping an aircraft
-/// against the wall the way a tank is clamped would leave it grinding along the
-/// boundary burning fuel with the stick doing nothing, so the boundary is a
-/// band that rolls it into a turn before it ever reaches the wall -- through
-/// the same bank the player flies with, so what the edge does to the aircraft
-/// is something they can see and fly out of. The clamp behind it is a backstop
-/// that should never be the thing that acts.
+/// Flying out of the field ends the sortie, and nothing stops you doing it.
+/// The edge used to bank the aircraft back inside, which kept every sortie over
+/// the field but meant the boundary quietly flew the aeroplane for you -- and
+/// near a corner base, which is one of the things worth crossing the map to
+/// bomb, it wrestled you off the run every time you lined one up. Leaving is
+/// now simply a way to lose the aircraft, which is a price the player can see
+/// coming and choose to pay.
 fn step_plane(state: &mut MoveState, throttle: f32, steer: f32, dt: f32) {
     let t = tuning(VehicleKind::Plane);
-    let _ = throttle;
-    state.speed = approach(state.speed, PLANE_CRUISE, t.accel * dt);
-
-    // Inside the boundary band the edge takes the stick, rolling toward
-    // whichever full bank brings the nose back toward the middle of the field.
-    let lo = t.radius;
-    let hi = WORLD_SIZE - t.radius;
-    let p = state.pos;
-    let cornered = p.x < lo + PLANE_EDGE_BAND
-        || p.x > hi - PLANE_EDGE_BAND
-        || p.y < lo + PLANE_EDGE_BAND
-        || p.y > hi - PLANE_EDGE_BAND;
-    if cornered {
-        // Banked by how far off the way home the nose is: hard over while it is
-        // pointed at the wall, and rolling level again as it comes round. A
-        // flat "full bank until it is inside" does not work, because the bank
-        // is *held* -- the aircraft would leave the band still hard over, circle
-        // straight back into it, and orbit the corner for the rest of its fuel.
-        let off = angle_delta(state.yaw, (Vec2::splat(WORLD_SIZE * 0.5) - p).to_angle());
-        let target = (off * PLANE_EDGE_GAIN).clamp(-PLANE_MAX_BANK, PLANE_MAX_BANK);
-        state.roll = approach(state.roll, target, PLANE_EDGE_ROLL_RATE * dt);
-    } else {
-        state.roll =
-            (state.roll + steer * PLANE_ROLL_RATE * dt).clamp(-PLANE_MAX_BANK, PLANE_MAX_BANK);
-    }
+    let target = PLANE_CRUISE + throttle.clamp(-1.0, 1.0) * PLANE_SPEED_TRIM;
+    state.speed = approach(state.speed, target, t.accel * dt);
+    state.roll =
+        (state.roll + steer * PLANE_ROLL_RATE * dt).clamp(-PLANE_MAX_BANK, PLANE_MAX_BANK);
 
     // Lift leans over with the wings, and its sideways part is the turn.
     // Normalised on the tangent at full bank so `PLANE_TURN_RATE` stays the
@@ -345,9 +328,18 @@ fn step_plane(state: &mut MoveState, throttle: f32, steer: f32, dt: f32) {
     let rate = t.turn_rate * state.roll.tan() / PLANE_MAX_BANK.tan();
     state.yaw = wrap_angle(state.yaw + rate * dt);
     state.pos += Vec2::from_angle(state.yaw) * (state.speed * dt);
+}
 
-    state.pos.x = state.pos.x.clamp(lo, hi);
-    state.pos.y = state.pos.y.clamp(lo, hi);
+/// Whether a sortie has flown out of the match.
+///
+/// Measured past the wall rather than at it, so the aircraft is seen to leave
+/// -- crossing the boundary and vanishing on the same frame reads as a bug
+/// rather than as a decision the player just made.
+pub fn plane_has_left(pos: Vec2) -> bool {
+    pos.x < -PLANE_EXIT_MARGIN
+        || pos.y < -PLANE_EXIT_MARGIN
+        || pos.x > WORLD_SIZE + PLANE_EXIT_MARGIN
+        || pos.y > WORLD_SIZE + PLANE_EXIT_MARGIN
 }
 
 /// Where a bomb released now will land.
@@ -426,10 +418,22 @@ pub const MISSILE_SEEK_RANGE: f32 = 120.0;
 /// [`BOMB_FALL_TIME`] have to move together.
 pub const PLANE_ALTITUDE: f32 = 26.0;
 
-/// Cruising speed, and the only speed it has. Getting on twice a tank's top
-/// speed, so crossing ground a tank has to fight across is most of what the
-/// aircraft is for.
+/// Airspeed with the stick centred. Getting on twice a tank's top speed, so
+/// crossing ground a tank has to fight across is most of what the aircraft is
+/// for.
 pub const PLANE_CRUISE: f32 = 34.0;
+
+/// How far the throttle moves the airspeed either side of [`PLANE_CRUISE`].
+///
+/// Bounded by the fastest thing on the ground rather than picked for feel: held
+/// hard back the aircraft still has to outrun a tank under Turbo, or the slow
+/// end stops reading as an aircraft at all. That leaves a shade under nine, and
+/// eight is the round number inside it.
+///
+/// It is enough to matter. Across the range the bombs land some twenty-two
+/// units apart -- nearly two blast radii -- which is the difference between
+/// walking a stick onto a target and dropping it short.
+pub const PLANE_SPEED_TRIM: f32 = 8.0;
 
 /// How fast the stick rolls the aircraft, in radians per second.
 ///
@@ -442,27 +446,11 @@ pub const PLANE_ROLL_RATE: f32 = 1.9;
 /// How far over it will go, in radians. Sixty degrees.
 pub const PLANE_MAX_BANK: f32 = 1.047;
 
-/// How fast the field edge rolls it away, in radians per second.
+/// How far past the wall a sortie flies before it is gone for good.
 ///
-/// Faster than the pilot's own stick, so the boundary is firm, and fast enough
-/// to reach a full bank while crossing [`PLANE_EDGE_BAND`] at cruise.
-pub const PLANE_EDGE_ROLL_RATE: f32 = 4.0;
-
-/// Bank the field edge asks for per radian the nose is off the way home.
-///
-/// Above one, so anything more than a modest angle away from the middle of the
-/// field asks for everything the wings have, and the last of the bank comes off
-/// only as the aircraft is very nearly pointed home.
-pub const PLANE_EDGE_GAIN: f32 = 1.6;
-
-/// How far in from the wall the aircraft starts being banked back.
-///
-/// Deliberately narrower than [`world::BASE_INSET`]. A corner base is one of
-/// the things worth flying all that way to bomb, and a band wide enough to
-/// cover one would wrestle the aircraft off its run every time it lined up.
-/// At [`BOMB_FALL_TIME`] a bomb is released some 47 units short of where it
-/// lands, so a base can be hit from well outside this.
-pub const PLANE_EDGE_BAND: f32 = 14.0;
+/// Comfortably more than the aircraft is long, so it leaves the field rather
+/// than blinking out on the boundary.
+pub const PLANE_EXIT_MARGIN: f32 = 14.0;
 
 /// Seconds of fuel in one sortie.
 ///
@@ -497,10 +485,24 @@ pub const BOMB_BLAST_RADIUS: f32 = 13.0;
 /// Damage a bomb does at the very centre of its blast, falling off to nothing
 /// at [`BOMB_BLAST_RADIUS`].
 ///
-/// A direct hit is worth about a missile and a half. A tank caught square by
-/// one loses most of a full shield, and one caught at the rim barely notices,
-/// which is what makes a stick of bombs about where they are put.
-pub const BOMB_DAMAGE: f32 = 86.0;
+/// Set by what a direct hit should be worth rather than by comparison with the
+/// other weapons, because landing one is nothing like firing them. A bomb is
+/// released some 47 units before it arrives, from an aircraft that is committed
+/// to a line and cannot stop, out of a sortie that comes round every
+/// forty-five seconds at best. Against anything that is moving and paying
+/// attention, most bombs miss.
+///
+/// So the number is the answer to "what is a hit worth": everything a
+/// harvester's shield has, and half of what is under it. That is 150 and 65 of
+/// a harvester's 130, and it falls out of [`apply_damage`] spilling the
+/// remainder from one into the other.
+///
+/// Two consequences worth knowing. A base tank has 210 between shield and hull
+/// and so does not survive a square hit at all -- which is the point of a
+/// weapon this hard to land. And because this is flat damage, like every other
+/// weapon here, upgrades are still worth having: a harvester carrying both
+/// Shield Booster and Armour keeps almost all of its hull.
+pub const BOMB_DAMAGE: f32 = 215.0;
 
 // ---------------------------------------------------------------------------
 // Impacts
@@ -918,27 +920,59 @@ mod tests {
         assert!(tank.pos.x < 150.0, "the tank should be stopped at the hill: {:?}", tank.pos);
     }
 
-    /// An aircraft holds one speed, whatever the pilot does with the throttle.
+    /// The throttle trims the airspeed, and cannot bring it near a stop.
     ///
-    /// A bomber that can be slowed down is a gun platform that happens to be in
-    /// the air, and the fuel clock stops meaning very much if you can sit still
-    /// on it. It is also what makes the speed a constant the wire never has to
-    /// carry and the bombsight can rely on, so "the throttle does nothing" is
-    /// load-bearing in three places rather than a shortcut.
+    /// Both halves matter. Without the trim there is no reason to touch the
+    /// throttle at all; without the floor under it the bomber becomes something
+    /// that can be parked over a target, which is a gun platform rather than an
+    /// aircraft and makes the fuel clock meaningless.
     #[test]
-    fn an_aircraft_holds_one_speed_however_it_is_flown() {
-        for throttle in [-1.0, -0.5, 0.0, 0.5, 1.0] {
-            let mut s = MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
+    fn the_throttle_trims_the_airspeed_but_never_stops_it() {
+        let settle = |throttle: f32| {
+            let mut s =
+                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
             for _ in 0..120 {
                 let _ =
                     step_vehicle(&mut s, throttle, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
             }
-            assert!(
-                (s.speed - PLANE_CRUISE).abs() < 1e-3,
-                "throttle {throttle} settled at {} rather than {PLANE_CRUISE}",
-                s.speed
-            );
-        }
+            s.speed
+        };
+
+        let slow = settle(-1.0);
+        let level = settle(0.0);
+        let fast = settle(1.0);
+        assert!((level - PLANE_CRUISE).abs() < 1e-3, "hands off settled at {level}");
+        assert!((slow - (PLANE_CRUISE - PLANE_SPEED_TRIM)).abs() < 1e-3, "slow was {slow}");
+        assert!((fast - (PLANE_CRUISE + PLANE_SPEED_TRIM)).abs() < 1e-3, "fast was {fast}");
+
+        // Even held hard back it outruns anything on the ground, so slowing
+        // down is a choice about the run and never a way to loiter.
+        let fastest_tank = tuning(VehicleKind::Tank).max_speed * speed_multiplier(
+            crate::world::PowerUp::Turbo.bit(),
+        );
+        assert!(slow > fastest_tank, "held back it does {slow}, under a tank's {fastest_tank}");
+    }
+
+    /// Changing speed changes where the bombs go, and the sight knows it.
+    ///
+    /// The throw ahead is the airspeed times the fall, so a slower run puts the
+    /// bombs closer in. That is most of the reason to touch the throttle, and
+    /// it only works because the sight is computed from the speed the aircraft
+    /// is actually doing rather than from the cruise it started at.
+    #[test]
+    fn a_slower_run_drops_its_bombs_shorter() {
+        let throw = |throttle: f32| {
+            let mut s =
+                MoveState { pos: vec2(240.0, 240.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
+            for _ in 0..120 {
+                let _ =
+                    step_vehicle(&mut s, throttle, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
+            }
+            bomb_impact(s.pos, s.yaw, s.speed).distance(s.pos)
+        };
+        let slow = throw(-1.0);
+        let fast = throw(1.0);
+        assert!(fast > slow + 20.0, "the throttle barely moved the aim point: {slow} to {fast}");
     }
 
     /// The stick banks the aircraft, and the bank is what turns it.
@@ -1032,28 +1066,53 @@ mod tests {
         assert!(half < full * 0.45, "half bank did {half} against a full {full}");
     }
 
-    /// The edge of the field turns an aircraft back rather than pinning it.
+    /// Nothing holds the aircraft inside the field, and leaving is leaving.
     ///
-    /// A tank clamped against the wall simply stops. Doing that to a plane
-    /// would leave it grinding along the boundary burning fuel with the stick
-    /// doing nothing, so the edge costs a turn instead -- and it has to be a
-    /// turn that actually brings it home, not one that holds it in the corner.
+    /// The boundary used to bank it back in, which kept every sortie over the
+    /// field at the cost of the boundary flying the aeroplane -- and it fought
+    /// the player hardest exactly where a corner base makes it worth being.
+    /// Flying out is now a thing you can do and a way to lose the aircraft, so
+    /// the wall has to let it through and `plane_has_left` has to say when it
+    /// has gone far enough to count.
     #[test]
-    fn the_field_edge_turns_an_aircraft_around() {
-        let mut s = MoveState { pos: vec2(WORLD_SIZE - 20.0, 100.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
-        for _ in 0..150 {
+    fn an_aircraft_can_be_flown_out_of_the_match() {
+        let mut s =
+            MoveState { pos: vec2(WORLD_SIZE - 20.0, 100.0), yaw: 0.0, speed: PLANE_CRUISE, roll: 0.0 };
+        assert!(!plane_has_left(s.pos), "it started outside the field");
+
+        // Held straight at the wall, wings level, with no stick input at all.
+        let mut crossed_the_wall = None;
+        let mut gone = None;
+        for tick in 0..120 {
             let _ = step_vehicle(&mut s, 0.0, 0.0, VehicleKind::Plane, 0, &[], world::TICK_DT);
-            assert!(
-                s.pos.x <= WORLD_SIZE + 1e-3 && s.pos.x >= -1e-3,
-                "the aircraft left the field at {:?}",
-                s.pos
-            );
+            if crossed_the_wall.is_none() && s.pos.x > WORLD_SIZE {
+                crossed_the_wall = Some(tick);
+            }
+            if gone.is_none() && plane_has_left(s.pos) {
+                gone = Some(tick);
+            }
         }
+        let crossed = crossed_the_wall.expect("it never reached the wall");
+        let gone = gone.expect("it never counted as having left");
         assert!(
-            s.pos.x < WORLD_SIZE - 20.0,
-            "it should have turned and be heading back in, not sat on the wall at {:?}",
-            s.pos
+            gone > crossed,
+            "the aircraft has to be seen to leave, not blink out on the boundary"
         );
+        assert_eq!(s.roll, 0.0, "the boundary is not allowed to fly it any more");
+    }
+
+    /// Being near the edge is not being over it.
+    #[test]
+    fn a_sortie_over_its_own_corner_has_not_left() {
+        // A base pad sits `BASE_INSET` in from two walls, and bombing one is
+        // among the things worth crossing the map for, so flying over one must
+        // not end the sortie.
+        for player in 0..world::MAX_PLAYERS as u8 {
+            let base = world::base_position(player);
+            assert!(!plane_has_left(base), "a base pad counts as off the field");
+        }
+        assert!(!plane_has_left(vec2(0.0, 0.0)), "the corner itself counts as off the field");
+        assert!(!plane_has_left(vec2(WORLD_SIZE, WORLD_SIZE)));
     }
 
     /// The bombsight has to be exactly where the bomb lands.
@@ -1086,6 +1145,61 @@ mod tests {
             "the throw ahead should be worth drawing a sight for, was {}",
             aimed.distance(plane.pos)
         );
+    }
+
+    /// What a direct hit is worth, which is what `BOMB_DAMAGE` is set from.
+    ///
+    /// A bomb is thrown 47 units ahead of an aircraft that cannot stop, out of
+    /// a sortie that comes round every forty-five seconds, so most of them
+    /// miss. The ones that do not have to be worth the wait: a harvester
+    /// caught square loses its shield entirely and half of the hull under it.
+    ///
+    /// Pinned here because it is a balance decision that a later change to any
+    /// of three separate numbers -- the damage, the falloff, or a harvester's
+    /// own tuning -- would quietly undo.
+    #[test]
+    fn a_direct_hit_strips_a_harvester_and_halves_what_is_left() {
+        let kind = VehicleKind::Harvester;
+        let mut shield = max_shield(kind, 0);
+        let mut hull = max_hull(kind, 0);
+        let full = max_hull(kind, 0);
+
+        let _ = apply_damage(
+            &mut shield,
+            &mut hull,
+            blast_damage(0.0, BOMB_BLAST_RADIUS, BOMB_DAMAGE),
+        );
+        assert_eq!(shield, 0.0, "the shield should be gone outright");
+        assert!(
+            (hull / full - 0.5).abs() < 0.02,
+            "it left {hull} of {full}, which is {:.0}% rather than half",
+            hull / full * 100.0
+        );
+
+        // A tank has less between it and the ground than a harvester does, so
+        // the same hit is the end of it. That is deliberate: this is the one
+        // weapon in the game that has to be worth a thousand ore to land.
+        let mut shield = max_shield(VehicleKind::Tank, 0);
+        let mut hull = max_hull(VehicleKind::Tank, 0);
+        let left = apply_damage(
+            &mut shield,
+            &mut hull,
+            blast_damage(0.0, BOMB_BLAST_RADIUS, BOMB_DAMAGE),
+        );
+        assert_eq!(left, 0.0, "a tank walked away from a bomb landing on it");
+
+        // Upgrades still buy something, which is what keeps the flat number
+        // honest rather than making Shield Booster pointless against the air.
+        let up = crate::world::PowerUp::ShieldBooster.bit()
+            | crate::world::PowerUp::HarvesterArmor.bit();
+        let mut shield = max_shield(kind, up);
+        let mut hull = max_hull(kind, up);
+        let left = apply_damage(
+            &mut shield,
+            &mut hull,
+            blast_damage(0.0, BOMB_BLAST_RADIUS, BOMB_DAMAGE),
+        );
+        assert!(left > max_hull(kind, up) * 0.9, "the upgrades bought nothing: {left} left");
     }
 
     /// A blast falls off, so a bomb is aimed at a place rather than a hull.

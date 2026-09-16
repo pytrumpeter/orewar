@@ -242,6 +242,7 @@ impl Player {
                 pos: v.mv.pos,
                 yaw: v.mv.yaw,
                 roll: v.mv.roll,
+                speed: v.mv.speed,
                 fuel: (v.fuel / sim::PLANE_FUEL).clamp(0.0, 1.0),
             }),
             plane_ready_in: self.sortie_cooldown.ceil().max(0.0) as u8,
@@ -369,6 +370,11 @@ pub struct Game {
     fx: Vec<HitFx>,
     /// Players who have ever joined, so a solo player is not declared winner.
     joined: u8,
+    /// Cheat mode: everything on the build list is free, and a sortie never
+    /// runs out of fuel. Deliberately match-wide -- see
+    /// [`ClientMessage::ToggleCheats`] -- and deliberately survives a restart,
+    /// because it is a way of looking at the game rather than part of a match.
+    pub cheats: bool,
 }
 
 impl Game {
@@ -387,6 +393,7 @@ impl Game {
             events: Vec::new(),
             fx: Vec::new(),
             joined: 0,
+            cheats: false,
         }
     }
 
@@ -548,16 +555,23 @@ impl Game {
         }
     }
 
+    /// Turns cheat mode on or off for everybody.
+    pub fn toggle_cheats(&mut self) {
+        self.cheats = !self.cheats;
+    }
+
     pub fn purchase(&mut self, id: u8, powerup: PowerUp) {
+        // Read before the player is borrowed.
+        let cost = if self.cheats { 0 } else { powerup.cost() };
         let Some(p) = self.player_mut(id) else { return };
         let event = if p.eliminated {
             GameEvent::PurchaseRejected { powerup, reason: RejectReason::Eliminated }
         } else if powerup.held(p.powerups) {
             GameEvent::PurchaseRejected { powerup, reason: RejectReason::AlreadyOwned }
-        } else if p.credits < powerup.cost() {
+        } else if p.credits < cost {
             GameEvent::PurchaseRejected { powerup, reason: RejectReason::NotEnoughCredits }
         } else {
-            p.credits -= powerup.cost();
+            p.credits -= cost;
             if powerup.is_consumable() {
                 p.missiles = p.missiles.saturating_add(MISSILES_PER_PACK);
             } else {
@@ -801,6 +815,7 @@ impl Game {
     /// of, an aircraft keeps flying straight and keeps burning fuel, which is
     /// the difference between it and a tank left parked.
     fn step_planes(&mut self, dt: f32) {
+        let cheats = self.cheats;
         for p in self.players.iter_mut().flatten() {
             p.sortie_cooldown = (p.sortie_cooldown - dt).max(0.0);
 
@@ -822,9 +837,15 @@ impl Game {
             // over, so the hull's heading is the only bearing it has.
             plane.turret_yaw = plane.mv.yaw;
             plane.gun_cooldown = (plane.gun_cooldown - dt).max(0.0);
-            plane.fuel -= dt;
+            if !cheats {
+                plane.fuel -= dt;
+            }
 
-            if plane.fuel <= 0.0 {
+            // Two ways a sortie ends: the tank runs dry, or it is flown out of
+            // the match. Nothing holds the aircraft inside the field, so the
+            // second is a choice the player makes -- and the only one of the
+            // two that cheat mode does not take away.
+            if plane.fuel <= 0.0 || sim::plane_has_left(plane.mv.pos) {
                 p.plane = None;
                 // Timed from the sortie ending rather than from the launch, so
                 // flying one badly and losing it early is not rewarded with a
@@ -1291,6 +1312,16 @@ impl Game {
         // them dropped across a position is for.
         for (owner, at) in blasts {
             self.fx.push(HitFx::on_terrain(HitKind::Blast, at));
+            // Ore in the blast is gone, not reduced. A deposit is the one thing
+            // on the field that cannot move out of the way, and denying one
+            // outright is the reason to spend a sortie on empty ground rather
+            // than on somebody's hull.
+            for (i, deposit) in self.ore.iter_mut().enumerate() {
+                if deposit.amount > 0.0 && deposit.pos.distance(at) <= sim::BOMB_BLAST_RADIUS {
+                    deposit.amount = 0.0;
+                    self.dirty_ore.insert(i as u16);
+                }
+            }
             for t in &targets {
                 if t.player == owner {
                     continue;
@@ -1751,6 +1782,7 @@ impl Game {
                     yaw: wrap_angle(p.yaw),
                 })
                 .collect(),
+            cheats: self.cheats,
             ore_is_full_sync: full_ore,
             ore,
             hits,
@@ -2654,18 +2686,194 @@ mod tests {
         assert!(bomb > 0.0, "the hill ate a bomb that was 26 units above it");
     }
 
+    /// Cheat mode opens the shop and fills the tank, for everybody at once.
+    ///
+    /// Match-wide is the point rather than a shortcut: a cheat that applied to
+    /// whoever pressed the key would be an advantage, and the reason this
+    /// exists is to be able to look at something quickly.
+    #[test]
+    fn cheat_mode_makes_the_list_free_and_the_fuel_endless() {
+        let mut g = two_player_game();
+        assert!(!g.cheats, "a match does not start in cheat mode");
+
+        // Ordinarily a thousand ore is out of reach on the opening credits.
+        g.purchase(0, PowerUp::Bomber);
+        assert!(!PowerUp::Bomber.held(g.player(0).unwrap().powerups));
+
+        g.toggle_cheats();
+
+        // Now anyone can have anything, and it costs nothing.
+        for id in [0, 1] {
+            let before = g.player(id).unwrap().credits;
+            g.purchase(id, PowerUp::Bomber);
+            assert!(PowerUp::Bomber.held(g.player(id).unwrap().powerups), "player {id}");
+            assert_eq!(g.player(id).unwrap().credits, before, "player {id} was charged");
+        }
+
+        // And a sortie flies on past the point it would have run dry.
+        g.launch_plane(0);
+        assert!(g.player(0).unwrap().plane.is_some());
+        for _ in 0..((sim::PLANE_FUEL * 2.0 / TICK_DT) as usize) {
+            g.step(TICK_DT);
+            // Kept over the middle, so this measures the fuel and not the map.
+            if let Some(plane) = g.player_mut(0).unwrap().plane.as_mut() {
+                plane.mv.pos = Vec2::splat(world::WORLD_SIZE * 0.5);
+            }
+        }
+        assert!(
+            g.player(0).unwrap().plane.is_some(),
+            "the sortie ran out of fuel with cheats on"
+        );
+
+        // Off again, and the ordinary rules come straight back.
+        g.toggle_cheats();
+        for _ in 0..((sim::PLANE_FUEL / TICK_DT) as usize + 5) {
+            g.step(TICK_DT);
+            if let Some(plane) = g.player_mut(0).unwrap().plane.as_mut() {
+                plane.mv.pos = Vec2::splat(world::WORLD_SIZE * 0.5);
+            }
+        }
+        assert!(g.player(0).unwrap().plane.is_none(), "the fuel never started burning again");
+    }
+
+    /// The throttle has to reach the aircraft through the whole input path.
+    ///
+    /// The flight model is tested in `sim`, which proves only that the numbers
+    /// work when something hands them over. This is the hand-over: a frame that
+    /// names the plane and asks for full throttle has to end up trimming the
+    /// airspeed, and every step between the two is somewhere it can be dropped.
+    #[test]
+    fn the_throttle_reaches_the_aircraft() {
+        let mut g = two_player_game();
+        launch_for(&mut g, 0);
+
+        // Ticks have to keep climbing across both runs: the server drops a
+        // frame whose tick it has already acknowledged, so restarting the count
+        // would quietly test nothing the second time round.
+        let mut tick = 0u32;
+        let mut fly = |g: &mut Game, throttle: f32| {
+            for _ in 0..60 {
+                tick += 1;
+                g.set_input(
+                    0,
+                    InputFrame {
+                        tick,
+                        controlling: VehicleSlot::Plane,
+                        throttle,
+                        ..Default::default()
+                    },
+                );
+                g.step(TICK_DT);
+                // Held over the middle so it cannot fly out of the match.
+                if let Some(plane) = g.player_mut(0).unwrap().plane.as_mut() {
+                    plane.mv.pos = Vec2::splat(world::WORLD_SIZE * 0.5);
+                }
+            }
+            g.player(0).unwrap().plane.as_ref().unwrap().mv.speed
+        };
+
+        let fast = fly(&mut g, 1.0);
+        assert!(
+            fast > sim::PLANE_CRUISE + sim::PLANE_SPEED_TRIM - 0.5,
+            "full throttle only reached {fast}, against a cruise of {}",
+            sim::PLANE_CRUISE
+        );
+        let slow = fly(&mut g, -1.0);
+        assert!(
+            slow < sim::PLANE_CRUISE - sim::PLANE_SPEED_TRIM + 0.5,
+            "held back it still did {slow}"
+        );
+    }
+
+    /// Flying out of the match is a way to lose the aircraft.
+    ///
+    /// Nothing holds it inside the field any more, so this is the other way a
+    /// sortie ends -- and the only one cheat mode does not take away.
+    #[test]
+    fn flying_out_of_the_field_ends_the_sortie() {
+        let mut g = two_player_game();
+        launch_for(&mut g, 0);
+        g.toggle_cheats(); // even with the fuel switched off
+
+        // Pointed at the nearest wall and left to fly.
+        {
+            let plane = g.player_mut(0).unwrap().plane.as_mut().unwrap();
+            plane.mv = MoveState {
+                pos: Vec2::new(world::WORLD_SIZE - 10.0, world::WORLD_SIZE * 0.5),
+                yaw: 0.0,
+                speed: sim::PLANE_CRUISE,
+                roll: 0.0,
+            };
+        }
+        for _ in 0..120 {
+            g.step(TICK_DT);
+        }
+        let p = g.player(0).unwrap();
+        assert!(p.plane.is_none(), "it flew off the map and stayed in the match");
+        assert!(p.sortie_cooldown > 0.0, "leaving did not start the cooldown");
+    }
+
+    /// A bomb takes a deposit out entirely, and only the one it landed on.
+    ///
+    /// This is the reason to spend a sortie on empty ground: ore is the one
+    /// thing on the field that cannot be driven out of the way, and denying a
+    /// deposit is worth more than the hull that was standing next to it.
+    #[test]
+    fn a_bomb_destroys_the_ore_it_lands_on() {
+        let mut g = two_player_game();
+        g.hills.clear();
+        let at = Vec2::new(200.0, 200.0);
+        g.ore = vec![
+            OreDeposit { pos: at, amount: 900.0, capacity: 900.0 },
+            OreDeposit {
+                pos: at + Vec2::new(sim::BOMB_BLAST_RADIUS + 6.0, 0.0),
+                amount: 900.0,
+                capacity: 900.0,
+            },
+        ];
+        g.clear_dirty_ore();
+
+        g.projectiles.push(Projectile {
+            id: 910,
+            kind: ProjectileKind::Bomb,
+            owner: 0,
+            pos: at,
+            yaw: 0.0,
+            speed: 0.0,
+            life: TICK_DT * 0.5,
+        });
+        g.step(TICK_DT);
+
+        assert_eq!(g.ore[0].amount, 0.0, "one bomb should have emptied it outright");
+        assert_eq!(g.ore[1].amount, 900.0, "a deposit clear of the blast was taken with it");
+    }
+
     /// A blast is aimed at a place: near misses hurt, far ones do not.
     #[test]
     fn a_bomb_hurts_what_is_near_where_it_lands() {
+        // Measured on a harvester rather than a tank, and on shield *and* hull
+        // rather than shield alone. A bomb now takes a base tank apart in one
+        // hit, so a tank would stop existing part way through the experiment
+        // and take the reading with it; a harvester is disabled rather than
+        // destroyed and stays there to be measured.
         let damage_at = |offset: f32| {
             let mut g = two_player_game();
             g.hills.clear();
             let at = Vec2::new(200.0, 200.0);
             {
-                let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
-                t.mv = MoveState { pos: at + Vec2::new(offset, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
+                let h = g.player_mut(1).unwrap().harvester.as_mut().unwrap();
+                h.mv = MoveState {
+                    pos: at + Vec2::new(offset, 0.0),
+                    yaw: 0.0,
+                    speed: 0.0,
+                    roll: 0.0,
+                };
             }
-            let before = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+            let taken = |g: &Game| {
+                let h = g.player(1).unwrap().harvester.as_ref().unwrap();
+                h.shield + h.hull
+            };
+            let before = taken(&g);
             // Dropped straight down: no travel, so it lands exactly here.
             g.projectiles.push(Projectile {
                 id: 901,
@@ -2677,15 +2885,21 @@ mod tests {
                 life: TICK_DT * 0.5,
             });
             g.step(TICK_DT);
-            before - g.player(1).unwrap().tank.as_ref().unwrap().shield
+            before - taken(&g)
         };
 
         let direct = damage_at(0.0);
         let near = damage_at(sim::BOMB_BLAST_RADIUS * 0.6);
         let clear = damage_at(sim::BOMB_BLAST_RADIUS + 5.0);
-        assert!(direct > 0.0, "a bomb landing on a tank did nothing");
+        assert!(direct > 0.0, "a bomb landing on a harvester did nothing");
         assert!(near > 0.0 && near < direct, "the falloff is not a slope: {direct} then {near}");
         assert_eq!(clear, 0.0, "a bomb outside its own radius still did {clear}");
+        // The whole point of the change: a hit is worth the sortie it took.
+        assert!(
+            direct >= sim::BOMB_DAMAGE - 0.5,
+            "a square hit only took {direct} of {}",
+            sim::BOMB_DAMAGE
+        );
     }
 
     /// Nothing on the ground can bring the aircraft down.

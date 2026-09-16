@@ -297,7 +297,10 @@ pub fn sync_bombsight(
     if material.0 != assets.sight[idx] {
         material.0 = assets.sight[idx].clone();
     }
-    let at = sim::bomb_impact(plane.pos, plane.yaw, sim::PLANE_CRUISE);
+    // The aircraft's actual airspeed, not the cruise: the throttle moves the
+    // aim point by some twenty-two units across its range, which is most of the
+    // reason to touch it.
+    let at = sim::bomb_impact(plane.pos, plane.yaw, plane.speed);
     // Just clear of the ground so the ring does not fight the grass for depth.
     transform.translation = coords::sim_to_world_at(at, 0.12);
 }
