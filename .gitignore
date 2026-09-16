@@ -8,3 +8,8 @@
 # Identity token the client writes when it is run without --name, so a player
 # returns to the same slot after a restart. Local to one machine.
 .orewar-token
+
+# A second checkout kept alongside this one to build for another architecture.
+# Its sources are a copy; the 2 GB is its own target/, which /target above does
+# not reach because that pattern is anchored to the repository root.
+/orewar_arm
