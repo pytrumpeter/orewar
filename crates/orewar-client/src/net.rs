@@ -14,7 +14,7 @@ use bevy::prelude::*;
 use orewar_shared::bytes::{Decode, Encode};
 use orewar_shared::net::{Endpoint, MAX_PACKET, PacketKind, begin_packet, parse_packet};
 use orewar_shared::protocol::{
-    ClientMessage, DenyReason, GameEvent, HarvesterMode, InputFrame, PROTOCOL_ID,
+    ClientMessage, DenyReason, GameEvent, MinerMode, InputFrame, PROTOCOL_ID,
     ServerMessage,
 };
 use orewar_shared::sim;
@@ -147,9 +147,9 @@ impl NetClient {
     }
 
     /// Asks the server to restart the match for everyone on a fresh map.
-    /// Tells the server what the harvester should do when left alone.
-    pub fn set_harvester_mode(&mut self, mode: HarvesterMode) {
-        self.send_reliable(&ClientMessage::SetHarvesterMode(mode));
+    /// Tells the server what the miner should do when left alone.
+    pub fn set_miner_mode(&mut self, mode: MinerMode) {
+        self.send_reliable(&ClientMessage::SetMinerMode(mode));
     }
 
     pub fn request_new_game(&mut self) {
@@ -413,18 +413,18 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
             "Your tank is back on the field".to_string()
         }
         GameEvent::TankRespawned { .. } => return None,
-        GameEvent::HarvesterDisabled { player } => {
+        GameEvent::MinerDisabled { player } => {
             if Some(player) == me {
-                "Your harvester is disabled -- defend it!".to_string()
+                "Your miner is disabled -- defend it!".to_string()
             } else {
-                format!("{}'s harvester is disabled", name(player))
+                format!("{}'s miner is disabled", name(player))
             }
         }
-        GameEvent::HarvesterRescued { player } => {
+        GameEvent::MinerRescued { player } => {
             if Some(player) == me {
-                "Your harvester is back online".to_string()
+                "Your miner is back online".to_string()
             } else {
-                format!("{} rescued their harvester", name(player))
+                format!("{} rescued their miner", name(player))
             }
         }
         GameEvent::SentinelDestroyed { player } => {
@@ -447,8 +447,8 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
                 format!("{} seized {amount} ore from {}", name(by), name(from))
             }
         }
-        GameEvent::HarvesterCaptured { by, from } => {
-            format!("{} captured {}'s harvester", name(by), name(from))
+        GameEvent::MinerCaptured { by, from } => {
+            format!("{} captured {}'s miner", name(by), name(from))
         }
         // A capture puts you off the field for a minute and then hands you a
         // fresh pair of vehicles and an empty bank -- unless it also emptied
@@ -456,7 +456,7 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
         // that counts and this note is overtaken a moment later.
         GameEvent::PlayerEliminated { player } => {
             if Some(player) == me {
-                format!("Harvester lost -- back in {:.0}s", sim::CAPTURE_LOCKOUT)
+                format!("Miner lost -- back in {:.0}s", sim::CAPTURE_LOCKOUT)
             } else {
                 format!("{} is down for a minute", name(player))
             }

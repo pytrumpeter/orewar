@@ -18,7 +18,7 @@ use crate::state::GameState;
 pub const SKY_COLOR: Color = Color::srgb(0.44, 0.66, 0.92);
 
 /// Radius of a full deposit's patch of ore-bearing rock, in world units. Kept
-/// comfortably inside `sim::HARVEST_RADIUS` so that parking anywhere on the
+/// comfortably inside `sim::MINING_RADIUS` so that parking anywhere on the
 /// visible rock is enough to mine it.
 const ORE_PATCH_RADIUS: f32 = 5.4;
 /// How far the tallest shard stands proud of the grass. Deliberately small:

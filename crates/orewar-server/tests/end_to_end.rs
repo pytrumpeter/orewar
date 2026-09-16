@@ -245,7 +245,7 @@ fn a_client_can_join_and_receives_the_world() {
 
     let me = client.me().expect("our own player should be in the snapshot");
     assert!(me.tank.is_some(), "we should start with a tank");
-    assert!(me.harvester.is_some(), "we should start with a harvester");
+    assert!(me.miner.is_some(), "we should start with a miner");
 
     // One player alone is not a match.
     assert_eq!(client.latest.as_ref().unwrap().status, GameStatus::Waiting);

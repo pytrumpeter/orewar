@@ -11,7 +11,7 @@ mod camera;
 mod coords;
 mod effects;
 mod field;
-mod harvester_panel;
+mod miner_panel;
 mod hud;
 mod input;
 mod menu;
@@ -209,7 +209,7 @@ fn main() {
                 camera::setup,
                 hud::setup,
                 menu::setup,
-                harvester_panel::setup,
+                miner_panel::setup,
                 sentinels::setup,
                 effects::setup,
             ),
@@ -245,7 +245,7 @@ fn main() {
                     hud::update_bars,
                     hud::update_panels,
                     hud::update_radar,
-                    harvester_panel::update,
+                    miner_panel::update,
                 ),
                 // After the render view is rebuilt: a shield arc rides the
                 // interpolated hull, not the one from last frame.

@@ -14,7 +14,7 @@ use crate::world::{self, Hill, PowerUp, WORLD_SIZE};
 #[repr(u8)]
 pub enum VehicleKind {
     Tank = 0,
-    Harvester = 1,
+    Miner = 1,
     /// The bomber. Flown, not driven: it holds one cruising speed, turns with
     /// the stick, and passes over everything the other two have to go around.
     Plane = 2,
@@ -24,7 +24,7 @@ impl VehicleKind {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(VehicleKind::Tank),
-            1 => Some(VehicleKind::Harvester),
+            1 => Some(VehicleKind::Miner),
             2 => Some(VehicleKind::Plane),
             _ => None,
         }
@@ -61,7 +61,7 @@ pub fn tuning(kind: VehicleKind) -> VehicleTuning {
             base_shield: 110.0,
             base_hull: 100.0,
         },
-        VehicleKind::Harvester => VehicleTuning {
+        VehicleKind::Miner => VehicleTuning {
             max_speed: 11.5,
             reverse_speed: 6.0,
             accel: 15.0,
@@ -106,7 +106,7 @@ pub fn max_shield(kind: VehicleKind, powerups: u16) -> f32 {
 
 pub fn max_hull(kind: VehicleKind, powerups: u16) -> f32 {
     let base = tuning(kind).base_hull;
-    if kind == VehicleKind::Harvester && PowerUp::HarvesterArmor.held(powerups) {
+    if kind == VehicleKind::Miner && PowerUp::MinerArmor.held(powerups) {
         base + 60.0
     } else {
         base
@@ -128,7 +128,7 @@ pub fn bullet_lifetime(powerups: u16) -> f32 {
 
 /// Shell life for a gun that engages at a fixed range of its own.
 ///
-/// The emplacement in a player's corner and the harvester's auto turret stop
+/// The emplacement in a player's corner and the miner's auto turret stop
 /// firing at [`SENTINEL_RANGE`] and [`AUTO_TURRET_RANGE`], so their shells are
 /// sized from those rather than from the tank's gun -- which is tuned for how a
 /// gunfight should feel and has been shortened twice.
@@ -145,7 +145,7 @@ pub fn shell_life_covering(range: f32) -> f32 {
 
 pub fn cargo_capacity(powerups: u16) -> f32 {
     let base = 60.0;
-    if PowerUp::HarvesterArmor.held(powerups) { base * 1.25 } else { base }
+    if PowerUp::MinerArmor.held(powerups) { base * 1.25 } else { base }
 }
 
 pub fn shield_regen_rate(powerups: u16) -> f32 {
@@ -493,14 +493,14 @@ pub const BOMB_BLAST_RADIUS: f32 = 13.0;
 /// attention, most bombs miss.
 ///
 /// So the number is the answer to "what is a hit worth": everything a
-/// harvester's shield has, and half of what is under it. That is 150 and 65 of
-/// a harvester's 130, and it falls out of [`apply_damage`] spilling the
+/// miner's shield has, and half of what is under it. That is 150 and 65 of
+/// a miner's 130, and it falls out of [`apply_damage`] spilling the
 /// remainder from one into the other.
 ///
 /// Two consequences worth knowing. A base tank has 210 between shield and hull
 /// and so does not survive a square hit at all -- which is the point of a
 /// weapon this hard to land. And because this is flat damage, like every other
-/// weapon here, upgrades are still worth having: a harvester carrying both
+/// weapon here, upgrades are still worth having: a miner carrying both
 /// Shield Booster and Armour keeps almost all of its hull.
 pub const BOMB_DAMAGE: f32 = 215.0;
 
@@ -531,12 +531,12 @@ pub const RAM_SPEED_LOSS: f32 = 0.55;
 /// Seconds without taking damage before shields begin to regenerate.
 pub const SHIELD_REGEN_DELAY: f32 = 4.0;
 
-/// How long losing your harvester keeps you off the field.
+/// How long losing your miner keeps you off the field.
 ///
 /// Long enough to be the worst thing that can happen to you and short enough
 /// that it is a setback rather than the end of your match -- as long as there
 /// is somebody else still playing to come back to. In a two-player match there
-/// is not, and losing your harvester loses it: the win goes to whoever is left
+/// is not, and losing your miner loses it: the win goes to whoever is left
 /// on the field, and it goes the moment the capture lands.
 pub const CAPTURE_LOCKOUT: f32 = 60.0;
 
@@ -544,7 +544,7 @@ pub const CAPTURE_LOCKOUT: f32 = 60.0;
 ///
 /// The ending that matters is being the last one on the field. This is the
 /// other way home for a bigger match, where a capture keeps putting somebody
-/// off for a minute and everybody keeps coming back: take three harvesters and
+/// off for a minute and everybody keeps coming back: take three miners and
 /// it is yours whoever is still standing.
 pub const CAPTURES_TO_WIN: u8 = 3;
 
@@ -580,33 +580,33 @@ pub const AUTO_TURRET_COOLDOWN: f32 = 0.9;
 pub const TANK_RESPAWN_DELAY: f32 = 8.0;
 
 // Economy.
-pub const HARVEST_RADIUS: f32 = 7.5;
-pub const HARVEST_RATE: f32 = 15.0;
-/// A harvester must be nearly stationary to draw ore.
-pub const HARVEST_MAX_SPEED: f32 = 4.0;
+pub const MINING_RADIUS: f32 = 7.5;
+pub const MINING_RATE: f32 = 15.0;
+/// A miner must be nearly stationary to draw ore.
+pub const MINING_MAX_SPEED: f32 = 4.0;
 pub const UNLOAD_RATE: f32 = 50.0;
 
 // Capture.
-/// How close a tank has to be to a disabled harvester to work on it.
+/// How close a tank has to be to a disabled miner to work on it.
 ///
 /// Just past touching: the two hulls meet at 2.4 + 2.9 = 5.3 and vehicles no
 /// longer share space, so anything at or below that could never be reached.
-/// Small on purpose -- at 11.0 a tank covered its own harvester from where it
+/// Small on purpose -- at 11.0 a tank covered its own miner from where it
 /// spawned, so a defender never had to do anything to deny a capture.
 pub const CAPTURE_RADIUS: f32 = 6.5;
-/// Seconds an enemy tank must hold station to take a disabled harvester.
+/// Seconds an enemy tank must hold station to take a disabled miner.
 pub const CAPTURE_TIME: f32 = 4.0;
-/// How fast an owner's tank repairs their own disabled harvester.
+/// How fast an owner's tank repairs their own disabled miner.
 ///
 /// Deliberately slow enough that a rescue takes longer than [`CAPTURE_TIME`].
 /// At 11.0 it took three seconds against a four-second capture, so disabling a
-/// harvester achieved nothing: the attacker still had to cross the ground to
+/// miner achieved nothing: the attacker still had to cross the ground to
 /// the wreck and then hold it, while the defender only had to already be
 /// standing there -- which they are, since a tank spawns and respawns inside
-/// [`CAPTURE_RADIUS`] of its own harvester. The wreck was repaired before the
+/// [`CAPTURE_RADIUS`] of its own miner. The wreck was repaired before the
 /// attacker could arrive, every time.
 pub const RESCUE_REPAIR_RATE: f32 = 4.5;
-/// Hull fraction at which a rescued harvester comes back online.
+/// Hull fraction at which a rescued miner comes back online.
 pub const REENABLE_HULL_FRACTION: f32 = 0.25;
 
 /// Applies damage to shields first, then hull. Returns the remaining hull.
@@ -686,12 +686,12 @@ pub fn overlap_push(a: Vec2, ra: f32, b: Vec2, rb: f32) -> Option<(Vec2, f32)> {
 // Autopilot
 // ---------------------------------------------------------------------------
 
-/// Cruise throttle for an unattended harvester, as a fraction of full.
+/// Cruise throttle for an unattended miner, as a fraction of full.
 ///
-/// Deliberately slow. An autopilot harvester is a floor on your income, not a
+/// Deliberately slow. An autopilot miner is a floor on your income, not a
 /// replacement for driving one -- taking it over yourself should be visibly
 /// worth doing. It also keeps the cruise well under [`IMPACT_THRESHOLD`], so a
-/// harvester left to itself can never crash into a hillside hard enough to hurt.
+/// miner left to itself can never crash into a hillside hard enough to hurt.
 pub const AUTOPILOT_CRUISE: f32 = 0.4;
 
 /// How wide of a hill the autopilot tries to pass.
@@ -704,7 +704,7 @@ pub const AUTOPILOT_STALL_SPEED: f32 = 0.5;
 ///
 /// The direct bearing, unless a hill sits across it -- then the tangent past the
 /// side the target is already on. Driving straight at a target behind a hill
-/// parks the harvester against the slope indefinitely: the push-out in
+/// parks the miner against the slope indefinitely: the push-out in
 /// [`step_vehicle`] holds it clear, and it drives straight back in.
 pub fn autopilot_bearing(from: Vec2, to: Vec2, hills: &[Hill]) -> f32 {
     let direct = (to - from).to_angle();
@@ -745,10 +745,10 @@ pub fn autopilot_bearing(from: Vec2, to: Vec2, hills: &[Hill]) -> f32 {
     wrap_angle(to_hill + side * (radius / distance).clamp(-1.0, 1.0).asin())
 }
 
-/// Throttle and steer for a harvester driving itself to `target`.
+/// Throttle and steer for a miner driving itself to `target`.
 ///
 /// Returns neutral once inside `stop_within`, so the vehicle brakes and settles
-/// under [`HARVEST_MAX_SPEED`] rather than circling the thing it came for.
+/// under [`MINING_MAX_SPEED`] rather than circling the thing it came for.
 pub fn autopilot(state: &MoveState, target: Vec2, stop_within: f32, hills: &[Hill]) -> (f32, f32) {
     if state.pos.distance(target) <= stop_within {
         return (0.0, 0.0);
@@ -1151,15 +1151,15 @@ mod tests {
     ///
     /// A bomb is thrown 47 units ahead of an aircraft that cannot stop, out of
     /// a sortie that comes round every forty-five seconds, so most of them
-    /// miss. The ones that do not have to be worth the wait: a harvester
+    /// miss. The ones that do not have to be worth the wait: a miner
     /// caught square loses its shield entirely and half of the hull under it.
     ///
     /// Pinned here because it is a balance decision that a later change to any
-    /// of three separate numbers -- the damage, the falloff, or a harvester's
+    /// of three separate numbers -- the damage, the falloff, or a miner's
     /// own tuning -- would quietly undo.
     #[test]
-    fn a_direct_hit_strips_a_harvester_and_halves_what_is_left() {
-        let kind = VehicleKind::Harvester;
+    fn a_direct_hit_strips_a_miner_and_halves_what_is_left() {
+        let kind = VehicleKind::Miner;
         let mut shield = max_shield(kind, 0);
         let mut hull = max_hull(kind, 0);
         let full = max_hull(kind, 0);
@@ -1176,7 +1176,7 @@ mod tests {
             hull / full * 100.0
         );
 
-        // A tank has less between it and the ground than a harvester does, so
+        // A tank has less between it and the ground than a miner does, so
         // the same hit is the end of it. That is deliberate: this is the one
         // weapon in the game that has to be worth a thousand ore to land.
         let mut shield = max_shield(VehicleKind::Tank, 0);
@@ -1191,7 +1191,7 @@ mod tests {
         // Upgrades still buy something, which is what keeps the flat number
         // honest rather than making Shield Booster pointless against the air.
         let up = crate::world::PowerUp::ShieldBooster.bit()
-            | crate::world::PowerUp::HarvesterArmor.bit();
+            | crate::world::PowerUp::MinerArmor.bit();
         let mut shield = max_shield(kind, up);
         let mut hull = max_hull(kind, up);
         let left = apply_damage(
@@ -1294,7 +1294,7 @@ mod tests {
         assert!(bearing.abs() < 1e-4, "nothing crosses the path, got {bearing}");
     }
 
-    /// The case that would otherwise wedge a harvester forever: a hill sitting
+    /// The case that would otherwise wedge a miner forever: a hill sitting
     /// squarely between it and where it is going.
     #[test]
     fn the_autopilot_rounds_a_hill_on_the_way_to_its_target() {
@@ -1313,7 +1313,7 @@ mod tests {
                 &mut s,
                 throttle,
                 steer,
-                VehicleKind::Harvester,
+                VehicleKind::Miner,
                 0,
                 &[hill],
                 world::TICK_DT,
@@ -1336,11 +1336,11 @@ mod tests {
         assert_eq!((throttle, steer), (0.0, 0.0), "inside the stop radius it coasts");
     }
 
-    /// The cruise has to stay under the speed that hurts, or a harvester left
+    /// The cruise has to stay under the speed that hurts, or a miner left
     /// to itself would grind its own hull away on the scenery.
     #[test]
     fn the_autopilot_cruises_too_slowly_to_hurt_itself() {
-        let top = tuning(VehicleKind::Harvester).max_speed;
+        let top = tuning(VehicleKind::Miner).max_speed;
         assert!(top * AUTOPILOT_CRUISE < IMPACT_THRESHOLD);
     }
 
@@ -1372,7 +1372,7 @@ mod tests {
                     &mut s,
                     throttle,
                     steer,
-                    VehicleKind::Harvester,
+                    VehicleKind::Miner,
                     0,
                     &[],
                     world::TICK_DT,
@@ -1472,9 +1472,9 @@ mod tests {
     }
 
     #[test]
-    fn armor_raises_only_the_harvester_hull() {
-        let mask = PowerUp::HarvesterArmor.bit();
-        assert!(max_hull(VehicleKind::Harvester, mask) > max_hull(VehicleKind::Harvester, 0));
+    fn armor_raises_only_the_miner_hull() {
+        let mask = PowerUp::MinerArmor.bit();
+        assert!(max_hull(VehicleKind::Miner, mask) > max_hull(VehicleKind::Miner, 0));
         assert_eq!(max_hull(VehicleKind::Tank, mask), max_hull(VehicleKind::Tank, 0));
         assert!(cargo_capacity(mask) > cargo_capacity(0));
     }

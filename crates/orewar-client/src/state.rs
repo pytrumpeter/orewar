@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 use orewar_shared::math::{self, Vec2 as SimVec2};
 use orewar_shared::protocol::{
-    GameStatus, HarvesterMode, HitFx, InputFrame, PlaneSnapshot, PlayerInfo, ProjectileKind,
+    GameStatus, MinerMode, HitFx, InputFrame, PlaneSnapshot, PlayerInfo, ProjectileKind,
     Snapshot, VehicleSlot, VehicleSnapshot,
 };
 use orewar_shared::sim::{self, MoveState};
@@ -140,13 +140,13 @@ pub struct RenderPlayer {
     pub powerups: u16,
     pub missiles: u8,
     pub captures: u8,
-    /// What the harvester does when nobody is driving it.
-    pub harvester_mode: HarvesterMode,
+    /// What the miner does when nobody is driving it.
+    pub miner_mode: MinerMode,
     /// Seconds until a captured player is back on the field; zero when they
     /// are on it.
     pub respawn_in: u8,
     pub tank: Option<RenderVehicle>,
-    pub harvester: Option<RenderVehicle>,
+    pub miner: Option<RenderVehicle>,
     /// Absent while the emplacement is rubble.
     pub sentinel: Option<RenderSentinel>,
     /// Present only while a sortie is in the air. Its `cargo` is the fuel left,
@@ -160,7 +160,7 @@ impl RenderPlayer {
     pub fn vehicle(&self, slot: VehicleSlot) -> Option<&RenderVehicle> {
         match slot {
             VehicleSlot::Tank => self.tank.as_ref(),
-            VehicleSlot::Harvester => self.harvester.as_ref(),
+            VehicleSlot::Miner => self.miner.as_ref(),
             VehicleSlot::Plane => self.plane.as_ref(),
         }
     }
@@ -531,7 +531,7 @@ impl GameState {
                 let as_plane = me.plane.as_ref().map(plane_as_vehicle);
                 let vehicle = match slot {
                     VehicleSlot::Tank => me.tank.as_ref(),
-                    VehicleSlot::Harvester => me.harvester.as_ref(),
+                    VehicleSlot::Miner => me.miner.as_ref(),
                     VehicleSlot::Plane => as_plane.as_ref(),
                 };
                 // The bank is not on a `VehicleSnapshot` -- only an aircraft
@@ -604,7 +604,7 @@ impl GameState {
                         (_, Some(vb)) => Some(RenderVehicle::from_snapshot(&vb)),
                         _ => None,
                     };
-                    let harvester = match (pa.and_then(|p| p.harvester), pb.harvester) {
+                    let miner = match (pa.and_then(|p| p.miner), pb.miner) {
                         (Some(va), Some(vb)) => Some(RenderVehicle::lerp(&va, &vb, t)),
                         (_, Some(vb)) => Some(RenderVehicle::from_snapshot(&vb)),
                         _ => None,
@@ -649,10 +649,10 @@ impl GameState {
                             powerups: pb.powerups,
                             missiles: pb.missiles,
                             captures: pb.captures,
-                            harvester_mode: pb.harvester_mode,
+                            miner_mode: pb.miner_mode,
                             respawn_in: pb.respawn_in,
                             tank,
-                            harvester,
+                            miner,
                             sentinel,
                             plane,
                             plane_ready_in: pb.plane_ready_in,
@@ -693,10 +693,10 @@ impl GameState {
                                 powerups: p.powerups,
                                 missiles: p.missiles,
                                 captures: p.captures,
-                                harvester_mode: p.harvester_mode,
+                                miner_mode: p.miner_mode,
                                 respawn_in: p.respawn_in,
                                 tank: p.tank.as_ref().map(RenderVehicle::from_snapshot),
-                                harvester: p.harvester.as_ref().map(RenderVehicle::from_snapshot),
+                                miner: p.miner.as_ref().map(RenderVehicle::from_snapshot),
                                 sentinel: p.sentinel.map(|s| RenderSentinel {
                                     hull: s.hull,
                                     turret_yaw: s.turret_yaw,
@@ -731,7 +731,7 @@ impl GameState {
             if let Some(Some(player)) = players.get_mut(local as usize) {
                 let target = match slot {
                     VehicleSlot::Tank => player.tank.as_mut(),
-                    VehicleSlot::Harvester => player.harvester.as_mut(),
+                    VehicleSlot::Miner => player.miner.as_mut(),
                     VehicleSlot::Plane => player.plane.as_mut(),
                 };
                 if let Some(v) = target {
@@ -1042,7 +1042,7 @@ mod tests {
         p.apply(
             InputFrame {
                 tick: 1,
-                controlling: VehicleSlot::Harvester,
+                controlling: VehicleSlot::Miner,
                 throttle: 1.0,
                 ..Default::default()
             },

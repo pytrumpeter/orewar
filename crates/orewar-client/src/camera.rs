@@ -7,7 +7,7 @@
 //!
 //! The overview is the other half of that: a high, free camera you can pan and
 //! zoom over the whole field. It comes up on its own for the minute you are off
-//! the field after losing a harvester, since there is nothing to chase, and can
+//! the field after losing a miner, since there is nothing to chase, and can
 //! be raised at any other time with the overview key.
 
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
@@ -127,7 +127,7 @@ pub fn overview_controls(
     time: Res<Time>,
     mut overview: ResMut<Overview>,
 ) {
-    // Off the field after losing a harvester: there is no vehicle to chase, so
+    // Off the field after losing a miner: there is no vehicle to chase, so
     // the overview is the only sensible thing to show, whether it was asked for
     // or not.
     let waiting = state.local().is_some_and(|p| p.respawn_in > 0);
@@ -209,7 +209,7 @@ pub fn overview_controls(
     }
 
     // Right button drags the map. The left one is left alone so the buttons
-    // floating over the harvester stay clickable from up here.
+    // floating over the miner stay clickable from up here.
     let dragged: Vec2 = if buttons.pressed(MouseButton::Right) {
         motion.read().map(|m| m.delta).sum()
     } else {

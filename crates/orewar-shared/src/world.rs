@@ -21,11 +21,11 @@ pub const DEFAULT_PORT: u16 = 45_701;
 
 /// How far a base pad sits in from the two edges of its corner.
 pub const BASE_INSET: f32 = 24.0;
-/// A harvester within this distance of its own pad unloads its cargo.
+/// A miner within this distance of its own pad unloads its cargo.
 pub const BASE_RADIUS: f32 = 13.0;
 /// How far into the corner the gun emplacement sits. Behind the pad, and
 /// clear of it: 24 - 11 across both axes puts it about 18 out from the pad
-/// centre, past the 13 a harvester unloads within.
+/// centre, past the 13 a miner unloads within.
 pub const SENTINEL_INSET: f32 = 11.0;
 
 /// Per-player identity colors, chosen to stay distinct against green grass.
@@ -53,7 +53,7 @@ pub fn rotate_quarter(p: Vec2, times: u32) -> Vec2 {
 /// game starts at maximum separation.
 const CORNER_ORDER: [u32; MAX_PLAYERS] = [0, 2, 1, 3];
 
-/// Center of `player`'s home pad, where their harvester unloads ore.
+/// Center of `player`'s home pad, where their miner unloads ore.
 pub fn base_position(player: u8) -> Vec2 {
     let idx = player as usize % MAX_PLAYERS;
     rotate_quarter(vec2(BASE_INSET, BASE_INSET), CORNER_ORDER[idx])
@@ -65,13 +65,13 @@ pub fn base_position(player: u8) -> Vec2 {
 /// Built through `rotate_quarter` like everything else on the map, so all
 /// four sit identically under the quadrant symmetry. Far enough back that it
 /// covers the pad without standing on it, which would put it between a
-/// harvester and the spot it unloads at.
+/// miner and the spot it unloads at.
 pub fn sentinel_position(player: u8) -> Vec2 {
     let idx = player as usize % MAX_PLAYERS;
     rotate_quarter(vec2(SENTINEL_INSET, SENTINEL_INSET), CORNER_ORDER[idx])
 }
 
-/// Ore in the ground. `amount` depletes as it is harvested; `capacity` is what
+/// Ore in the ground. `amount` depletes as it is mined; `capacity` is what
 /// it started with, which the client uses to size the deposit's visual.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OreDeposit {
@@ -172,7 +172,7 @@ const MAX_HILL_RADIUS: f32 = 11.0;
 /// Builds the terrain for a seed, on the same rotational plan as the ore.
 ///
 /// Hills are placed after the ore and around it: a hill close enough to a
-/// deposit to deny a harvester its parking space would quietly delete that
+/// deposit to deny a miner its parking space would quietly delete that
 /// deposit from the game, which is worse than a slightly emptier map.
 pub fn generate_hills(seed: u64) -> Vec<Hill> {
     const HILL_SEED_MIX: u64 = 0x_1A11_5EED_0C0F_FEE5;
@@ -203,8 +203,8 @@ pub fn generate_hills(seed: u64) -> Vec<Hill> {
         if p.distance(center) < 40.0 + radius {
             continue;
         }
-        // Room to park a harvester on every deposit, all the way around it.
-        if ore.iter().any(|o| o.pos.distance(p) < radius + crate::sim::HARVEST_RADIUS + 6.0) {
+        // Room to park a miner on every deposit, all the way around it.
+        if ore.iter().any(|o| o.pos.distance(p) < radius + crate::sim::MINING_RADIUS + 6.0) {
             continue;
         }
         if quadrant.iter().any(|(q, r)| q.distance(p) < radius + r + 12.0) {
@@ -236,7 +236,7 @@ pub enum PowerUp {
     Radar = 0,
     ShieldBooster = 1,
     Turbo = 2,
-    HarvesterArmor = 3,
+    MinerArmor = 3,
     AutoTurret = 4,
     MissilePack = 5,
     LongBarrel = 6,
@@ -248,7 +248,7 @@ impl PowerUp {
         PowerUp::Radar,
         PowerUp::ShieldBooster,
         PowerUp::Turbo,
-        PowerUp::HarvesterArmor,
+        PowerUp::MinerArmor,
         PowerUp::AutoTurret,
         PowerUp::MissilePack,
         PowerUp::LongBarrel,
@@ -264,13 +264,13 @@ impl PowerUp {
             PowerUp::Radar => 600,
             PowerUp::ShieldBooster => 400,
             PowerUp::Turbo => 350,
-            PowerUp::HarvesterArmor => 450,
+            PowerUp::MinerArmor => 450,
             PowerUp::AutoTurret => 800,
             PowerUp::MissilePack => 250,
             PowerUp::LongBarrel => 400,
             // Far and away the most expensive thing on the list, because it is
             // the only one that reaches somewhere a tank cannot drive. A whole
-            // match's harvesting buys one, and what it buys is the aircraft,
+            // match's mining buys one, and what it buys is the aircraft,
             // not a sortie: the clock on a sortie is fuel, and the clock on the
             // next one is [`sim::SORTIE_COOLDOWN`].
             PowerUp::Bomber => 1000,
@@ -282,7 +282,7 @@ impl PowerUp {
             PowerUp::Radar => "Radar",
             PowerUp::ShieldBooster => "Shield Booster",
             PowerUp::Turbo => "Turbo Drive",
-            PowerUp::HarvesterArmor => "Harvester Armor",
+            PowerUp::MinerArmor => "Miner Armor",
             PowerUp::AutoTurret => "Auto Turret",
             PowerUp::MissilePack => "Missile Pack",
             PowerUp::LongBarrel => "Long Barrel",
@@ -295,8 +295,8 @@ impl PowerUp {
             PowerUp::Radar => "HUD contact circle showing every vehicle on the field",
             PowerUp::ShieldBooster => "+60 max shield and faster regeneration, both vehicles",
             PowerUp::Turbo => "+30% top speed, both vehicles",
-            PowerUp::HarvesterArmor => "+60 harvester hull and +25% cargo capacity",
-            PowerUp::AutoTurret => "Harvester defends itself against nearby enemies",
+            PowerUp::MinerArmor => "+60 miner hull and +25% cargo capacity",
+            PowerUp::AutoTurret => "Miner defends itself against nearby enemies",
             PowerUp::MissilePack => "+6 missiles for your tank",
             PowerUp::LongBarrel => "Tank shells fly twice as far",
             PowerUp::Bomber => "Call up a plane you fly yourself, until the fuel runs out",
@@ -425,10 +425,10 @@ mod tests {
                         "seed {seed}: hill on a base pad"
                     );
                 }
-                // A harvester must be able to park anywhere around a deposit.
+                // A miner must be able to park anywhere around a deposit.
                 for o in generate_ore(seed) {
                     assert!(
-                        o.pos.distance(h.pos) > h.radius + crate::sim::HARVEST_RADIUS,
+                        o.pos.distance(h.pos) > h.radius + crate::sim::MINING_RADIUS,
                         "seed {seed}: hill covers a deposit's parking space"
                     );
                 }

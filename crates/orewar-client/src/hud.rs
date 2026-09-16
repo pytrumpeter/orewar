@@ -41,7 +41,7 @@ pub enum HudText {
     Banner,
     BuildMenu,
     TankStats,
-    HarvesterStats,
+    MinerStats,
     Roster(u8),
 }
 
@@ -50,9 +50,9 @@ pub enum HudText {
 pub enum HudBar {
     TankShield,
     TankHull,
-    HarvesterShield,
-    HarvesterHull,
-    HarvesterCargo,
+    MinerShield,
+    MinerHull,
+    MinerCargo,
     Capture,
 }
 
@@ -167,18 +167,18 @@ pub fn setup(mut commands: Commands) {
             spawn_bar(p, HudBar::TankHull, HULL_COLOR, 210.0);
         });
 
-    // ---- Harvester panel, bottom right ------------------------------------
+    // ---- Miner panel, bottom right ------------------------------------
     commands
         .spawn((
             Node { bottom: px(12), right: px(12), width: px(230), ..panel_node() },
             BackgroundColor(PANEL_BG),
         ))
         .with_children(|p| {
-            p.spawn((Text::new("HARVESTER"), font(12.0), TextColor(TEXT_DIM)));
-            p.spawn((HudText::HarvesterStats, Text::new(""), font(13.0), TextColor(TEXT)));
-            spawn_bar(p, HudBar::HarvesterShield, SHIELD_COLOR, 210.0);
-            spawn_bar(p, HudBar::HarvesterHull, HULL_COLOR, 210.0);
-            spawn_bar(p, HudBar::HarvesterCargo, CARGO_COLOR, 210.0);
+            p.spawn((Text::new("MINER"), font(12.0), TextColor(TEXT_DIM)));
+            p.spawn((HudText::MinerStats, Text::new(""), font(13.0), TextColor(TEXT)));
+            spawn_bar(p, HudBar::MinerShield, SHIELD_COLOR, 210.0);
+            spawn_bar(p, HudBar::MinerHull, HULL_COLOR, 210.0);
+            spawn_bar(p, HudBar::MinerCargo, CARGO_COLOR, 210.0);
             spawn_bar(p, HudBar::Capture, CAPTURE_COLOR, 210.0);
         });
 
@@ -358,7 +358,7 @@ pub fn update_texts(
                     me.map_or(0, |p| p.ore_mined),
                     match input.controlling {
                         VehicleSlot::Tank => "TANK",
-                        VehicleSlot::Harvester => "HARVESTER",
+                        VehicleSlot::Miner => "MINER",
                         VehicleSlot::Plane => "BOMBER",
                     }
                 );
@@ -381,16 +381,16 @@ pub fn update_texts(
                 };
             }
 
-            HudText::HarvesterStats => {
-                **text = match me.and_then(|p| p.harvester) {
+            HudText::MinerStats => {
+                **text = match me.and_then(|p| p.miner) {
                     Some(v) => {
                         let powerups = me.map_or(0, |p| p.powerups);
                         let mut s = format!(
                             "shield {:.0}/{:.0}   hull {:.0}/{:.0}\ncargo {:.0}/{:.0}",
                             v.shield,
-                            sim::max_shield(VehicleKind::Harvester, powerups),
+                            sim::max_shield(VehicleKind::Miner, powerups),
                             v.hull,
-                            sim::max_hull(VehicleKind::Harvester, powerups),
+                            sim::max_hull(VehicleKind::Miner, powerups),
                             v.cargo,
                             sim::cargo_capacity(powerups),
                         );
@@ -465,11 +465,11 @@ pub fn update_texts(
                 let coming_back = me.map_or(0, |p| p.respawn_in);
                 **text = match (state.status, state.winner) {
                     (GameStatus::Waiting, _) => "WAITING FOR ANOTHER PLAYER".to_string(),
-                    // Losing a harvester is the one thing that takes you off the
+                    // Losing a miner is the one thing that takes you off the
                     // field entirely, so while that clock runs it is the only
                     // thing worth saying.
                     (GameStatus::Running, _) if coming_back > 0 => {
-                        format!("HARVESTER LOST\nBACK IN {coming_back}")
+                        format!("MINER LOST\nBACK IN {coming_back}")
                     }
                     (GameStatus::Finished, Some(winner)) => {
                         if Some(winner) == state.local_player {
@@ -497,17 +497,17 @@ pub fn update_bars(state: Res<GameState>, mut bars: Query<(&HudBar, &mut Node)>)
             HudBar::TankHull => me
                 .and_then(|p| p.tank)
                 .map(|v| v.hull / sim::max_hull(VehicleKind::Tank, powerups).max(1.0)),
-            HudBar::HarvesterShield => me.and_then(|p| p.harvester).map(|v| {
-                v.shield / sim::max_shield(VehicleKind::Harvester, powerups).max(1.0)
+            HudBar::MinerShield => me.and_then(|p| p.miner).map(|v| {
+                v.shield / sim::max_shield(VehicleKind::Miner, powerups).max(1.0)
             }),
-            HudBar::HarvesterHull => me.and_then(|p| p.harvester).map(|v| {
-                v.hull / sim::max_hull(VehicleKind::Harvester, powerups).max(1.0)
+            HudBar::MinerHull => me.and_then(|p| p.miner).map(|v| {
+                v.hull / sim::max_hull(VehicleKind::Miner, powerups).max(1.0)
             }),
-            HudBar::HarvesterCargo => me
-                .and_then(|p| p.harvester)
+            HudBar::MinerCargo => me
+                .and_then(|p| p.miner)
                 .map(|v| v.cargo / sim::cargo_capacity(powerups).max(1.0)),
             HudBar::Capture => me
-                .and_then(|p| p.harvester)
+                .and_then(|p| p.miner)
                 .map(|v| if v.disabled { v.capture_progress } else { 0.0 }),
         };
         node.width = percent(fraction.unwrap_or(0.0).clamp(0.0, 1.0) * 100.0);
@@ -561,7 +561,7 @@ pub fn update_radar(
         if let Some(v) = player.tank {
             contacts.push((v.pos, color, is_me));
         }
-        if let Some(v) = player.harvester {
+        if let Some(v) = player.miner {
             contacts.push((v.pos, color, is_me));
         }
     }

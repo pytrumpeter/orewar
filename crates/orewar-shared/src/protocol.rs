@@ -80,14 +80,14 @@ pub const ORE_FULL_SYNC_INTERVAL: u32 = 30;
 pub enum VehicleSlot {
     #[default]
     Tank = 0,
-    Harvester = 1,
+    Miner = 1,
     Plane = 2,
 }
 
 impl VehicleSlot {
     /// Cycling order, which is the order the switch key walks.
     pub const ALL: [VehicleSlot; 3] =
-        [VehicleSlot::Tank, VehicleSlot::Harvester, VehicleSlot::Plane];
+        [VehicleSlot::Tank, VehicleSlot::Miner, VehicleSlot::Plane];
 
     pub fn from_u8(v: u8) -> Option<Self> {
         Self::ALL.get(v as usize).copied()
@@ -96,7 +96,7 @@ impl VehicleSlot {
     pub fn kind(self) -> VehicleKind {
         match self {
             VehicleSlot::Tank => VehicleKind::Tank,
-            VehicleSlot::Harvester => VehicleKind::Harvester,
+            VehicleSlot::Miner => VehicleKind::Miner,
             VehicleSlot::Plane => VehicleKind::Plane,
         }
     }
@@ -113,8 +113,8 @@ impl VehicleSlot {
         let mut slot = self;
         for _ in 0..Self::ALL.len() {
             slot = match slot {
-                VehicleSlot::Tank => VehicleSlot::Harvester,
-                VehicleSlot::Harvester => VehicleSlot::Plane,
+                VehicleSlot::Tank => VehicleSlot::Miner,
+                VehicleSlot::Miner => VehicleSlot::Plane,
                 VehicleSlot::Plane => VehicleSlot::Tank,
             };
             if available(slot) {
@@ -146,7 +146,7 @@ impl Encode for InputFrame {
     fn encode(&self, w: &mut Writer) {
         // Two bits for the slot since the bomber joined, so the fire bits moved
         // up one. This is what the protocol bump is for: read by an older build
-        // the same byte says "driving the harvester and holding fire".
+        // the same byte says "driving the miner and holding fire".
         let flags = self.controlling as u8
             | (self.fire_primary as u8) << 2
             | (self.fire_secondary as u8) << 3;
@@ -191,8 +191,8 @@ pub enum ClientMessage {
     /// the authority but takes no side -- so the alternative would be inventing
     /// one, and a four-player game around one screen does not need it.
     NewGame,
-    /// Reliable. Changes what the harvester does when left to itself.
-    SetHarvesterMode(HarvesterMode),
+    /// Reliable. Changes what the miner does when left to itself.
+    SetMinerMode(MinerMode),
     /// Reliable. Turns cheat mode on or off for the whole match.
     ///
     /// Any player may ask, and it lands on everybody -- the same reasoning as
@@ -220,7 +220,7 @@ impl Encode for ClientMessage {
             ClientMessage::Purchase(p) => {
                 w.u8(2).u8(*p as u8);
             }
-            ClientMessage::SetHarvesterMode(m) => {
+            ClientMessage::SetMinerMode(m) => {
                 w.u8(5).u8(*m as u8);
             }
             ClientMessage::Leave => {
@@ -254,9 +254,9 @@ impl Decode for ClientMessage {
             4 => ClientMessage::NewGame,
             5 => {
                 let raw = r.u8()?;
-                ClientMessage::SetHarvesterMode(
-                    HarvesterMode::from_u8(raw)
-                        .ok_or(DecodeError::BadTag("HarvesterMode", raw))?,
+                ClientMessage::SetMinerMode(
+                    MinerMode::from_u8(raw)
+                        .ok_or(DecodeError::BadTag("MinerMode", raw))?,
                 )
             }
             6 => ClientMessage::LaunchPlane,
@@ -282,7 +282,7 @@ pub struct VehicleSnapshot {
     pub hull: f32,
     /// Ore aboard. Always zero for a tank.
     pub cargo: f32,
-    /// A harvester at zero hull: immobile and capturable.
+    /// A miner at zero hull: immobile and capturable.
     pub disabled: bool,
     /// Capture or rescue progress, `0..=1`.
     pub capture_progress: f32,
@@ -321,14 +321,14 @@ impl Decode for VehicleSnapshot {
 /// Bytes one `VehicleSnapshot` occupies on the wire.
 pub const VEHICLE_SNAPSHOT_BYTES: usize = 22;
 
-/// What an unattended harvester does with itself.
+/// What an unattended miner does with itself.
 ///
 /// Only consulted while the player is driving something else; taking the
-/// harvester over with TAB overrides whatever is selected, and letting go
+/// miner over with TAB overrides whatever is selected, and letting go
 /// resumes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-pub enum HarvesterMode {
+pub enum MinerMode {
     /// Work the field: nearest deposit, fill up, home, unload, repeat.
     #[default]
     Auto = 0,
@@ -338,12 +338,12 @@ pub enum HarvesterMode {
     Stop = 2,
 }
 
-impl HarvesterMode {
+impl MinerMode {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(HarvesterMode::Auto),
-            1 => Some(HarvesterMode::Home),
-            2 => Some(HarvesterMode::Stop),
+            0 => Some(MinerMode::Auto),
+            1 => Some(MinerMode::Home),
+            2 => Some(MinerMode::Stop),
             _ => None,
         }
     }
@@ -437,12 +437,12 @@ pub struct PlayerSnapshot {
     pub ore_mined: u32,
     pub powerups: u16,
     pub missiles: u8,
-    /// Enemy harvesters this player has taken.
+    /// Enemy miners this player has taken.
     pub captures: u8,
     /// Absent while the tank is waiting to respawn.
     pub tank: Option<VehicleSnapshot>,
-    /// Absent once the harvester has been captured.
-    pub harvester: Option<VehicleSnapshot>,
+    /// Absent once the miner has been captured.
+    pub miner: Option<VehicleSnapshot>,
     /// Absent while the emplacement is rubble and rebuilding.
     pub sentinel: Option<SentinelSnapshot>,
     /// Present only while a sortie is in the air.
@@ -451,10 +451,10 @@ pub struct PlayerSnapshot {
     /// available now. Whole seconds because it is only ever read as a countdown
     /// on screen, the same as `respawn_in`.
     pub plane_ready_in: u8,
-    /// What the harvester does when nobody is driving it. Sent back so the
+    /// What the miner does when nobody is driving it. Sent back so the
     /// control panel shows what the server actually has, not what this client
     /// last asked for.
-    pub harvester_mode: HarvesterMode,
+    pub miner_mode: MinerMode,
     /// Whole seconds until a captured player is back on the field. Zero when
     /// they are already on it. Whole seconds because it is only ever read as
     /// a countdown on screen.
@@ -466,7 +466,7 @@ impl Encode for PlayerSnapshot {
         let flags = self.connected as u8
             | (self.eliminated as u8) << 1
             | (self.tank.is_some() as u8) << 2
-            | (self.harvester.is_some() as u8) << 3
+            | (self.miner.is_some() as u8) << 3
             | (self.sentinel.is_some() as u8) << 4
             | (self.plane.is_some() as u8) << 5;
         w.u8(self.id);
@@ -476,13 +476,13 @@ impl Encode for PlayerSnapshot {
         w.u16(self.powerups);
         w.u8(self.missiles);
         w.u8(self.captures);
-        w.u8(self.harvester_mode as u8);
+        w.u8(self.miner_mode as u8);
         w.u8(self.respawn_in);
         w.u8(self.plane_ready_in);
         if let Some(v) = &self.tank {
             v.encode(w);
         }
-        if let Some(v) = &self.harvester {
+        if let Some(v) = &self.miner {
             v.encode(w);
         }
         if let Some(sentinel) = &self.sentinel {
@@ -504,12 +504,12 @@ impl Decode for PlayerSnapshot {
         let missiles = r.u8()?;
         let captures = r.u8()?;
         let raw_mode = r.u8()?;
-        let harvester_mode =
-            HarvesterMode::from_u8(raw_mode).ok_or(DecodeError::BadTag("HarvesterMode", raw_mode))?;
+        let miner_mode =
+            MinerMode::from_u8(raw_mode).ok_or(DecodeError::BadTag("MinerMode", raw_mode))?;
         let respawn_in = r.u8()?;
         let plane_ready_in = r.u8()?;
         let tank = if flags & 0b100 != 0 { Some(r.read()?) } else { None };
-        let harvester = if flags & 0b1000 != 0 { Some(r.read()?) } else { None };
+        let miner = if flags & 0b1000 != 0 { Some(r.read()?) } else { None };
         let sentinel = if flags & 0b1_0000 != 0 { Some(r.read()?) } else { None };
         let plane = if flags & 0b10_0000 != 0 { Some(r.read()?) } else { None };
         Ok(PlayerSnapshot {
@@ -521,11 +521,11 @@ impl Decode for PlayerSnapshot {
             powerups,
             missiles,
             captures,
-            harvester_mode,
+            miner_mode,
             respawn_in,
             plane_ready_in,
             tank,
-            harvester,
+            miner,
             sentinel,
             plane,
         })
@@ -673,7 +673,7 @@ impl HitFx {
     const SLOT_BIT: u8 = 0b1000_0000;
 
     pub fn on_vehicle(kind: HitKind, pos: Vec2, angle: f32, player: u8, slot: VehicleSlot) -> Self {
-        let slot_bit = if slot == VehicleSlot::Harvester { Self::SLOT_BIT } else { 0 };
+        let slot_bit = if slot == VehicleSlot::Miner { Self::SLOT_BIT } else { 0 };
         HitFx { kind, pos, angle, target: (player & 0x7F) | slot_bit }
     }
 
@@ -687,7 +687,7 @@ impl HitFx {
             return None;
         }
         let slot = if self.target & Self::SLOT_BIT != 0 {
-            VehicleSlot::Harvester
+            VehicleSlot::Miner
         } else {
             VehicleSlot::Tank
         };
@@ -834,9 +834,9 @@ pub enum GameEvent {
     PurchaseRejected { powerup: PowerUp, reason: RejectReason },
     TankDestroyed { player: u8, by: u8 },
     TankRespawned { player: u8 },
-    HarvesterDisabled { player: u8 },
-    HarvesterRescued { player: u8 },
-    HarvesterCaptured { by: u8, from: u8 },
+    MinerDisabled { player: u8 },
+    MinerRescued { player: u8 },
+    MinerCaptured { by: u8, from: u8 },
     PlayerEliminated { player: u8 },
     MatchStarted,
     GameOver { winner: u8 },
@@ -846,10 +846,10 @@ pub enum GameEvent {
     /// never sees another `Welcome`, and the map never travels as a deposit
     /// list -- both sides generate it from the seed.
     MatchReset { world_seed: u64, by: u8 },
-    /// A captured harvester's cargo changed hands.
+    /// A captured miner's cargo changed hands.
     ///
-    /// Separate from `HarvesterCaptured` because the amount is the part
-    /// worth saying out loud, and a harvester taken empty should not claim a
+    /// Separate from `MinerCaptured` because the amount is the part
+    /// worth saying out loud, and a miner taken empty should not claim a
     /// haul that was not there.
     OreSeized { by: u8, from: u8, amount: u32 },
     /// A base emplacement was shot down and is rebuilding.
@@ -880,13 +880,13 @@ impl Encode for GameEvent {
             GameEvent::TankRespawned { player } => {
                 w.u8(6).u8(player);
             }
-            GameEvent::HarvesterDisabled { player } => {
+            GameEvent::MinerDisabled { player } => {
                 w.u8(7).u8(player);
             }
-            GameEvent::HarvesterRescued { player } => {
+            GameEvent::MinerRescued { player } => {
                 w.u8(8).u8(player);
             }
-            GameEvent::HarvesterCaptured { by, from } => {
+            GameEvent::MinerCaptured { by, from } => {
                 w.u8(9).u8(by).u8(from);
             }
             GameEvent::PlayerEliminated { player } => {
@@ -939,9 +939,9 @@ impl Decode for GameEvent {
             }
             5 => GameEvent::TankDestroyed { player: r.u8()?, by: r.u8()? },
             6 => GameEvent::TankRespawned { player: r.u8()? },
-            7 => GameEvent::HarvesterDisabled { player: r.u8()? },
-            8 => GameEvent::HarvesterRescued { player: r.u8()? },
-            9 => GameEvent::HarvesterCaptured { by: r.u8()?, from: r.u8()? },
+            7 => GameEvent::MinerDisabled { player: r.u8()? },
+            8 => GameEvent::MinerRescued { player: r.u8()? },
+            9 => GameEvent::MinerCaptured { by: r.u8()?, from: r.u8()? },
             10 => GameEvent::PlayerEliminated { player: r.u8()? },
             11 => GameEvent::MatchStarted,
             12 => GameEvent::GameOver { winner: r.u8()? },
@@ -1085,9 +1085,9 @@ mod tests {
             missiles: 7,
             captures: 2,
             tank: Some(sample_vehicle()),
-            harvester: Some(sample_vehicle()),
+            miner: Some(sample_vehicle()),
             sentinel: Some(SentinelSnapshot { hull: 118.5, turret_yaw: 2.0 }),
-            harvester_mode: HarvesterMode::Home,
+            miner_mode: MinerMode::Home,
             respawn_in: 41,
             // A sortie in the air is part of the worst case: four players can
             // all have one up at once, and that is the packet that has to fit.
@@ -1119,7 +1119,7 @@ mod tests {
     fn input_frames_round_trip() {
         let f = InputFrame {
             tick: 900_001,
-            controlling: VehicleSlot::Harvester,
+            controlling: VehicleSlot::Miner,
             throttle: -1.0,
             steer: 0.5,
             aim: 2.5,
@@ -1147,8 +1147,8 @@ mod tests {
         for msg in purchases.into_iter().chain([
             ClientMessage::Leave,
             ClientMessage::NewGame,
-            ClientMessage::SetHarvesterMode(HarvesterMode::Home),
-            ClientMessage::SetHarvesterMode(HarvesterMode::Auto),
+            ClientMessage::SetMinerMode(MinerMode::Home),
+            ClientMessage::SetMinerMode(MinerMode::Auto),
             ClientMessage::Input(InputFrame::default()),
         ]) {
             let bytes = msg.to_vec();
@@ -1168,9 +1168,9 @@ mod tests {
             },
             GameEvent::TankDestroyed { player: 0, by: 2 },
             GameEvent::TankRespawned { player: 0 },
-            GameEvent::HarvesterDisabled { player: 2 },
-            GameEvent::HarvesterRescued { player: 2 },
-            GameEvent::HarvesterCaptured { by: 1, from: 2 },
+            GameEvent::MinerDisabled { player: 2 },
+            GameEvent::MinerRescued { player: 2 },
+            GameEvent::MinerCaptured { by: 1, from: 2 },
             GameEvent::PlayerEliminated { player: 2 },
             GameEvent::MatchStarted,
             GameEvent::GameOver { winner: 1 },
@@ -1244,7 +1244,7 @@ mod tests {
             assert_eq!(a.missiles, b.missiles);
             assert_eq!(a.captures, b.captures);
             assert_vehicle_close(a.tank.as_ref().unwrap(), b.tank.as_ref().unwrap());
-            assert_vehicle_close(a.harvester.as_ref().unwrap(), b.harvester.as_ref().unwrap());
+            assert_vehicle_close(a.miner.as_ref().unwrap(), b.miner.as_ref().unwrap());
         }
     }
 
@@ -1253,7 +1253,7 @@ mod tests {
         let cases = [
             HitFx::on_terrain(HitKind::Blast, vec2(12.5, 300.25)),
             HitFx::on_vehicle(HitKind::Shield, vec2(0.0, 0.0), -2.5, 0, VehicleSlot::Tank),
-            HitFx::on_vehicle(HitKind::Shield, vec2(319.99, 1.0), 1.25, 3, VehicleSlot::Harvester),
+            HitFx::on_vehicle(HitKind::Shield, vec2(319.99, 1.0), 1.25, 3, VehicleSlot::Miner),
         ];
         for want in cases {
             let got = HitFx::from_slice(&want.to_vec()).unwrap();
@@ -1309,7 +1309,7 @@ mod tests {
                     vec2(WORLD_SIZE, WORLD_SIZE),
                     3.0,
                     3,
-                    VehicleSlot::Harvester,
+                    VehicleSlot::Miner,
                 ))
                 .collect(),
         };
@@ -1381,7 +1381,7 @@ mod tests {
         assert_eq!(sample_vehicle().to_vec().len(), VEHICLE_SNAPSHOT_BYTES);
         let bare = PlayerSnapshot {
             tank: None,
-            harvester: None,
+            miner: None,
             sentinel: None,
             plane: None,
             ..sample_player(0)

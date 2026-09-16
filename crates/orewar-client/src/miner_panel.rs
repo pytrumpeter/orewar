@@ -1,14 +1,14 @@
-//! Three buttons floating over your own harvester, for telling it what to do
+//! Three buttons floating over your own miner, for telling it what to do
 //! while you are off driving the tank.
 //!
 //! Bevy's UI is screen-space, so the panel is an ordinary absolutely-positioned
-//! node whose offset is recomputed each frame by projecting the harvester's
+//! node whose offset is recomputed each frame by projecting the miner's
 //! interpolated position through the camera. That keeps it pinned to the
 //! vehicle without the buttons scaling or rotating with the world, which is
 //! what you want of a control: it stays the same size and stays clickable.
 
 use bevy::prelude::*;
-use orewar_shared::protocol::HarvesterMode;
+use orewar_shared::protocol::MinerMode;
 
 use crate::coords;
 use crate::net::NetClient;
@@ -20,22 +20,22 @@ pub struct PanelRoot;
 
 /// One of the three choices.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
-pub struct ModeButton(pub HarvesterMode);
+pub struct ModeButton(pub MinerMode);
 
 /// Order left to right, and the order they are spawned.
-const MODES: [HarvesterMode; 3] =
-    [HarvesterMode::Auto, HarvesterMode::Home, HarvesterMode::Stop];
+const MODES: [MinerMode; 3] =
+    [MinerMode::Auto, MinerMode::Home, MinerMode::Stop];
 
 const DOT: f32 = 20.0;
 
 /// How high above the hull the panel floats, in world units.
 const LIFT: f32 = 4.6;
 
-fn color(mode: HarvesterMode) -> Color {
+fn color(mode: MinerMode) -> Color {
     match mode {
-        HarvesterMode::Auto => Color::srgb(0.30, 0.82, 0.38),
-        HarvesterMode::Home => Color::srgb(0.96, 0.76, 0.22),
-        HarvesterMode::Stop => Color::srgb(0.88, 0.28, 0.26),
+        MinerMode::Auto => Color::srgb(0.30, 0.82, 0.38),
+        MinerMode::Home => Color::srgb(0.96, 0.76, 0.22),
+        MinerMode::Stop => Color::srgb(0.88, 0.28, 0.26),
     }
 }
 
@@ -85,16 +85,16 @@ pub fn update(
 ) {
     let Ok((mut node, mut visibility)) = root.single_mut() else { return };
 
-    // Only your own, and only while it is a harvester rather than a wreck --
+    // Only your own, and only while it is a miner rather than a wreck --
     // there is nothing to instruct a disabled one to do.
-    let mine = state.local().and_then(|p| p.harvester.map(|h| (h, p.harvester_mode)));
-    let Some((harvester, mode)) = mine.filter(|(h, _)| !h.disabled) else {
+    let showing = state.local().and_then(|p| p.miner.map(|m| (m, p.miner_mode)));
+    let Some((miner, mode)) = showing.filter(|(m, _)| !m.disabled) else {
         *visibility = Visibility::Hidden;
         return;
     };
 
     let Some(screen) = cameras.iter().next().and_then(|(camera, transform)| {
-        camera.world_to_viewport(transform, coords::sim_to_world_at(harvester.pos, LIFT)).ok()
+        camera.world_to_viewport(transform, coords::sim_to_world_at(miner.pos, LIFT)).ok()
     }) else {
         // Behind the camera or off the edge of the projection.
         *visibility = Visibility::Hidden;
@@ -122,7 +122,7 @@ pub fn update(
         });
 
         if *interaction == Interaction::Pressed && !selected {
-            net.set_harvester_mode(button.0);
+            net.set_miner_mode(button.0);
         }
     }
 }

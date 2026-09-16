@@ -102,7 +102,7 @@ pub fn controls_for(menu_open: bool, overview_active: bool) -> Controls {
         // an aircraft keeps flying whether or not you are watching it.
         live: !menu_open,
         // Up in the overview the mouse belongs to the camera and the panels --
-        // right-drag pans the map, and the harvester's mode buttons float over
+        // right-drag pans the map, and the miner's mode buttons float over
         // it -- so the triggers come off the mouse while it is up.
         mouse_fires: !menu_open && !overview_active,
     }
@@ -225,7 +225,7 @@ pub fn gather(
     // to drive, and an aircraft running dry takes the controls out from under
     // you mid-flight with nothing to announce it. The server already falls
     // through, but prediction and the turret still have to be pointed at the
-    // right hull or the harvester moves under you while the camera and aim
+    // right hull or the miner moves under you while the camera and aim
     // stay behind. Coming back the same way puts you in the tank the moment it
     // respawns.
     if let Some(me) = state.local() {
@@ -343,7 +343,7 @@ mod tests {
     ///
     /// What the overview does take is the mouse, because up there it already
     /// has two jobs: the right button drags the map and the left one reaches
-    /// the harvester's mode buttons floating over it. Neither should also pull
+    /// the miner's mode buttons floating over it. Neither should also pull
     /// a trigger. Nothing is lost by it -- `Space` and `F` fire.
     #[test]
     fn only_the_pause_menu_takes_the_controls_away() {

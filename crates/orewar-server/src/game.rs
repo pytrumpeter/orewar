@@ -2,7 +2,7 @@
 //!
 //! This is the only place game state actually changes. Clients send intent and
 //! render what comes back; everything that decides an outcome -- who was hit,
-//! who owns which harvester, whether a purchase can be afforded -- happens here.
+//! who owns which miner, whether a purchase can be afforded -- happens here.
 //!
 //! Player state is keyed by a client-supplied token rather than by socket
 //! address, so a player who drops out keeps their ore, power-ups, and vehicles
@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use orewar_shared::math::{Vec2, angle_delta, wrap_angle};
 use orewar_shared::protocol::{
-    DenyReason, GameEvent, GameStatus, HarvesterMode, HitFx, HitKind, InputFrame,
+    DenyReason, GameEvent, GameStatus, MinerMode, HitFx, HitKind, InputFrame,
     MAX_HITS_PER_SNAPSHOT, OreUpdate, PlaneSnapshot, PlayerInfo, PlayerSnapshot, ProjectileKind,
     SentinelSnapshot, ProjectileSnapshot, RejectReason, Snapshot, VehicleSlot, VehicleSnapshot,
     MAX_PROJECTILES_PER_SNAPSHOT,
@@ -38,7 +38,7 @@ pub struct Vehicle {
     pub shield: f32,
     pub hull: f32,
     pub cargo: f32,
-    /// A harvester at zero hull. It cannot move or harvest, and an enemy tank
+    /// A miner at zero hull. It cannot move or mine, and an enemy tank
     /// can take it.
     pub disabled: bool,
     /// Capture progress while disabled, `0..=1`.
@@ -98,7 +98,7 @@ pub struct Player {
     pub missiles: u8,
     pub captures: u8,
     pub tank: Option<Vehicle>,
-    pub harvester: Option<Vehicle>,
+    pub miner: Option<Vehicle>,
     /// A sortie in the air. A `Vehicle` like the other two so that everything
     /// which takes a slot -- input, prediction, the switch key -- works on it
     /// without a second shape to special-case, even though most of a vehicle
@@ -108,10 +108,10 @@ pub struct Player {
     /// ending, so a short run does not buy a quick second one.
     pub sortie_cooldown: f32,
     pub sentinel: Sentinel,
-    /// What the harvester does when the player is driving something else.
-    pub harvester_mode: HarvesterMode,
+    /// What the miner does when the player is driving something else.
+    pub miner_mode: MinerMode,
     /// Seconds the autopilot has spent asking for throttle and going nowhere.
-    /// Steering rounds a hill, but a harvester can still end up wedged; this is
+    /// Steering rounds a hill, but a miner can still end up wedged; this is
     /// what notices.
     stuck_for: f32,
     /// Seconds left of backing out of being wedged.
@@ -119,7 +119,7 @@ pub struct Player {
     /// Counts down while the tank is destroyed.
     pub respawn_timer: f32,
     /// Counts down while the player is off the field entirely, having had their
-    /// harvester taken. Zero means they are in the match.
+    /// miner taken. Zero means they are in the match.
     pub down_for: f32,
     pub input: InputFrame,
     /// Seconds since a fresh input frame arrived.
@@ -144,7 +144,7 @@ fn starting_placement(id: u8) -> (Vec2, Vec2, f32) {
 
 impl Player {
     fn new(id: u8, token: u64, name: String) -> Self {
-        let (tank_pos, harvester_pos, inward) = starting_placement(id);
+        let (tank_pos, miner_pos, inward) = starting_placement(id);
         Player {
             id,
             name,
@@ -162,16 +162,16 @@ impl Player {
                 inward,
                 STARTING_POWERUPS,
             )),
-            harvester: Some(Vehicle::spawn(
-                VehicleKind::Harvester,
-                harvester_pos,
+            miner: Some(Vehicle::spawn(
+                VehicleKind::Miner,
+                miner_pos,
                 inward,
                 STARTING_POWERUPS,
             )),
             plane: None,
             sortie_cooldown: 0.0,
             sentinel: Sentinel::new(id),
-            harvester_mode: HarvesterMode::default(),
+            miner_mode: MinerMode::default(),
             stuck_for: 0.0,
             unstick_for: 0.0,
             respawn_timer: 0.0,
@@ -214,7 +214,7 @@ impl Player {
     pub fn vehicle(&self, slot: VehicleSlot) -> Option<&Vehicle> {
         match slot {
             VehicleSlot::Tank => self.tank.as_ref(),
-            VehicleSlot::Harvester => self.harvester.as_ref(),
+            VehicleSlot::Miner => self.miner.as_ref(),
             VehicleSlot::Plane => self.plane.as_ref(),
         }
     }
@@ -222,7 +222,7 @@ impl Player {
     fn vehicle_mut(&mut self, slot: VehicleSlot) -> Option<&mut Vehicle> {
         match slot {
             VehicleSlot::Tank => self.tank.as_mut(),
-            VehicleSlot::Harvester => self.harvester.as_mut(),
+            VehicleSlot::Miner => self.miner.as_mut(),
             VehicleSlot::Plane => self.plane.as_mut(),
         }
     }
@@ -237,7 +237,7 @@ impl Player {
             powerups: self.powerups,
             missiles: self.missiles,
             captures: self.captures,
-            harvester_mode: self.harvester_mode,
+            miner_mode: self.miner_mode,
             plane: self.plane.as_ref().map(|v| PlaneSnapshot {
                 pos: v.mv.pos,
                 yaw: v.mv.yaw,
@@ -250,7 +250,7 @@ impl Player {
             // the vehicles actually come back rather than a beat before.
             respawn_in: self.down_for.max(0.0).ceil().min(255.0) as u8,
             tank: self.tank.as_ref().map(Vehicle::to_snapshot),
-            harvester: self.harvester.as_ref().map(Vehicle::to_snapshot),
+            miner: self.miner.as_ref().map(Vehicle::to_snapshot),
             // Absent while it is rubble, which is how the client knows to draw
             // the wreck instead of the gun.
             sentinel: self.sentinel.standing().then(|| SentinelSnapshot {
@@ -531,13 +531,13 @@ impl Game {
     ///
     /// Inputs are unreliable and can be reordered by the network; replaying a
     /// stale frame would jerk the vehicle backwards.
-    /// Changes what a player's harvester does when left to itself.
+    /// Changes what a player's miner does when left to itself.
     ///
     /// Takes effect on the next tick the player is not driving it; there is
     /// nothing to validate, since every mode is always available.
-    pub fn set_harvester_mode(&mut self, id: u8, mode: HarvesterMode) {
+    pub fn set_miner_mode(&mut self, id: u8, mode: MinerMode) {
         if let Some(p) = self.player_mut(id) {
-            p.harvester_mode = mode;
+            p.miner_mode = mode;
             // A mode change is a fresh instruction; whatever it was stuck
             // against a moment ago is no longer the plan.
             p.stuck_for = 0.0;
@@ -583,9 +583,9 @@ impl Game {
                     v.shield = v.shield.min(sim::max_shield(VehicleKind::Tank, powerups));
                     v.hull = v.hull.min(sim::max_hull(VehicleKind::Tank, powerups));
                 }
-                if let Some(v) = p.harvester.as_mut() {
-                    v.shield = v.shield.min(sim::max_shield(VehicleKind::Harvester, powerups));
-                    v.hull = v.hull.min(sim::max_hull(VehicleKind::Harvester, powerups));
+                if let Some(v) = p.miner.as_mut() {
+                    v.shield = v.shield.min(sim::max_shield(VehicleKind::Miner, powerups));
+                    v.hull = v.hull.min(sim::max_hull(VehicleKind::Miner, powerups));
                 }
             }
             GameEvent::PurchaseAccepted { powerup, credits: p.credits }
@@ -661,31 +661,31 @@ impl Game {
         }
     }
 
-    /// Where an unattended harvester should head, and how close counts as
+    /// Where an unattended miner should head, and how close counts as
     /// arrived. `None` means hold station -- either the player asked for that,
     /// or there is nothing left to go and get.
     fn autopilot_target(&self, player: u8) -> Option<(Vec2, f32)> {
         let p = self.player(player)?;
-        let h = p.harvester.as_ref()?;
+        let m = p.miner.as_ref()?;
         let home = (world::base_position(player), world::BASE_RADIUS * 0.6);
 
-        match p.harvester_mode {
-            HarvesterMode::Stop => None,
-            HarvesterMode::Home => Some(home),
-            HarvesterMode::Auto => {
-                // A full harvester cannot mine, so the load is only worth
+        match p.miner_mode {
+            MinerMode::Stop => None,
+            MinerMode::Home => Some(home),
+            MinerMode::Auto => {
+                // A full miner cannot mine, so the load is only worth
                 // anything once it is back at the pad.
-                if h.cargo >= sim::cargo_capacity(p.powerups) {
+                if m.cargo >= sim::cargo_capacity(p.powerups) {
                     return Some(home);
                 }
                 let nearest = self.ore.iter().filter(|d| d.amount > 0.0).min_by(|a, b| {
                     a.pos
-                        .distance_squared(h.mv.pos)
-                        .total_cmp(&b.pos.distance_squared(h.mv.pos))
+                        .distance_squared(m.mv.pos)
+                        .total_cmp(&b.pos.distance_squared(m.mv.pos))
                 })?;
                 // Stop short of the middle, so braking settles it under
-                // HARVEST_MAX_SPEED while still inside HARVEST_RADIUS.
-                Some((nearest.pos, sim::HARVEST_RADIUS * 0.7))
+                // MINING_MAX_SPEED while still inside MINING_RADIUS.
+                Some((nearest.pos, sim::MINING_RADIUS * 0.7))
             }
         }
     }
@@ -712,11 +712,11 @@ impl Game {
             // Reached field by field rather than through `vehicle_mut`, which
             // would borrow the whole player and put the autopilot bookkeeping
             // below out of reach.
-            for slot in [VehicleSlot::Tank, VehicleSlot::Harvester] {
+            for slot in [VehicleSlot::Tank, VehicleSlot::Miner] {
                 let kind = slot.kind();
                 let Some(v) = (match slot {
                     VehicleSlot::Tank => p.tank.as_mut(),
-                    VehicleSlot::Harvester => p.harvester.as_mut(),
+                    VehicleSlot::Miner => p.miner.as_mut(),
                     VehicleSlot::Plane => None,
                 }) else {
                     continue;
@@ -727,8 +727,8 @@ impl Game {
                     sim::StepOutcome::default()
                 } else if slot == controlling {
                     sim::step_vehicle(&mut v.mv, throttle, steer, kind, powerups, &self.hills, dt)
-                } else if slot == VehicleSlot::Harvester {
-                    // Left alone, the harvester works the field on whichever
+                } else if slot == VehicleSlot::Miner {
+                    // Left alone, the miner works the field on whichever
                     // mode the player picked. This branch runs only while they
                     // are driving something else, so taking it over with TAB
                     // overrides the mode for free and letting go resumes it.
@@ -877,7 +877,7 @@ impl Game {
             // Ground vehicles only. Nothing at `sim::PLANE_ALTITUDE` shares
             // ground with anything, and a tank bouncing off an aircraft 26
             // units over its head is not a collision anybody would accept.
-            for slot in [VehicleSlot::Tank, VehicleSlot::Harvester] {
+            for slot in [VehicleSlot::Tank, VehicleSlot::Miner] {
                 let Some(v) = p.vehicle(slot) else { continue };
                 bodies.push(Body {
                     player: p.id,
@@ -1032,30 +1032,30 @@ impl Game {
                 }
             }
 
-            // The harvester cannot be aimed by the player; with the Auto Turret
+            // The miner cannot be aimed by the player; with the Auto Turret
             // upgrade it defends itself.
             if PowerUp::AutoTurret.held(p.powerups) {
-                if let Some(h) = p.harvester.as_mut() {
-                    if !h.disabled {
+                if let Some(m) = p.miner.as_mut() {
+                    if !m.disabled {
                         let nearest = targets
                             .iter()
                             .filter(|t| t.player != owner)
-                            .map(|t| (t.pos.distance(h.mv.pos), t.pos))
+                            .map(|t| (t.pos.distance(m.mv.pos), t.pos))
                             .filter(|(d, _)| *d <= sim::AUTO_TURRET_RANGE)
                             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                         if let Some((_, target_pos)) = nearest {
-                            let desired = (target_pos - h.mv.pos).to_angle();
-                            h.turret_yaw = sim::step_turret(h.turret_yaw, desired, dt);
-                            if h.gun_cooldown <= 0.0
-                                && angle_delta(h.turret_yaw, desired).abs() < 0.15
+                            let desired = (target_pos - m.mv.pos).to_angle();
+                            m.turret_yaw = sim::step_turret(m.turret_yaw, desired, dt);
+                            if m.gun_cooldown <= 0.0
+                                && angle_delta(m.turret_yaw, desired).abs() < 0.15
                             {
-                                h.gun_cooldown = sim::AUTO_TURRET_COOLDOWN;
+                                m.gun_cooldown = sim::AUTO_TURRET_COOLDOWN;
                                 spawned.push(Projectile {
                                     id: 0,
                                     kind: ProjectileKind::Bullet,
                                     owner,
-                                    pos: h.mv.pos + Vec2::from_angle(h.turret_yaw) * 3.2,
-                                    yaw: h.turret_yaw,
+                                    pos: m.mv.pos + Vec2::from_angle(m.turret_yaw) * 3.2,
+                                    yaw: m.turret_yaw,
                                     speed: sim::BULLET_SPEED,
                                     life: sim::shell_life_covering(sim::AUTO_TURRET_RANGE),
                                 });
@@ -1076,7 +1076,7 @@ impl Game {
     /// Base emplacements: pick a target, slew onto it, fire.
     ///
     /// Deliberately shaped like the Auto Turret block in [`Self::step_weapons`],
-    /// which solved the same problem for the harvester -- the difference is that
+    /// which solved the same problem for the miner -- the difference is that
     /// this one works through the enemies in range in turn rather than always
     /// engaging the nearest, so a pair of attackers cannot have one of them
     /// soak every shell while the other works unmolested.
@@ -1156,12 +1156,12 @@ impl Game {
                     radius: sim::tuning(VehicleKind::Tank).radius,
                 });
             }
-            if let Some(v) = &p.harvester {
+            if let Some(v) = &p.miner {
                 out.push(Target {
                     player: p.id,
-                    what: Hittable::Vehicle(VehicleSlot::Harvester),
+                    what: Hittable::Vehicle(VehicleSlot::Miner),
                     pos: v.mv.pos,
-                    radius: sim::tuning(VehicleKind::Harvester).radius,
+                    radius: sim::tuning(VehicleKind::Miner).radius,
                 });
             }
             // The aircraft is deliberately absent. Everything that shoots in
@@ -1413,17 +1413,17 @@ impl Game {
             // if something ever does learn to shoot upward, this is the line
             // that has to decide what being hit up there means.
             VehicleSlot::Plane => {}
-            VehicleSlot::Harvester => {
-                // Harvesters are never destroyed. They go dead in the water and
+            VehicleSlot::Miner => {
+                // Miners are never destroyed. They go dead in the water and
                 // become something an enemy tank has to come and take.
                 v.disabled = true;
                 v.capture_progress = 0.0;
                 // The cargo stays aboard. Whoever reaches the wreck first gets
                 // it: the owner carries it home on a rescue, an enemy takes it
                 // with the capture. Destroying the load outright made disabling
-                // a loaded harvester worth less than catching it at the pad.
+                // a loaded miner worth less than catching it at the pad.
                 let _ = powerups;
-                self.events.push(GameEvent::HarvesterDisabled { player });
+                self.events.push(GameEvent::MinerDisabled { player });
             }
         }
     }
@@ -1436,43 +1436,43 @@ impl Game {
             }
             let powerups = p.powerups;
             let id = p.id;
-            let Some(h) = p.harvester.as_mut() else { continue };
-            if h.disabled {
+            let Some(m) = p.miner.as_mut() else { continue };
+            if m.disabled {
                 continue;
             }
 
             // Draw ore while stopped over a deposit.
             let capacity = sim::cargo_capacity(powerups);
-            if h.cargo < capacity && h.mv.speed.abs() <= sim::HARVEST_MAX_SPEED {
+            if m.cargo < capacity && m.mv.speed.abs() <= sim::MINING_MAX_SPEED {
                 let mut best: Option<usize> = None;
                 let mut best_dist = f32::MAX;
                 for (i, deposit) in self.ore.iter().enumerate() {
                     if deposit.amount <= 0.0 {
                         continue;
                     }
-                    let d = deposit.pos.distance(h.mv.pos);
-                    if d <= sim::HARVEST_RADIUS && d < best_dist {
+                    let d = deposit.pos.distance(m.mv.pos);
+                    if d <= sim::MINING_RADIUS && d < best_dist {
                         best_dist = d;
                         best = Some(i);
                     }
                 }
                 if let Some(i) = best {
-                    let take = (sim::HARVEST_RATE * dt).min(capacity - h.cargo).min(self.ore[i].amount);
+                    let take = (sim::MINING_RATE * dt).min(capacity - m.cargo).min(self.ore[i].amount);
                     self.ore[i].amount -= take;
-                    h.cargo += take;
+                    m.cargo += take;
                     self.dirty_ore.insert(i as u16);
                 }
             }
 
             // Unload at the home pad.
-            if h.cargo > 0.0 && sim::is_at_base(h.mv.pos, id) {
-                let moved = (sim::UNLOAD_RATE * dt).min(h.cargo);
-                h.cargo -= moved;
+            if m.cargo > 0.0 && sim::is_at_base(m.mv.pos, id) {
+                let moved = (sim::UNLOAD_RATE * dt).min(m.cargo);
+                m.cargo -= moved;
                 // Credits are whole units; the fraction stays aboard rather
                 // than evaporating.
                 let whole = moved.floor().max(0.0) as u32;
                 let remainder = moved - whole as f32;
-                h.cargo += remainder;
+                m.cargo += remainder;
                 p.credits += whole;
                 p.ore_mined += whole;
             }
@@ -1499,15 +1499,15 @@ impl Game {
             }
             let owner = p.id;
             let powerups = p.powerups;
-            let Some(h) = p.harvester.as_mut() else { continue };
-            if !h.disabled {
+            let Some(m) = p.miner.as_mut() else { continue };
+            if !m.disabled {
                 continue;
             }
 
             let mut captor: Option<u8> = None;
             let mut owner_present = false;
             for (tank_owner, pos) in &tanks {
-                if pos.distance(h.mv.pos) > sim::CAPTURE_RADIUS {
+                if pos.distance(m.mv.pos) > sim::CAPTURE_RADIUS {
                     continue;
                 }
                 if *tank_owner == owner {
@@ -1524,28 +1524,28 @@ impl Game {
                 // where it is, and whoever gives up the ground first decides how
                 // this ends. Without this the defender simply outran the capture
                 // -- a rescue takes about three seconds against a four-second
-                // capture -- so a contested harvester could never be taken and
+                // capture -- so a contested miner could never be taken and
                 // spent the fight flicking between wreck and running.
                 (true, Some(_)) => {}
 
-                // Your own tank alone over your harvester patches it up, which
-                // is what gives a disabled harvester a way back into the match.
+                // Your own tank alone over your miner patches it up, which
+                // is what gives a disabled miner a way back into the match.
                 (true, None) => {
-                    let max_hull = sim::max_hull(VehicleKind::Harvester, powerups);
-                    h.hull = (h.hull + sim::RESCUE_REPAIR_RATE * dt).min(max_hull);
-                    h.capture_progress = (h.capture_progress - dt / sim::CAPTURE_TIME).max(0.0);
-                    if h.hull >= max_hull * sim::REENABLE_HULL_FRACTION {
-                        h.disabled = false;
-                        h.capture_progress = 0.0;
-                        h.shield = 0.0;
-                        h.since_damage = 0.0;
+                    let max_hull = sim::max_hull(VehicleKind::Miner, powerups);
+                    m.hull = (m.hull + sim::RESCUE_REPAIR_RATE * dt).min(max_hull);
+                    m.capture_progress = (m.capture_progress - dt / sim::CAPTURE_TIME).max(0.0);
+                    if m.hull >= max_hull * sim::REENABLE_HULL_FRACTION {
+                        m.disabled = false;
+                        m.capture_progress = 0.0;
+                        m.shield = 0.0;
+                        m.since_damage = 0.0;
                         rescued.push(owner);
                     }
                 }
 
                 (false, Some(by)) => {
-                    h.capture_progress += dt / sim::CAPTURE_TIME;
-                    if h.capture_progress >= 1.0 {
+                    m.capture_progress += dt / sim::CAPTURE_TIME;
+                    if m.capture_progress >= 1.0 {
                         captures.push((by, owner));
                     }
                 }
@@ -1553,14 +1553,14 @@ impl Game {
                 // Nobody in range; progress decays so a partial attempt does
                 // not linger indefinitely.
                 (false, None) => {
-                    h.capture_progress =
-                        (h.capture_progress - dt / (sim::CAPTURE_TIME * 2.0)).max(0.0);
+                    m.capture_progress =
+                        (m.capture_progress - dt / (sim::CAPTURE_TIME * 2.0)).max(0.0);
                 }
             }
         }
 
         for player in rescued {
-            self.events.push(GameEvent::HarvesterRescued { player });
+            self.events.push(GameEvent::MinerRescued { player });
         }
         for (by, from) in captures {
             self.apply_capture(by, from);
@@ -1570,11 +1570,11 @@ impl Game {
     fn apply_capture(&mut self, by: u8, from: u8) {
         let mut spoils = 0u32;
         if let Some(victim) = self.player_mut(from) {
-            // Whole units only, matching how a harvester unloads at its own pad;
+            // Whole units only, matching how a miner unloads at its own pad;
             // the fraction is lost with the hull rather than rounded up.
-            spoils = victim.harvester.as_ref().map_or(0.0, |h| h.cargo).floor().max(0.0) as u32;
-            victim.harvester = None;
-            // A player with no harvester has nothing left to defend, so their
+            spoils = victim.miner.as_ref().map_or(0.0, |m| m.cargo).floor().max(0.0) as u32;
+            victim.miner = None;
+            // A player with no miner has nothing left to defend, so their
             // tank leaves the field with it. They are off the field rather than
             // out of the match: `eliminated` means "not here right now", and
             // `down_for` is how long that lasts.
@@ -1596,7 +1596,7 @@ impl Game {
             captor.credits += spoils;
             captor.ore_mined += spoils;
         }
-        self.events.push(GameEvent::HarvesterCaptured { by, from });
+        self.events.push(GameEvent::MinerCaptured { by, from });
         // Only worth saying when there was something aboard.
         if spoils > 0 {
             self.events.push(GameEvent::OreSeized { by, from, amount: spoils });
@@ -1613,25 +1613,25 @@ impl Game {
         for slot_index in 0..self.players.len() {
             let Some(p) = self.players[slot_index].as_mut() else { continue };
 
-            // A player whose harvester was taken sits the minute out and then
+            // A player whose miner was taken sits the minute out and then
             // starts again: fresh vehicles, an empty bank, and every upgrade
-            // they had bought still theirs. Losing a harvester costs a minute
+            // they had bought still theirs. Losing a miner costs a minute
             // and everything liquid, not the match.
             if p.down_for > 0.0 {
                 p.down_for -= dt;
                 if p.down_for > 0.0 {
                     continue;
                 }
-                let (tank_pos, harvester_pos, inward) = starting_placement(p.id);
+                let (tank_pos, miner_pos, inward) = starting_placement(p.id);
                 p.down_for = 0.0;
                 p.eliminated = false;
                 p.credits = 0;
                 p.missiles = STARTING_MISSILES;
                 p.tank =
                     Some(Vehicle::spawn(VehicleKind::Tank, tank_pos, inward, p.powerups));
-                p.harvester = Some(Vehicle::spawn(
-                    VehicleKind::Harvester,
-                    harvester_pos,
+                p.miner = Some(Vehicle::spawn(
+                    VehicleKind::Miner,
+                    miner_pos,
                     inward,
                     p.powerups,
                 ));
@@ -1669,10 +1669,10 @@ impl Game {
     }
 
     /// Being the only one left on the field wins it, and so does taking three
-    /// harvesters.
+    /// miners.
     ///
     /// Last one standing is the ending the game is actually about: you win by
-    /// taking everybody else's harvester. A capture only puts its victim off the
+    /// taking everybody else's miner. A capture only puts its victim off the
     /// field for a minute, so it is checked against who is on the field *now* --
     /// in a two-player match that means one capture ends it, before the minute
     /// has a chance to run out and hand the loser a second life nobody is left
@@ -1721,7 +1721,7 @@ impl Game {
         let eye = self
             .player(viewer)
             .and_then(|p| {
-                p.vehicle(p.input.controlling).or(p.tank.as_ref()).or(p.harvester.as_ref())
+                p.vehicle(p.input.controlling).or(p.tank.as_ref()).or(p.miner.as_ref())
             })
             .map(|v| v.mv.pos)
             .unwrap_or(Vec2::splat(world::WORLD_SIZE * 0.5));
@@ -1740,7 +1740,7 @@ impl Game {
         if hits.len() > MAX_HITS_PER_SNAPSHOT {
             let eye = self
                 .player(viewer)
-                .and_then(|p| p.tank.as_ref().or(p.harvester.as_ref()))
+                .and_then(|p| p.tank.as_ref().or(p.miner.as_ref()))
                 .map_or(Vec2::splat(world::WORLD_SIZE * 0.5), |v| v.mv.pos);
             hits.sort_by(|a, b| {
                 a.pos.distance_squared(eye).total_cmp(&b.pos.distance_squared(eye))
@@ -1816,14 +1816,14 @@ mod tests {
     /// so the lockout, the return, and the long road to three captures all need
     /// somebody else still playing to be observable at all.
     ///
-    /// The third player's harvester holds station at their own base rather than
+    /// The third player's miner holds station at their own base rather than
     /// setting off across the map: these tests step minutes at a time, and an
-    /// unattended harvester wandering into somebody's sentinels is a variable
+    /// unattended miner wandering into somebody's sentinels is a variable
     /// none of them are about.
     fn three_player_game() -> Game {
         let mut g = two_player_game();
         g.join(3, "three").unwrap();
-        g.set_harvester_mode(2, HarvesterMode::Stop);
+        g.set_miner_mode(2, MinerMode::Stop);
         g.step(TICK_DT);
         g
     }
@@ -1847,7 +1847,7 @@ mod tests {
             let p = g.player(id).unwrap();
             let base = world::base_position(id);
             assert!(p.tank.as_ref().unwrap().mv.pos.distance(base) < 15.0);
-            assert!(p.harvester.as_ref().unwrap().mv.pos.distance(base) < 15.0);
+            assert!(p.miner.as_ref().unwrap().mv.pos.distance(base) < 15.0);
         }
         let a = g.player(0).unwrap().tank.as_ref().unwrap().mv.pos;
         let b = g.player(1).unwrap().tank.as_ref().unwrap().mv.pos;
@@ -1862,7 +1862,7 @@ mod tests {
         g.disconnect(0);
         assert!(!g.player(0).unwrap().connected);
         // The vehicles stay on the field while the player is away.
-        assert!(g.player(0).unwrap().harvester.is_some());
+        assert!(g.player(0).unwrap().miner.is_some());
 
         let id = g.join(1, "one").unwrap();
         assert_eq!(id, 0, "same token must resume the same slot");
@@ -1898,7 +1898,7 @@ mod tests {
         assert_eq!(p.powerups, STARTING_POWERUPS);
         assert_eq!(p.ore_mined, 0);
         assert_eq!(p.captures, 0);
-        assert!(p.tank.is_some() && p.harvester.is_some());
+        assert!(p.tank.is_some() && p.miner.is_some());
         assert_eq!(p.input, InputFrame::default(), "a held key must not cross over");
 
         assert_eq!(g.seed, 999);
@@ -2006,24 +2006,24 @@ mod tests {
     }
 
     #[test]
-    fn harvesting_moves_ore_into_cargo_then_into_credits() {
+    fn mining_moves_ore_into_cargo_then_into_credits() {
         let mut g = two_player_game();
         let deposit = g.ore[0].pos;
         {
-            let h = g.player_mut(0).unwrap().harvester.as_mut().unwrap();
-            h.mv.pos = deposit;
-            h.mv.speed = 0.0;
+            let m = g.player_mut(0).unwrap().miner.as_mut().unwrap();
+            m.mv.pos = deposit;
+            m.mv.speed = 0.0;
         }
         let before = g.ore[0].amount;
         for _ in 0..30 {
             g.step(TICK_DT);
         }
         assert!(g.ore[0].amount < before, "deposit should deplete");
-        let cargo = g.player(0).unwrap().harvester.as_ref().unwrap().cargo;
-        assert!(cargo > 0.0, "harvester should be carrying ore");
+        let cargo = g.player(0).unwrap().miner.as_ref().unwrap().cargo;
+        assert!(cargo > 0.0, "miner should be carrying ore");
 
         // Teleport home and let it unload.
-        g.player_mut(0).unwrap().harvester.as_mut().unwrap().mv.pos = world::base_position(0);
+        g.player_mut(0).unwrap().miner.as_mut().unwrap().mv.pos = world::base_position(0);
         let credits_before = g.player(0).unwrap().credits;
         for _ in 0..60 {
             g.step(TICK_DT);
@@ -2032,19 +2032,19 @@ mod tests {
     }
 
     #[test]
-    fn a_moving_harvester_cannot_harvest() {
+    fn a_moving_miner_cannot_mine() {
         let mut g = two_player_game();
         let deposit = g.ore[0].pos;
         {
             let p = g.player_mut(0).unwrap();
-            p.input.controlling = VehicleSlot::Harvester;
+            p.input.controlling = VehicleSlot::Miner;
             p.input.throttle = 1.0;
-            let h = p.harvester.as_mut().unwrap();
-            h.mv.pos = deposit;
-            h.mv.speed = sim::HARVEST_MAX_SPEED + 3.0;
+            let m = p.miner.as_mut().unwrap();
+            m.mv.pos = deposit;
+            m.mv.speed = sim::MINING_MAX_SPEED + 3.0;
         }
         g.step(TICK_DT);
-        assert_eq!(g.player(0).unwrap().harvester.as_ref().unwrap().cargo, 0.0);
+        assert_eq!(g.player(0).unwrap().miner.as_ref().unwrap().cargo, 0.0);
     }
 
     #[test]
@@ -2098,22 +2098,22 @@ mod tests {
     }
 
     #[test]
-    fn a_harvester_is_disabled_rather_than_destroyed() {
+    fn a_miner_is_disabled_rather_than_destroyed() {
         let mut g = two_player_game();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let h = g.player(0).unwrap().harvester.as_ref().expect("harvester must remain");
-        assert!(h.disabled);
-        assert_eq!(h.hull, 0.0);
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let m = g.player(0).unwrap().miner.as_ref().expect("miner must remain");
+        assert!(m.disabled);
+        assert_eq!(m.hull, 0.0);
         assert!(!g.player(0).unwrap().eliminated, "it has to be captured, not just shot");
     }
 
-    /// Takes one harvester and lets the clock run out on the victim.
+    /// Takes one miner and lets the clock run out on the victim.
     ///
     /// Returns the game with the capture done, so the tests below can each pick
     /// up the part of the aftermath they care about.
     fn capture_once(g: &mut Game, by: u8, from: u8) {
-        g.damage_vehicle(from, VehicleSlot::Harvester, 100_000.0, by, 0.0);
-        let wreck = g.player(from).unwrap().harvester.as_ref().unwrap().mv.pos;
+        g.damage_vehicle(from, VehicleSlot::Miner, 100_000.0, by, 0.0);
+        let wreck = g.player(from).unwrap().miner.as_ref().unwrap().mv.pos;
         // Vehicles spawn within capture range of each other, so the owner's tank
         // has to be drawn away before the wreck is actually takeable.
         g.player_mut(from).unwrap().tank.as_mut().unwrap().mv.pos = Vec2::splat(128.0);
@@ -2122,7 +2122,7 @@ mod tests {
             g.player_mut(by).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
             g.step(TICK_DT);
         }
-        assert!(g.player(from).unwrap().harvester.is_none(), "the harvester changed hands");
+        assert!(g.player(from).unwrap().miner.is_none(), "the miner changed hands");
     }
 
     /// A capture takes a player off the field, not out of the match.
@@ -2140,7 +2140,7 @@ mod tests {
 
         capture_once(&mut g, 1, 0);
         assert!(g.player(0).unwrap().eliminated, "off the field for now");
-        assert!(g.player(0).unwrap().tank.is_none(), "the tank goes with the harvester");
+        assert!(g.player(0).unwrap().tank.is_none(), "the tank goes with the miner");
         assert_ne!(g.status, GameStatus::Finished, "one capture is not the match");
 
         // Still gone most of the way through the minute.
@@ -2155,7 +2155,7 @@ mod tests {
         }
         let p = g.player(0).unwrap();
         assert!(!p.eliminated, "should be back after the lockout");
-        assert!(p.tank.is_some() && p.harvester.is_some(), "both vehicles come back");
+        assert!(p.tank.is_some() && p.miner.is_some(), "both vehicles come back");
         assert_eq!(p.credits, 0, "the bank is gone");
         assert_eq!(p.missiles, STARTING_MISSILES, "restocked as at the start of a match");
         assert_eq!(
@@ -2163,7 +2163,7 @@ mod tests {
             PowerUp::Turbo.bit() | PowerUp::Radar.bit(),
             "upgrades are permanent -- they are the whole reason to keep playing"
         );
-        assert_eq!(p.harvester.as_ref().unwrap().cargo, 0.0);
+        assert_eq!(p.miner.as_ref().unwrap().cargo, 0.0);
         assert!(
             g.events.iter().any(|e| matches!(e, GameEvent::PlayerReturned { player: 0 })),
             "and it should be announced"
@@ -2176,7 +2176,7 @@ mod tests {
         let mut g = three_player_game();
         g.hills.clear();
         capture_once(&mut g, 1, 0);
-        // Checked the instant they return: the harvester is on autopilot and
+        // Checked the instant they return: the miner is on autopilot and
         // sets off for the nearest ore straight away, so waiting even a second
         // longer would be measuring where it drove to, not where it started.
         for _ in 0..((sim::CAPTURE_LOCKOUT / TICK_DT) as usize + 60) {
@@ -2194,13 +2194,13 @@ mod tests {
             p.tank.as_ref().unwrap().mv.pos.distance(base)
         );
         assert!(
-            p.harvester.as_ref().unwrap().mv.pos.distance(base) < 12.0,
-            "harvester came back {:.1} from base",
-            p.harvester.as_ref().unwrap().mv.pos.distance(base)
+            p.miner.as_ref().unwrap().mv.pos.distance(base) < 12.0,
+            "miner came back {:.1} from base",
+            p.miner.as_ref().unwrap().mv.pos.distance(base)
         );
     }
 
-    /// The ending the game is about: take the last harvester and it is yours.
+    /// The ending the game is about: take the last miner and it is yours.
     #[test]
     fn capturing_the_last_opponent_wins_the_match() {
         let mut g = two_player_game();
@@ -2229,7 +2229,7 @@ mod tests {
         assert_ne!(g.status, GameStatus::Finished, "player 2 is still out there");
         assert_eq!(g.winner, None);
 
-        // Taking the bystander's harvester while the first victim is still in
+        // Taking the bystander's miner while the first victim is still in
         // their minute leaves one player on the field, and that ends it.
         capture_once(&mut g, 1, 2);
         assert!(g.player(0).unwrap().eliminated, "the first victim is still down");
@@ -2240,7 +2240,7 @@ mod tests {
     /// Dropping out is not the same as being taken off the field.
     ///
     /// A player who loses their connection leaves their vehicles where they
-    /// stand, and their harvester can still be taken -- which is how the match
+    /// stand, and their miner can still be taken -- which is how the match
     /// is meant to be won. Handing it over the moment somebody's wifi blinks
     /// would end matches nobody had finished.
     #[test]
@@ -2251,13 +2251,13 @@ mod tests {
             g.step(TICK_DT);
         }
         assert_eq!(g.status, GameStatus::Running);
-        assert_eq!(g.winner, None, "there is still a harvester out there to take");
+        assert_eq!(g.winner, None, "there is still a miner out there to take");
     }
 
     /// The other way home: a match nobody can clear the field of is still won
-    /// by taking three harvesters.
+    /// by taking three miners.
     #[test]
-    fn taking_three_harvesters_wins_the_match() {
+    fn taking_three_miners_wins_the_match() {
         let mut g = three_player_game();
         g.hills.clear();
         for round in 1..=sim::CAPTURES_TO_WIN {
@@ -2265,7 +2265,7 @@ mod tests {
             assert_eq!(g.player(1).unwrap().captures, round);
             if round < sim::CAPTURES_TO_WIN {
                 assert_ne!(g.status, GameStatus::Finished, "won after only {round}");
-                // Let them back on the field so there is a harvester to take.
+                // Let them back on the field so there is a miner to take.
                 for _ in 0..((sim::CAPTURE_LOCKOUT / TICK_DT) as usize + 60) {
                     g.step(TICK_DT);
                 }
@@ -2277,41 +2277,41 @@ mod tests {
     }
 
     #[test]
-    fn an_owner_can_rescue_their_own_disabled_harvester() {
+    fn an_owner_can_rescue_their_own_disabled_miner() {
         let mut g = two_player_game();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
 
         for _ in 0..600 {
             g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
             g.step(TICK_DT);
-            if !g.player(0).unwrap().harvester.as_ref().unwrap().disabled {
+            if !g.player(0).unwrap().miner.as_ref().unwrap().disabled {
                 break;
             }
         }
-        assert!(!g.player(0).unwrap().harvester.as_ref().unwrap().disabled, "should be repaired");
+        assert!(!g.player(0).unwrap().miner.as_ref().unwrap().disabled, "should be repaired");
         assert!(!g.player(0).unwrap().eliminated);
     }
 
-    /// Bringing a harvester back has to be slower than taking it.
+    /// Bringing a miner back has to be slower than taking it.
     ///
     /// Otherwise disabling one achieves nothing: the attacker has to cross the
     /// distance to the wreck *and then* hold it for `CAPTURE_TIME`, while the
     /// defender only has to drive back to it. A tank now spawns well outside
-    /// `CAPTURE_RADIUS` of its own harvester, so that return trip is real, but
+    /// `CAPTURE_RADIUS` of its own miner, so that return trip is real, but
     /// the repair itself still has to be the slower half of the exchange.
     #[test]
     fn a_rescue_takes_longer_than_a_capture() {
         let mut g = two_player_game();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         // Owner alone on it, which is the fastest a rescue can go.
         let mut ticks = 0;
         while ticks < 2000 {
             g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
             g.step(TICK_DT);
             ticks += 1;
-            if !g.player(0).unwrap().harvester.as_ref().unwrap().disabled {
+            if !g.player(0).unwrap().miner.as_ref().unwrap().disabled {
                 break;
             }
         }
@@ -2393,15 +2393,15 @@ mod tests {
     }
 
     /// A wreck is scenery: solid, but it neither moves nor takes any more
-    /// punishment. Without this a captor could shove the harvester they came for
+    /// punishment. Without this a captor could shove the miner they came for
     /// out from under themselves, or finish it off by driving at it.
     #[test]
     fn a_wreck_is_solid_but_takes_nothing_and_gives_no_ground() {
         let mut g = two_player_game();
         g.hills.clear();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
-        let hull = g.player(0).unwrap().harvester.as_ref().unwrap().hull;
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
+        let hull = g.player(0).unwrap().miner.as_ref().unwrap().hull;
 
         // Straight through the middle of it at full speed.
         {
@@ -2415,12 +2415,12 @@ mod tests {
         }
         g.step(TICK_DT);
 
-        let h = g.player(0).unwrap().harvester.as_ref().unwrap();
-        assert_eq!(h.mv.pos, wreck, "a wreck has no engine to be shoved with");
-        assert_eq!(h.hull, hull, "and nothing left to lose");
+        let m = g.player(0).unwrap().miner.as_ref().unwrap();
+        assert_eq!(m.mv.pos, wreck, "a wreck has no engine to be shoved with");
+        assert_eq!(m.hull, hull, "and nothing left to lose");
 
         let touching =
-            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Miner).radius;
         let tank = g.player(1).unwrap().tank.as_ref().unwrap().mv.pos;
         assert!(
             tank.distance(wreck) >= touching - 1e-3,
@@ -2432,14 +2432,14 @@ mod tests {
     /// The reach has to survive hulls no longer overlapping.
     ///
     /// [`sim::CAPTURE_RADIUS`] used to be wide enough that a tank covered its
-    /// own harvester from where it spawned. Now that it is close to touching, it
+    /// own miner from where it spawned. Now that it is close to touching, it
     /// has to clear the distance two hulls are held apart at -- otherwise a tank
     /// pressed right up against a wreck would still be out of range and no
     /// capture could ever complete.
     #[test]
     fn a_tank_pressed_against_a_wreck_is_in_range_to_take_it() {
         let touching =
-            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Miner).radius;
         assert!(
             sim::CAPTURE_RADIUS > touching,
             "hulls are held {touching} apart, so a {} reach can never be met",
@@ -2450,8 +2450,8 @@ mod tests {
         // top of it, still takes it.
         let mut g = two_player_game();
         g.hills.clear();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
             t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
@@ -2524,10 +2524,10 @@ mod tests {
     ///
     /// The client keeps naming the vehicle it last chose, so a destroyed tank
     /// used to mean every input was applied to a hull that no longer existed --
-    /// the harvester sat there unattended and the player was frozen out until
+    /// the miner sat there unattended and the player was frozen out until
     /// the respawn.
     #[test]
-    fn a_destroyed_tank_hands_control_to_the_harvester() {
+    fn a_destroyed_tank_hands_control_to_the_miner() {
         let mut g = two_player_game();
         g.hills.clear();
         g.damage_vehicle(0, VehicleSlot::Tank, 100_000.0, 1, 0.0);
@@ -2536,7 +2536,7 @@ mod tests {
             "the tank has to be gone for this to test anything"
         );
 
-        let start = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        let start = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         for tick in 0..30u32 {
             // Still asking to drive the tank, exactly as a client would.
             g.set_input(
@@ -2550,8 +2550,8 @@ mod tests {
             );
             g.step(TICK_DT);
         }
-        let moved = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos.distance(start);
-        assert!(moved > 3.0, "the harvester only moved {moved:.2}; the player is still frozen out");
+        let moved = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos.distance(start);
+        assert!(moved > 3.0, "the miner only moved {moved:.2}; the player is still frozen out");
     }
 
     /// Helper: give a player the aircraft and put a sortie in the air.
@@ -2851,18 +2851,18 @@ mod tests {
     /// A blast is aimed at a place: near misses hurt, far ones do not.
     #[test]
     fn a_bomb_hurts_what_is_near_where_it_lands() {
-        // Measured on a harvester rather than a tank, and on shield *and* hull
+        // Measured on a miner rather than a tank, and on shield *and* hull
         // rather than shield alone. A bomb now takes a base tank apart in one
         // hit, so a tank would stop existing part way through the experiment
-        // and take the reading with it; a harvester is disabled rather than
+        // and take the reading with it; a miner is disabled rather than
         // destroyed and stays there to be measured.
         let damage_at = |offset: f32| {
             let mut g = two_player_game();
             g.hills.clear();
             let at = Vec2::new(200.0, 200.0);
             {
-                let h = g.player_mut(1).unwrap().harvester.as_mut().unwrap();
-                h.mv = MoveState {
+                let m = g.player_mut(1).unwrap().miner.as_mut().unwrap();
+                m.mv = MoveState {
                     pos: at + Vec2::new(offset, 0.0),
                     yaw: 0.0,
                     speed: 0.0,
@@ -2870,8 +2870,8 @@ mod tests {
                 };
             }
             let taken = |g: &Game| {
-                let h = g.player(1).unwrap().harvester.as_ref().unwrap();
-                h.shield + h.hull
+                let m = g.player(1).unwrap().miner.as_ref().unwrap();
+                m.shield + m.hull
             };
             let before = taken(&g);
             // Dropped straight down: no travel, so it lands exactly here.
@@ -2891,7 +2891,7 @@ mod tests {
         let direct = damage_at(0.0);
         let near = damage_at(sim::BOMB_BLAST_RADIUS * 0.6);
         let clear = damage_at(sim::BOMB_BLAST_RADIUS + 5.0);
-        assert!(direct > 0.0, "a bomb landing on a harvester did nothing");
+        assert!(direct > 0.0, "a bomb landing on a miner did nothing");
         assert!(near > 0.0 && near < direct, "the falloff is not a slope: {direct} then {near}");
         assert_eq!(clear, 0.0, "a bomb outside its own radius still did {clear}");
         // The whole point of the change: a hit is worth the sortie it took.
@@ -2942,21 +2942,21 @@ mod tests {
 
     /// A wreck keeps its load, and the load goes to whoever takes it.
     #[test]
-    fn capturing_a_loaded_harvester_seizes_its_ore() {
+    fn capturing_a_loaded_miner_seizes_its_ore() {
         let mut g = two_player_game();
         g.hills.clear();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
 
         // Disabling must not empty it -- that is where the ore used to vanish.
         {
-            let h = g.player_mut(0).unwrap().harvester.as_mut().unwrap();
-            h.cargo = 42.7;
+            let m = g.player_mut(0).unwrap().miner.as_mut().unwrap();
+            m.cargo = 42.7;
         }
         let before = g.player(1).unwrap().credits;
 
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         let touching =
-            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Miner).radius;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
             t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
@@ -2980,15 +2980,15 @@ mod tests {
         );
     }
 
-    /// An empty harvester should not claim a haul that was never there.
+    /// An empty miner should not claim a haul that was never there.
     #[test]
-    fn capturing_an_empty_harvester_announces_nothing() {
+    fn capturing_an_empty_miner_announces_nothing() {
         let mut g = two_player_game();
         g.hills.clear();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         let touching =
-            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Harvester).radius;
+            sim::tuning(VehicleKind::Tank).radius + sim::tuning(VehicleKind::Miner).radius;
         {
             let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
             t.mv = MoveState { pos: wreck + Vec2::new(touching, 0.0), yaw: 0.0, speed: 0.0, roll: 0.0 };
@@ -3019,24 +3019,24 @@ mod tests {
         let (a, b) = (post + ahead + across, post + ahead - across);
 
         let mut hit_tank = 0u32;
-        let mut hit_harvester = 0u32;
+        let mut hit_miner = 0u32;
         for _ in 0..600 {
             // Held in place; this test is about who gets shot at.
             {
                 let p = g.player_mut(1).unwrap();
                 p.tank.as_mut().unwrap().mv = MoveState { pos: a, yaw: 0.0, speed: 0.0, roll: 0.0 };
-                p.harvester.as_mut().unwrap().mv = MoveState { pos: b, yaw: 0.0, speed: 0.0, roll: 0.0 };
+                p.miner.as_mut().unwrap().mv = MoveState { pos: b, yaw: 0.0, speed: 0.0, roll: 0.0 };
                 p.tank.as_mut().unwrap().shield = 100.0;
-                p.harvester.as_mut().unwrap().shield = 100.0;
+                p.miner.as_mut().unwrap().shield = 100.0;
             }
             g.step(TICK_DT);
             let p = g.player(1).unwrap();
             hit_tank += (p.tank.as_ref().unwrap().shield < 100.0) as u32;
-            hit_harvester += (p.harvester.as_ref().unwrap().shield < 100.0) as u32;
+            hit_miner += (p.miner.as_ref().unwrap().shield < 100.0) as u32;
         }
         assert!(
-            hit_tank > 0 && hit_harvester > 0,
-            "both hulls should have been engaged, got {hit_tank}/{hit_harvester}"
+            hit_tank > 0 && hit_miner > 0,
+            "both hulls should have been engaged, got {hit_tank}/{hit_miner}"
         );
     }
 
@@ -3070,7 +3070,7 @@ mod tests {
         );
     }
 
-    /// The same at the harvester's own turret, which is where sharing the
+    /// The same at the miner's own turret, which is where sharing the
     /// tank's shell actually bit: it engaged out to `AUTO_TURRET_RANGE` while
     /// its shell died about two units short of it.
     #[test]
@@ -3087,7 +3087,7 @@ mod tests {
         for _ in 0..300 {
             // Both held: this is about whether the shell arrives, not about
             // where an autopilot would rather be.
-            g.player_mut(0).unwrap().harvester.as_mut().unwrap().mv =
+            g.player_mut(0).unwrap().miner.as_mut().unwrap().mv =
                 MoveState { pos: station, yaw: 0.0, speed: 0.0, roll: 0.0 };
             g.player_mut(1).unwrap().tank.as_mut().unwrap().mv =
                 MoveState { pos: victim, yaw: 0.0, speed: 0.0, roll: 0.0 };
@@ -3187,13 +3187,13 @@ mod tests {
     /// Runs the full loop -- find ore, fill up, come home, unload -- with the
     /// player notionally in their tank the entire time.
     #[test]
-    fn an_auto_harvester_mines_and_banks_without_being_driven() {
+    fn an_auto_miner_mines_and_banks_without_being_driven() {
         let mut g = two_player_game();
         let start = g.player(0).unwrap().credits;
-        assert_eq!(g.player(0).unwrap().harvester_mode, HarvesterMode::Auto, "the default");
+        assert_eq!(g.player(0).unwrap().miner_mode, MinerMode::Auto, "the default");
 
         // Two minutes of nobody touching it. The player sits in their tank, so
-        // the harvester is on its own the whole way.
+        // the miner is on its own the whole way.
         for tick in 0..3600u32 {
             g.set_input(
                 0,
@@ -3210,7 +3210,7 @@ mod tests {
         assert!(
             p.ore_mined > 0,
             "it never banked anything: cargo {:.1}, credits {}",
-            p.harvester.as_ref().unwrap().cargo,
+            p.miner.as_ref().unwrap().cargo,
             p.credits
         );
         assert!(p.credits > start, "credits went {start} -> {}", p.credits);
@@ -3218,27 +3218,27 @@ mod tests {
 
     /// Stop means stop, so a player can park it somewhere deliberately.
     #[test]
-    fn a_stopped_harvester_stays_where_it_is() {
+    fn a_stopped_miner_stays_where_it_is() {
         let mut g = two_player_game();
-        g.set_harvester_mode(0, HarvesterMode::Stop);
-        let start = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        g.set_miner_mode(0, MinerMode::Stop);
+        let start = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         for _ in 0..600 {
             g.step(TICK_DT);
         }
-        let moved = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos.distance(start);
+        let moved = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos.distance(start);
         assert!(moved < 1.0, "it wandered {moved:.2} with the brakes on");
     }
 
     /// Home means home, and arriving there is what banks the load.
     #[test]
-    fn a_harvester_sent_home_goes_home() {
+    fn a_miner_sent_home_goes_home() {
         let mut g = two_player_game();
-        g.set_harvester_mode(0, HarvesterMode::Home);
+        g.set_miner_mode(0, MinerMode::Home);
         // Start it well out in the field so the trip is real.
         {
-            let h = g.player_mut(0).unwrap().harvester.as_mut().unwrap();
-            h.mv = MoveState { pos: Vec2::splat(world::WORLD_SIZE * 0.4), yaw: 0.0, speed: 0.0, roll: 0.0 };
-            h.cargo = 20.0;
+            let m = g.player_mut(0).unwrap().miner.as_mut().unwrap();
+            m.mv = MoveState { pos: Vec2::splat(world::WORLD_SIZE * 0.4), yaw: 0.0, speed: 0.0, roll: 0.0 };
+            m.cargo = 20.0;
         }
         for _ in 0..5400 {
             g.step(TICK_DT);
@@ -3246,7 +3246,7 @@ mod tests {
                 break;
             }
         }
-        let pos = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        let pos = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         assert!(
             sim::is_at_base(pos, 0),
             "ended at {pos:?}, not on its pad at {:?}",
@@ -3258,14 +3258,14 @@ mod tests {
     #[test]
     fn an_owner_tank_contests_an_enemy_capture() {
         let mut g = two_player_game();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize * 2) {
             g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
             g.player_mut(0).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
             g.step(TICK_DT);
         }
-        assert!(!g.player(0).unwrap().eliminated, "a defended harvester must not be taken");
+        assert!(!g.player(0).unwrap().eliminated, "a defended miner must not be taken");
     }
 
     /// The other half of contesting: standing over your own wreck denies the
@@ -3274,9 +3274,9 @@ mod tests {
     #[test]
     fn a_contested_wreck_is_neither_taken_nor_repaired() {
         let mut g = two_player_game();
-        g.damage_vehicle(0, VehicleSlot::Harvester, 100_000.0, 1, 0.0);
-        let wreck = g.player(0).unwrap().harvester.as_ref().unwrap().mv.pos;
-        let hull = g.player(0).unwrap().harvester.as_ref().unwrap().hull;
+        g.damage_vehicle(0, VehicleSlot::Miner, 100_000.0, 1, 0.0);
+        let wreck = g.player(0).unwrap().miner.as_ref().unwrap().mv.pos;
+        let hull = g.player(0).unwrap().miner.as_ref().unwrap().hull;
 
         for _ in 0..((sim::CAPTURE_TIME / TICK_DT) as usize * 2) {
             g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = wreck;
@@ -3284,9 +3284,9 @@ mod tests {
             g.step(TICK_DT);
         }
 
-        let h = g.player(0).unwrap().harvester.as_ref().unwrap();
-        assert!(h.disabled, "a contested wreck stays a wreck");
-        assert_eq!(h.hull, hull, "no free repairs with an enemy tank on top of it");
+        let m = g.player(0).unwrap().miner.as_ref().unwrap();
+        assert!(m.disabled, "a contested wreck stays a wreck");
+        assert_eq!(m.hull, hull, "no free repairs with an enemy tank on top of it");
         assert_eq!(g.player(1).unwrap().captures, 0, "and it is not taken either");
     }
 
@@ -3305,7 +3305,7 @@ mod tests {
         };
         let victim_pos = shooter + Vec2::new(20.0, 0.0);
         g.player_mut(1).unwrap().tank.as_mut().unwrap().mv.pos = victim_pos;
-        let own_harvester_shield = g.player(0).unwrap().harvester.as_ref().unwrap().shield;
+        let own_miner_shield = g.player(0).unwrap().miner.as_ref().unwrap().shield;
 
         let start = g.player(1).unwrap().tank.as_ref().unwrap().shield;
         for tick in 0..30u32 {
@@ -3318,8 +3318,8 @@ mod tests {
             "the target should have taken fire"
         );
         assert_eq!(
-            g.player(0).unwrap().harvester.as_ref().unwrap().shield,
-            own_harvester_shield,
+            g.player(0).unwrap().miner.as_ref().unwrap().shield,
+            own_miner_shield,
             "a player's own vehicles must be immune to their fire"
         );
     }

@@ -24,14 +24,14 @@ pub struct VehicleView {
     pub slot: VehicleSlot,
 }
 
-/// The rotating part of a tank, and the auto-turret on a harvester.
+/// The rotating part of a tank, and the auto-turret on a miner.
 #[derive(Component)]
 pub struct TurretView;
 
 #[derive(Component)]
 pub struct ShieldBubble;
 
-/// Floating bar over a disabled harvester showing capture progress.
+/// Floating bar over a disabled miner showing capture progress.
 #[derive(Component)]
 pub struct CaptureBar;
 
@@ -66,13 +66,13 @@ pub struct VehicleAssets {
     tank_mantlet: Handle<Mesh>,
     tank_barrel: Handle<Mesh>,
     tank_muzzle: Handle<Mesh>,
-    harvester_hull: Handle<Mesh>,
-    harvester_bin: Handle<Mesh>,
-    harvester_drum: Handle<Mesh>,
-    harvester_tread: Handle<Mesh>,
-    harvester_wheel: Handle<Mesh>,
-    harvester_turret: Handle<Mesh>,
-    harvester_barrel: Handle<Mesh>,
+    miner_hull: Handle<Mesh>,
+    miner_bin: Handle<Mesh>,
+    miner_drum: Handle<Mesh>,
+    miner_tread: Handle<Mesh>,
+    miner_wheel: Handle<Mesh>,
+    miner_turret: Handle<Mesh>,
+    miner_barrel: Handle<Mesh>,
     plane_fuselage: Handle<Mesh>,
     plane_nose: Handle<Mesh>,
     plane_wing: Handle<Mesh>,
@@ -184,13 +184,13 @@ pub fn setup(
         tank_mantlet: meshes.add(Cylinder::new(0.4, 0.95)),
         tank_barrel: meshes.add(Cylinder::new(0.17, 3.4)),
         tank_muzzle: meshes.add(Cylinder::new(0.26, 0.5)),
-        harvester_hull: meshes.add(rounded_box(Vec3::new(6.2, 1.4, 4.2), 0.3, 3)),
-        harvester_bin: meshes.add(rounded_box(Vec3::new(4.0, 1.3, 3.4), 0.28, 3)),
-        harvester_drum: meshes.add(Cylinder::new(0.8, 3.6)),
-        harvester_tread: meshes.add(rounded_box(Vec3::new(6.0, 1.0, 0.85), 0.3, 3)),
-        harvester_wheel: meshes.add(Cylinder::new(0.38, 0.24)),
-        harvester_turret: meshes.add(rounded_box(Vec3::new(1.8, 0.7, 1.0), 0.2, 3)),
-        harvester_barrel: meshes.add(Cylinder::new(0.12, 1.5)),
+        miner_hull: meshes.add(rounded_box(Vec3::new(6.2, 1.4, 4.2), 0.3, 3)),
+        miner_bin: meshes.add(rounded_box(Vec3::new(4.0, 1.3, 3.4), 0.28, 3)),
+        miner_drum: meshes.add(Cylinder::new(0.8, 3.6)),
+        miner_tread: meshes.add(rounded_box(Vec3::new(6.0, 1.0, 0.85), 0.3, 3)),
+        miner_wheel: meshes.add(Cylinder::new(0.38, 0.24)),
+        miner_turret: meshes.add(rounded_box(Vec3::new(1.8, 0.7, 1.0), 0.2, 3)),
+        miner_barrel: meshes.add(Cylinder::new(0.12, 1.5)),
         // The bomber. Longer and far thinner than either ground vehicle, which
         // is most of what makes it read as an aircraft from above -- at chase
         // range the wing is the silhouette and everything else hangs off it.
@@ -447,20 +447,20 @@ fn spawn_vehicle(
                 ));
             });
         }
-        VehicleSlot::Harvester => {
+        VehicleSlot::Miner => {
             commands.entity(root).with_children(|parent| {
                 parent.spawn((
-                    Mesh3d(assets.harvester_hull.clone()),
+                    Mesh3d(assets.miner_hull.clone()),
                     MeshMaterial3d(assets.body[idx].clone()),
                     Transform::from_xyz(0.0, 1.35, 0.0),
                 ));
                 // The ore bin, riding high and to the rear. This is the part
-                // that tells a harvester from a tank at chase-camera range, so
+                // that tells a miner from a tank at chase-camera range, so
                 // it takes the trim colour and the tallest line on the hull.
                 // Sunk clear of the hull roof, for the reason given above the
                 // tank's deck.
                 parent.spawn((
-                    Mesh3d(assets.harvester_bin.clone()),
+                    Mesh3d(assets.miner_bin.clone()),
                     MeshMaterial3d(assets.trim[idx].clone()),
                     Transform::from_xyz(-0.8, 2.0, 0.0),
                 ));
@@ -476,19 +476,19 @@ fn spawn_vehicle(
                 // of a unit away before breaking through it, which is the
                 // tangential seam described above the tank's deck.
                 parent.spawn((
-                    Mesh3d(assets.harvester_drum.clone()),
+                    Mesh3d(assets.miner_drum.clone()),
                     MeshMaterial3d(assets.metal.clone()),
                     Transform::from_xyz(2.95, 0.9, 0.0).with_rotation(across_z()),
                 ));
                 for z in [-2.1, 2.1] {
                     parent.spawn((
-                        Mesh3d(assets.harvester_tread.clone()),
+                        Mesh3d(assets.miner_tread.clone()),
                         MeshMaterial3d(assets.dark.clone()),
                         Transform::from_xyz(0.0, 0.6, z),
                     ));
                     for x in [-2.0, 0.0, 2.0] {
                         parent.spawn((
-                            Mesh3d(assets.harvester_wheel.clone()),
+                            Mesh3d(assets.miner_wheel.clone()),
                             MeshMaterial3d(assets.metal.clone()),
                             Transform::from_xyz(x, 0.55, z * 1.2).with_rotation(across_z()),
                         ));
@@ -498,14 +498,14 @@ fn spawn_vehicle(
                     .spawn((TurretView, Transform::from_xyz(0.0, 2.9, 0.0), Visibility::Inherited))
                     .with_children(|turret| {
                         turret.spawn((
-                            Mesh3d(assets.harvester_turret.clone()),
+                            Mesh3d(assets.miner_turret.clone()),
                             MeshMaterial3d(assets.dark.clone()),
                             Transform::default(),
                         ));
                         // A stub gun, so which way the auto-turret is looking
                         // is legible from the side and not only head on.
                         turret.spawn((
-                            Mesh3d(assets.harvester_barrel.clone()),
+                            Mesh3d(assets.miner_barrel.clone()),
                             MeshMaterial3d(assets.dark.clone()),
                             Transform::from_xyz(1.5, 0.0, 0.0).with_rotation(along_x()),
                         ));
@@ -569,8 +569,8 @@ pub fn sync_vehicles(
         if let Some(v) = player.tank {
             wanted.insert((player.id, VehicleSlot::Tank), v);
         }
-        if let Some(v) = player.harvester {
-            wanted.insert((player.id, VehicleSlot::Harvester), v);
+        if let Some(v) = player.miner {
+            wanted.insert((player.id, VehicleSlot::Miner), v);
         }
         if let Some(v) = player.plane {
             wanted.insert((player.id, VehicleSlot::Plane), v);
@@ -618,7 +618,7 @@ pub fn sync_vehicles(
             // roll goes in as it is rather than negated.
             transform.rotation *= Quat::from_rotation_x(v.roll);
         }
-        // A disabled harvester sits low and canted, so it reads as a wreck.
+        // A disabled miner sits low and canted, so it reads as a wreck.
         if v.disabled {
             transform.translation.y -= 0.45;
             transform.rotation *= Quat::from_rotation_z(0.13);
@@ -636,7 +636,7 @@ pub fn sync_vehicles(
         let Some((player, slot, v)) = resolved.get(&parent.parent()) else { continue };
         let kind = match slot {
             VehicleSlot::Tank => VehicleKind::Tank,
-            VehicleSlot::Harvester => VehicleKind::Harvester,
+            VehicleSlot::Miner => VehicleKind::Miner,
             // Unreachable: `spawn_vehicle` gives the aircraft no bubble to find.
             VehicleSlot::Plane => VehicleKind::Plane,
         };

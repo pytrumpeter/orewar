@@ -304,8 +304,8 @@ fn handle_packet(
                     Ok(ClientMessage::Purchase(p)) => game.purchase(player_id, p),
                     Ok(ClientMessage::LaunchPlane) => game.launch_plane(player_id),
                     Ok(ClientMessage::ToggleCheats) => game.toggle_cheats(),
-                    Ok(ClientMessage::SetHarvesterMode(m)) => {
-                        game.set_harvester_mode(player_id, m)
+                    Ok(ClientMessage::SetMinerMode(m)) => {
+                        game.set_miner_mode(player_id, m)
                     }
                     Ok(ClientMessage::Leave) => {
                         println!("player {player_id} left");

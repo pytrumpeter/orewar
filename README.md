@@ -1,8 +1,8 @@
 # Orewar
 
 A real-time multiplayer game on a 3D grid field. Each player commands a **tank**
-and a **harvester** from one corner of the map. The harvester mines ore, ore buys
-upgrades, and you win by capturing every other player's harvester.
+and a **miner** from one corner of the map. The miner mines ore, ore buys
+upgrades, and you win by capturing every other player's miner.
 
 Rust, Bevy 0.19 for the client, and a hand-rolled reliability layer over UDP.
 
@@ -80,7 +80,7 @@ the handshake with an error rather than let in. Start it with another name.
 
 Everything keeps working with the overview up — you can fly, drive, shoot, buy
 and call up a sortie while looking at the whole field. The mouse is the one
-thing that changes hands: up there it drags the map and reaches the harvester's
+thing that changes hands: up there it drags the map and reaches the miner's
 mode buttons, so the two triggers come off it and `Space` and `F` do the firing.
 Aim still follows the cursor, which from that height means aiming at a place on
 the map rather than at a point just ahead of the hull.
@@ -97,28 +97,28 @@ run drops them some twenty-two units shorter. Left mouse releases bombs.
 
 ## How it plays
 
-**Harvesting.** Park the harvester on an ore deposit and it draws ore
+**Mining.** Park the miner on an ore deposit and it draws ore
 automatically — it has to be nearly stopped. Drive home to your pad to unload it
 into credits. Deposits visibly shrink as they are worked.
 
-Because harvesting is proximity-based rather than something you actively do, you
-can leave the harvester working on a deposit, press `Tab`, and go fight in your
+Because mining is proximity-based rather than something you actively do, you
+can leave the miner working on a deposit, press `Tab`, and go fight in your
 tank. That trade-off — ore now, or position now — is the core of the game.
 
 **Combat.** Both vehicles are heavily shielded. Shields absorb damage first and
 regenerate after four quiet seconds; hull damage is permanent. A destroyed tank
 respawns at your base after eight seconds.
 
-**Capturing.** A harvester is never destroyed. At zero hull it is *disabled* —
+**Capturing.** A miner is never destroyed. At zero hull it is *disabled* —
 dead in the water and takeable. An enemy tank that holds station over it for four
 seconds captures it, and its owner goes off the field. But **your own tank can
-rescue it**: park over your disabled harvester and it repairs, coming back online
+rescue it**: park over your disabled miner and it repairs, coming back online
 at a quarter hull. A contested wreck cannot be taken.
 
-**Winning.** Last player on the field wins — take everybody else's harvester and
+**Winning.** Last player on the field wins — take everybody else's miner and
 the match is yours. In a two-player game that is one capture.
 
-Losing a harvester is otherwise a setback rather than the end: if somebody else
+Losing a miner is otherwise a setback rather than the end: if somebody else
 is still playing, you sit out a minute and come back with fresh vehicles, an
 empty bank, and every upgrade you had bought. So a bigger match has a second way
 home, for when everyone keeps coming back — three captures wins it outright.
@@ -140,7 +140,7 @@ Missiles are the way to answer one without standing in front of it: they seek,
 they will lock a standing emplacement, and they fly far enough that the tank
 launching them can sit outside its reach.
 
-Both it and the harvester's auto turret size their shells from their own
+Both it and the miner's auto turret size their shells from their own
 engagement ranges rather than from the tank's, so retuning the tank's gun
 cannot leave either one firing at something it can no longer hit.
 
@@ -164,7 +164,7 @@ ground is where the next one will land. Hills are cover from everything else in
 the game and nothing at all to a bomb, and a blast fades from its centre out, so
 a near miss still costs the target something.
 
-A hit is worth the wait. Square on, a bomb takes a harvester's shield entirely
+A hit is worth the wait. Square on, a bomb takes a miner's shield entirely
 and half of the hull under it, and a tank that has not bought a Shield Booster
 does not survive one at all. That is deliberate: a bomb is released some 47
 units before it lands, from an aircraft committed to a line and unable to stop,
@@ -176,7 +176,7 @@ field that cannot be driven out of the way, and one bomb empties it — which is
 the reason to spend a sortie on open ground rather than on somebody's hull.
 
 **Upgrades.** Radar (a HUD contact circle), Shield Booster, Turbo Drive,
-Harvester Armor, Auto Turret (the harvester defends itself), Long Barrel,
+Miner Armor, Auto Turret (the miner defends itself), Long Barrel,
 Missile Packs, and the Bomber. The map is generated in one quadrant and rotated
 into the other three, so every corner faces an identical distribution of ore.
 
@@ -204,7 +204,7 @@ builds and runs headless in seconds without pulling in a renderer.
 ### The server decides everything
 
 Clients send intent and draw what comes back. Every outcome — who was hit, who
-owns which harvester, whether a purchase is affordable — is decided by the
+owns which miner, whether a purchase is affordable — is decided by the
 server. Player state is keyed by identity token rather than socket address,
 which is what makes disconnects recoverable.
 
@@ -313,9 +313,9 @@ drops every opaque draw while transparent surfaces keep rendering.
 
 Seams that were left deliberately clean:
 
-- **Captured harvesters currently leave the field.** The capture path is a single
+- **Captured miners currently leave the field.** The capture path is a single
   function (`Game::apply_capture`); transferring the vehicle to the captor and
-  giving it simple harvesting AI would go there.
+  giving it simple mining AI would go there.
 - **Only the driven vehicle is predicted.** Enough for LAN. Prediction is keyed
   by slot in `state::Prediction` if both are ever wanted.
 - **Buildings.** The economy supports it — `PowerUp` is a flat list, and adding a
