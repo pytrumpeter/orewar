@@ -184,8 +184,17 @@ pub struct RenderWorld {
     pub projectiles: Vec<RenderProjectile>,
 }
 
+/// How far one simulation step moved the vehicle, so that a correction landing
+/// part way through one can leave the interpolation where it found it.
+#[derive(Clone, Copy, Default)]
+struct Step {
+    pos: SimVec2,
+    yaw: f32,
+    roll: f32,
+}
+
 /// Local prediction of the vehicle this client is driving.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Prediction {
     pub active: bool,
     pub slot: VehicleSlot,
@@ -273,6 +282,13 @@ impl Prediction {
         hills: &[Hill],
     ) {
         let previous = self.state;
+        // How far the step now in progress had already carried the vehicle.
+        // Needed to keep the interpolation in phase across the correction.
+        let step = Step {
+            pos: previous.pos - self.previous.pos,
+            yaw: math::angle_delta(self.previous.yaw, previous.yaw),
+            roll: previous.roll - self.previous.roll,
+        };
         let was_active = self.active && self.slot == slot;
 
         self.slot = slot;
@@ -288,7 +304,11 @@ impl Prediction {
         }
         let replay: Vec<InputFrame> =
             self.history.iter().copied().filter(|f| f.controlling == slot).collect();
+        // The state one step short of the end, which is what the frames between
+        // now and the next simulation step have to be drawn sliding out of.
+        let mut behind = None;
         for frame in replay {
+            behind = Some(self.state);
             let _ = sim::step_vehicle(
                 &mut self.state,
                 frame.throttle,
@@ -300,10 +320,28 @@ impl Prediction {
             );
         }
 
-        // A correction is not a simulation step, so there is nothing to slide
-        // between: both ends of the interpolation become the corrected state and
-        // the residual is carried by `offset`, which decays on the render clock.
-        self.previous = self.state;
+        // A correction is not a simulation step, and it used to set both ends of
+        // the interpolation to the corrected state on the grounds that there was
+        // nothing to slide between. There is: the *step* the correction landed
+        // inside is still in progress, and collapsing it draws the vehicle at
+        // the end of that step instead of part way through it. Snapshots arrive
+        // on their own clock, unaligned with the simulation's, so that happened
+        // about thirty times a second and read as a few pixels of jitter on
+        // everything the local player drives.
+        //
+        // Replaying gives the honest answer -- the last replayed step is a real
+        // pair of positions in the corrected frame. With nothing to replay there
+        // is no such pair, so the phase of the step already under way is carried
+        // over instead.
+        self.previous = match behind {
+            Some(state) => state,
+            None => MoveState {
+                pos: self.state.pos - step.pos,
+                yaw: math::wrap_angle(self.state.yaw - step.yaw),
+                speed: self.state.speed,
+                roll: self.state.roll - step.roll,
+            },
+        };
 
         if was_active {
             // Fold the difference into the visual offset instead of moving the
@@ -790,6 +828,81 @@ mod tests {
     /// disagree -- if either side resolved it differently, or one of them did
     /// not have it at all, the replay would land somewhere else and the vehicle
     /// would rubber-band every time it touched a slope.
+    /// A snapshot landing between two simulation steps must not move anything.
+    ///
+    /// Prediction advances at 30 Hz and the picture is drawn at the refresh
+    /// rate, so what is on screen between steps is an interpolation of the last
+    /// two. Snapshots arrive on the server's clock, which is not aligned with
+    /// either, so a correction routinely lands part way through a step -- and if
+    /// it collapses that interpolation, the vehicle is redrawn at the *end* of
+    /// the step it is only half way through and then waits there. That is a jump
+    /// forward of most of a tick's travel, about thirty times a second, on
+    /// everything the local player drives. It reads as jitter.
+    ///
+    /// Here the server agrees exactly with the client, so there is no error to
+    /// correct and nothing on screen has any business moving.
+    #[test]
+    fn a_correction_between_two_steps_does_not_jump_the_picture() {
+        let hills: [Hill; 0] = [];
+        let mut p = Prediction { active: true, slot: VehicleSlot::Tank, ..Default::default() };
+
+        let drive = |tick| InputFrame {
+            tick,
+            controlling: VehicleSlot::Tank,
+            throttle: 1.0,
+            steer: 0.4,
+            ..Default::default()
+        };
+        for tick in 1..=10u32 {
+            p.apply(drive(tick), 0, &hills);
+        }
+
+        // Where the server had it at tick 4, arrived at the same way.
+        let mut authority = MoveState::default();
+        for tick in 1..=4u32 {
+            let _ = sim::step_vehicle(
+                &mut authority,
+                drive(tick).throttle,
+                drive(tick).steer,
+                VehicleSlot::Tank.kind(),
+                0,
+                &hills,
+                TICK_DT,
+            );
+        }
+
+        // Sampled part way through the step that is currently in progress.
+        for alpha in [0.0, 0.25, 0.5, 0.75] {
+            let mut p = p.clone();
+            let before = p.render_pos(alpha);
+            let before_yaw = p.render_yaw(alpha);
+            p.reconcile(
+                &VehicleSnapshot {
+                    pos: authority.pos,
+                    yaw: authority.yaw,
+                    speed: authority.speed,
+                    ..Default::default()
+                },
+                VehicleSlot::Tank,
+                0.0,
+                4,
+                0,
+                &hills,
+            );
+            let after = p.render_pos(alpha);
+            assert!(
+                before.distance(after) < 1e-3,
+                "a correction at alpha {alpha} moved the vehicle {:.4} units, \
+                 from {before:?} to {after:?}",
+                before.distance(after)
+            );
+            assert!(
+                math::angle_delta(before_yaw, p.render_yaw(alpha)).abs() < 1e-3,
+                "a correction at alpha {alpha} turned the vehicle"
+            );
+        }
+    }
+
     #[test]
     fn replayed_inputs_reproduce_the_server_state() {
         let hills = [Hill { pos: SimVec2::new(9.0, 0.0), radius: 4.0 }];
