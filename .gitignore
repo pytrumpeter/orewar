@@ -9,6 +9,10 @@
 # returns to the same slot after a restart. Local to one machine.
 .orewar-token
 
+# The server and name last connected to, so the connect screen opens on them
+# next time. Local in the same way.
+.orewar-connect
+
 # A second checkout kept alongside this one to build for another architecture.
 # Its sources are a copy; the 2 GB is its own target/, which /target above does
 # not reach because that pattern is anchored to the repository root.

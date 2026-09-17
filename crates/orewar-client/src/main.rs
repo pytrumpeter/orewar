@@ -4,10 +4,15 @@
 //! orewar-client [--server HOST:PORT] [--name NAME] [--token N] [--token-file PATH]
 //! ```
 //!
+//! Started with nothing, it opens on the connect screen and asks who to join.
+//! Anything given on the command line fills that screen in and presses the
+//! button, so a scripted launch still goes straight to the field.
+//!
 //! The client renders and predicts; it never decides anything. Every outcome
 //! comes from the server.
 
 mod camera;
+mod connect;
 mod coords;
 mod effects;
 mod field;
@@ -20,32 +25,25 @@ mod sentinels;
 mod state;
 mod vehicles;
 
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
-use orewar_shared::protocol::DenyReason;
 use orewar_shared::rng::Rng;
 use orewar_shared::world::{DEFAULT_PORT, TICK_HZ};
 
+use connect::{AppState, ConnectForm};
 use input::LocalInput;
 use menu::MenuState;
 use net::NetClient;
 use state::GameState;
 
-/// How long to wait for the server's answer to the handshake before opening the
-/// window anyway.
-///
-/// Long enough for a server that is there to answer, short enough not to be a
-/// pause anybody notices. One that is not there is not an error yet -- it may
-/// still be starting -- so the game opens and keeps asking.
-const HANDSHAKE_PATIENCE: Duration = Duration::from_millis(900);
-
-struct Args {
-    server: SocketAddr,
-    name: String,
-    token: u64,
+/// What the command line had to say, all of it optional: the connect screen
+/// fills in whatever was left out.
+pub struct Args {
+    pub server: Option<String>,
+    pub name: Option<String>,
+    pub token: Option<u64>,
+    pub token_file: Option<PathBuf>,
 }
 
 fn print_help() {
@@ -55,14 +53,15 @@ fn print_help() {
          --name NAME          display name; also derives a stable identity\n\
          --token N            explicit identity token\n\
          --token-file PATH    file holding the identity token (default .orewar-token)\n\n\
+         With none of these the game opens on the connect screen and asks.\n\
          Identity decides which player slot you resume after a disconnect.\n\
-         To run two clients on one machine, give each its own --name."
+         To run two clients on one machine, give each its own name."
     );
 }
 
 /// Derives a stable token from a name, so `--name Ash` always returns to the
 /// same player slot without needing a file on disk.
-fn token_from_name(name: &str) -> u64 {
+pub fn token_from_name(name: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in name.as_bytes() {
         hash ^= *byte as u64;
@@ -73,7 +72,7 @@ fn token_from_name(name: &str) -> u64 {
 }
 
 /// Reads the token file, creating it with a fresh random token if absent.
-fn token_from_file(path: &PathBuf) -> u64 {
+pub fn token_from_file(path: &Path) -> u64 {
     if let Ok(text) = std::fs::read_to_string(path) {
         if let Ok(token) = text.trim().parse::<u64>() {
             return token;
@@ -86,36 +85,20 @@ fn token_from_file(path: &PathBuf) -> u64 {
     token
 }
 
-/// Picks which resolved address to talk to, preferring IPv4.
-///
-/// `localhost` resolves to `::1` before `127.0.0.1` on Windows, and the server
-/// binds `0.0.0.0` by default -- IPv4 only. Taking the resolver's first answer
-/// therefore sent every packet to an IPv6 loopback nothing was listening on.
-/// Nothing reports that: UDP has no connection to refuse, so the client simply
-/// waits forever on a handshake that cannot arrive.
-///
-/// An explicit IPv6 address still works; this only decides ties.
-fn prefer_ipv4(resolved: &[SocketAddr]) -> Option<SocketAddr> {
-    resolved.iter().find(|a| a.is_ipv4()).or_else(|| resolved.first()).copied()
-}
-
 fn parse_args() -> Result<Args, String> {
-    let mut server_text = format!("127.0.0.1:{DEFAULT_PORT}");
-    let mut name = String::new();
-    let mut explicit_token: Option<u64> = None;
-    let mut token_file: Option<PathBuf> = None;
+    let mut args = Args { server: None, name: None, token: None, token_file: None };
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
-            "--server" => server_text = value()?,
-            "--name" => name = value()?,
+            "--server" => args.server = Some(value()?),
+            "--name" => args.name = Some(value()?),
             "--token" => {
-                explicit_token =
+                args.token =
                     Some(value()?.parse().map_err(|_| "--token must be a number".to_string())?)
             }
-            "--token-file" => token_file = Some(PathBuf::from(value()?)),
+            "--token-file" => args.token_file = Some(PathBuf::from(value()?)),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -124,27 +107,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    // Accept a bare host and supply the default port.
-    if !server_text.contains(':') {
-        server_text = format!("{server_text}:{DEFAULT_PORT}");
-    }
-    let resolved: Vec<SocketAddr> = server_text
-        .to_socket_addrs()
-        .map_err(|e| format!("could not resolve {server_text}: {e}"))?
-        .collect();
-    let server =
-        prefer_ipv4(&resolved).ok_or_else(|| format!("no address found for {server_text}"))?;
-
-    // Precedence: an explicit token wins; then a name, which is the convenient
-    // way to run several clients on one machine; then the token file.
-    let token = match (explicit_token, token_file, name.is_empty()) {
-        (Some(t), _, _) => t,
-        (None, Some(path), _) => token_from_file(&path),
-        (None, None, false) => token_from_name(&name),
-        (None, None, true) => token_from_file(&PathBuf::from(".orewar-token")),
-    };
-
-    Ok(Args { server, name, token })
+    Ok(args)
 }
 
 fn main() {
@@ -156,28 +119,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-
-    let mut client = match NetClient::connect(args.server, args.token, args.name.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: could not open a socket: {e}");
-            std::process::exit(1);
-        }
-    };
-    println!("Orewar: joining {} as {}", args.server, if args.name.is_empty() { "(unnamed)" } else { &args.name });
-
-    // Ask before opening a window. A refusal never becomes an acceptance, and
-    // the commonest one -- a name somebody is already playing under -- is a
-    // mistake made on the command line and best answered there.
-    if let Err(reason) = client.await_verdict(HANDSHAKE_PATIENCE) {
-        eprintln!("error: {} refused the connection: {}", args.server, reason.describe());
-        if reason == DenyReason::NameTaken {
-            eprintln!("       A name is an identity here: it is what the server knows you by,");
-            eprintln!("       and what returns you to your own ore and vehicles after a drop.");
-            eprintln!("       Two clients cannot share one. Start this one with another --name.");
-        }
-        std::process::exit(1);
-    }
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -196,7 +137,8 @@ fn main() {
         // Prediction must advance in the same sized steps as the server's
         // simulation, or it drifts from authority every single tick.
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ as f64))
-        .insert_resource(client)
+        .init_state::<AppState>()
+        .insert_resource(ConnectForm::new(args))
         .init_resource::<GameState>()
         .init_resource::<LocalInput>()
         .init_resource::<MenuState>()
@@ -212,14 +154,23 @@ fn main() {
                 miner_panel::setup,
                 sentinels::setup,
                 effects::setup,
+                connect::setup,
             ),
         )
         // After `vehicles::setup`, which is where the mesh it draws is built.
         .add_systems(Startup, vehicles::setup_bombsight.after(vehicles::setup))
         // Networking runs before anything reads state, so a frame always sees
-        // the freshest snapshot that has arrived.
-        .add_systems(PreUpdate, net::poll)
-        .add_systems(FixedUpdate, input::send_input)
+        // the freshest snapshot that has arrived. It runs on the connect screen
+        // too: that is where the handshake it drives begins.
+        .add_systems(PreUpdate, net::poll.run_if(resource_exists::<NetClient>))
+        .add_systems(
+            Update,
+            (connect::update, connect::paint).chain().run_if(in_state(AppState::Connect)),
+        )
+        .add_systems(
+            FixedUpdate,
+            input::send_input.run_if(in_state(AppState::Playing)),
+        )
         .add_systems(
             Update,
             (
@@ -253,7 +204,8 @@ fn main() {
                 effects::animate,
                 quit_on_request,
             )
-                .chain(),
+                .chain()
+                .run_if(in_state(AppState::Playing)),
         )
         .run();
 }
@@ -269,32 +221,6 @@ fn quit_on_request(keys: Res<ButtonInput<KeyCode>>, mut net: ResMut<NetClient>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    fn v4(port: u16) -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
-    }
-    fn v6(port: u16) -> SocketAddr {
-        SocketAddr::from((Ipv6Addr::LOCALHOST, port))
-    }
-
-    /// The resolver lists `::1` first for `localhost` on Windows. The server
-    /// binds IPv4 by default, so following that order sends every packet into
-    /// a void that reports nothing back.
-    #[test]
-    fn ipv4_wins_when_the_resolver_lists_ipv6_first() {
-        assert_eq!(prefer_ipv4(&[v6(45701), v4(45701)]), Some(v4(45701)));
-    }
-
-    #[test]
-    fn ipv6_is_used_when_it_is_all_there_is() {
-        assert_eq!(prefer_ipv4(&[v6(45701)]), Some(v6(45701)));
-    }
-
-    #[test]
-    fn nothing_resolved_is_not_a_panic() {
-        assert_eq!(prefer_ipv4(&[]), None);
-    }
 
     #[test]
     fn a_name_maps_to_a_stable_identity() {

@@ -8,7 +8,7 @@
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bevy::prelude::*;
 use orewar_shared::bytes::{Decode, Encode};
@@ -163,59 +163,6 @@ impl NetClient {
             let packet = self.endpoint.build_packet(now, None);
             self.send_raw(&packet);
         }
-    }
-
-    /// Waits briefly for the server's verdict on the handshake, before the
-    /// window opens.
-    ///
-    /// Only a refusal is worth reporting here: it is the one answer that never
-    /// changes, and the reason for it -- a name somebody else is already
-    /// playing under, most of all -- belongs on the terminal the player
-    /// launched from rather than buried in a note behind an empty field.
-    ///
-    /// Silence is not failure. A server that is slow, absent, or on an address
-    /// nothing is listening to is left to the usual handshake loop, which
-    /// retries and says so after a few seconds. An acceptance is simply thrown
-    /// away: the loop asks again and the server, which already has the
-    /// connection, answers again.
-    pub fn await_verdict(&mut self, patience: Duration) -> Result<(), DenyReason> {
-        // A blocking read with a short timeout, rather than spinning. The
-        // socket goes back to non-blocking before anything else touches it.
-        let _ = self.socket.set_nonblocking(false);
-        let _ = self.socket.set_read_timeout(Some(Duration::from_millis(50)));
-
-        let deadline = Instant::now() + patience;
-        let mut verdict = Ok(());
-        let mut buf = [0u8; MAX_PACKET];
-        'wait: while Instant::now() < deadline {
-            let now = self.now();
-            if now - self.last_request >= HANDSHAKE_RETRY {
-                self.request_connection(now);
-            }
-            while let Ok(len) = self.socket.recv(&mut buf) {
-                let Ok((kind, mut reader)) = parse_packet(PROTOCOL_ID, &buf[..len]) else {
-                    continue;
-                };
-                match kind {
-                    PacketKind::ConnectionDenied => {
-                        let reason = reader
-                            .u8()
-                            .ok()
-                            .and_then(DenyReason::from_u8)
-                            .unwrap_or(DenyReason::ServerFull);
-                        self.link = Link::Denied(reason);
-                        verdict = Err(reason);
-                        break 'wait;
-                    }
-                    PacketKind::ConnectionAccepted => break 'wait,
-                    _ => {}
-                }
-            }
-        }
-
-        let _ = self.socket.set_read_timeout(None);
-        let _ = self.socket.set_nonblocking(true);
-        verdict
     }
 
     fn reset_for_retry(&mut self) {
@@ -504,6 +451,8 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use orewar_shared::bytes::Writer;
 
     /// A server that answers one handshake, and nothing else.
@@ -534,35 +483,51 @@ mod tests {
         NetClient::connect(addr, 7, "Ash".to_string()).expect("open a socket")
     }
 
-    /// The refusal has to arrive before the window does: it is the one answer
-    /// that retrying cannot change.
-    #[test]
-    fn a_refusal_is_reported_at_once() {
-        let addr = stand_in_server(Some(DenyReason::NameTaken));
-        let mut net = client_to(addr);
-        assert_eq!(net.await_verdict(Duration::from_secs(3)), Err(DenyReason::NameTaken));
+    /// Runs the handshake the way the game does -- through [`poll`], on a
+    /// world with a clock -- until the link settles or `patience` runs out.
+    ///
+    /// The connect screen reads nothing but `link`, so this is exactly what it
+    /// would see.
+    fn settle(net: NetClient, patience: Duration) -> Link {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GameState>()
+            .insert_resource(net)
+            .add_systems(Update, poll);
+        let deadline = Instant::now() + patience;
+        loop {
+            app.update();
+            let link = app.world().resource::<NetClient>().link.clone();
+            if link != Link::Connecting || Instant::now() >= deadline {
+                return link;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
-    /// Being let in is not worth waiting around for: the handshake loop asks
-    /// again a quarter of a second later and the server, which already has the
-    /// connection, answers again.
+    /// A refusal has to reach the screen. It is the one answer retrying cannot
+    /// change, so the player has to be told rather than left watching a
+    /// handshake that will never be accepted.
     #[test]
-    fn an_acceptance_lets_the_game_start() {
+    fn a_refusal_lands_on_the_link() {
+        let addr = stand_in_server(Some(DenyReason::NameTaken));
+        assert_eq!(settle(client_to(addr), Duration::from_secs(3)), Link::Denied(DenyReason::NameTaken));
+    }
+
+    #[test]
+    fn an_acceptance_opens_the_match() {
         let addr = stand_in_server(None);
-        let mut net = client_to(addr);
-        assert_eq!(net.await_verdict(Duration::from_secs(3)), Ok(()));
+        assert_eq!(settle(client_to(addr), Duration::from_secs(3)), Link::Connected);
     }
 
     /// Silence is not a refusal. A server that is slow, absent, or on an
-    /// address nothing is listening to is left to the usual retry loop, which
-    /// says so on its own after a few seconds -- opening the window and waiting
-    /// is the right answer, not exiting.
+    /// address nothing is listening to leaves the link where it is, and the
+    /// screen keeps asking rather than giving up on it.
     #[test]
     fn a_server_that_says_nothing_is_not_a_refusal() {
         // Nothing is bound here: on Windows this comes back as a connection
         // reset rather than as silence, which must not read as an answer.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut net = client_to(addr);
-        assert_eq!(net.await_verdict(Duration::from_millis(150)), Ok(()));
+        assert_eq!(settle(client_to(addr), Duration::from_millis(200)), Link::Connecting);
     }
 }

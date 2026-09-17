@@ -17,6 +17,21 @@ One machine is the server and manager of the match; everyone else connects to it
 cargo run --release -p orewar-server
 
 # On each player's machine
+cargo run --release -p orewar-client
+```
+
+Started with nothing to go on, the client opens on a **connect screen**: type
+the host's address and the name you want to play under, press Enter, and watch
+the handshake. Whatever the server says about it lands there -- a name somebody
+is already using, a server that is not answering -- with the fields still in
+front of you to correct. What worked last time is filled in for you the next
+time you start it.
+
+Everything on that screen can also be given on the command line, which fills it
+in and presses the button, so a scripted launch still goes straight to the
+field:
+
+```bash
 cargo run --release -p orewar-client -- --server 192.168.1.50 --name Ash
 ```
 
@@ -44,6 +59,8 @@ The match begins when the second player connects. Up to four can play.
 | `--server HOST[:PORT]` | who to join (default `127.0.0.1:45701`) |
 | `--name NAME` | display name, and your identity |
 | `--token N` / `--token-file PATH` | identity, set explicitly |
+
+Any one of these skips the connect screen. With none of them the client asks.
 
 Host names resolve to IPv4 by preference. `localhost` resolves to `::1` before
 `127.0.0.1` on Windows, and the server binds `0.0.0.0` -- IPv4 only -- so
