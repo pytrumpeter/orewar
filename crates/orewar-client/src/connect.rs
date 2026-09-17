@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
+use bevy::ui::FocusPolicy;
 use orewar_shared::protocol::DenyReason;
 use orewar_shared::world::DEFAULT_PORT;
 
@@ -99,6 +100,14 @@ pub enum ConnectText {
 /// Marks the full-screen overlay, which goes away for good once a match starts.
 #[derive(Component)]
 struct ConnectRoot;
+
+/// The one button that connects.
+///
+/// Marked rather than found by `With<Button>`, which would also find the
+/// miner's mode buttons behind the overlay and read a click on empty space as
+/// a press of this one.
+#[derive(Component)]
+pub struct ConnectButton;
 
 /// A handshake in flight.
 struct Attempt {
@@ -295,6 +304,10 @@ pub fn setup(mut commands: Commands) {
                 align_items: AlignItems::Center,
                 ..default()
             },
+            // Nothing behind this is clickable. The HUD's own buttons are
+            // still there under it, and a click that reached one would press
+            // something the player cannot see.
+            FocusPolicy::Block,
             // Opaque, not a scrim: the HUD is built at startup like everything
             // else, and a player choosing a server should not be reading a
             // scoreboard for a match they have not joined.
@@ -346,6 +359,7 @@ pub fn setup(mut commands: Commands) {
                     ));
 
                     panel.spawn((
+                        ConnectButton,
                         Button,
                         Node {
                             margin: UiRect { top: px(6), ..default() },
@@ -428,7 +442,7 @@ pub fn update(
     net: Option<Res<NetClient>>,
     mut next: ResMut<NextState<AppState>>,
     fields: Query<(&FieldId, &Interaction)>,
-    connect_button: Query<&Interaction, (With<Button>, Without<FieldId>)>,
+    connect_button: Query<&Interaction, With<ConnectButton>>,
 ) {
     let now = time.elapsed_secs_f64();
     let mut submit = false;
