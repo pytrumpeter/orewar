@@ -883,6 +883,15 @@ impl Game {
             plane.turret_yaw = plane.mv.yaw;
             plane.gun_cooldown = (plane.gun_cooldown - dt).max(0.0);
             plane.cannon_cooldown = (plane.cannon_cooldown - dt).max(0.0);
+
+            // No shield regen up here, and that is a decision rather than an
+            // omission: the ground vehicles get theirs in `step_vehicles`, and
+            // the aircraft is stepped in this pass instead, so leaving it out is
+            // as simple as not writing it -- which is exactly why it is worth
+            // saying out loud. What a sortie has lost, it has lost. It comes
+            // back with the next one, because the next one is a new aircraft
+            // rather than a repaired one, and a sixty-second fight that healed
+            // itself halfway through would make the first half of it pointless.
             if !cheats {
                 plane.fuel -= dt;
             }
@@ -963,6 +972,9 @@ impl Game {
         }
 
         for (id, other) in struck {
+            // Where the other one was, so the flash lands on the face that met
+            // it. Read before the borrow below, which takes this player alone.
+            let from = flying.iter().find(|(o, ..)| *o == other).map(|(_, pos, ..)| *pos);
             let Some(p) = self.players.get_mut(id as usize).and_then(Option::as_mut) else {
                 continue;
             };
@@ -977,7 +989,12 @@ impl Game {
             plane.collision_grace = sim::PLANE_COLLISION_GRACE;
             plane.since_damage = 0.0;
             let at = plane.mv.pos;
-            let bearing = (plane.mv.pos - at).to_angle();
+            // Toward the aircraft that was met. Measured from this one's centre
+            // out, which is what the shield flash is drawn along -- taking it
+            // from `at` to `at` would be a zero vector and a bearing of zero,
+            // so every collision would flash on the same face regardless of
+            // which side it came from.
+            let bearing = from.map_or(plane.mv.yaw, |other_pos| (other_pos - at).to_angle());
             let hull = sim::apply_damage(&mut plane.shield, &mut plane.hull, damage);
             self.fx.push(HitFx::on_vehicle(HitKind::Blast, at, bearing, id, VehicleSlot::Plane));
             if hull <= 0.0 {
@@ -3230,6 +3247,45 @@ mod tests {
                 "player {id} was charged twice inside the grace: {left} left"
             );
         }
+    }
+
+    /// What a sortie loses, it keeps; the next one is a new aircraft.
+    ///
+    /// Both halves are the rule. Ground vehicles get their shield back after a
+    /// lull, and the aircraft deliberately does not -- a sixty-second fight that
+    /// healed itself halfway through would make the first half of it pointless.
+    /// Leaving regen out is as easy as not writing it, which is why it has a
+    /// test rather than just a comment.
+    #[test]
+    fn a_damaged_sortie_stays_damaged_and_the_next_one_is_fresh() {
+        let mut g = two_player_game();
+        g.toggle_cheats();
+        two_aircraft(&mut g, sim::PLANE_ALTITUDE, sim::PLANE_ALTITUDE, 0.0);
+
+        // One meeting, which strips the shield entirely.
+        g.step(TICK_DT);
+        let hurt = g.player(0).unwrap().plane.as_ref().expect("one meeting killed it").shield;
+        assert_eq!(hurt, 0.0, "a meeting should take the whole shield");
+
+        // Long past the lull that would bring a tank's shield back.
+        for _ in 0..((sim::SHIELD_REGEN_DELAY / TICK_DT) as usize + 60) {
+            g.step(TICK_DT);
+        }
+        let plane = g.player(0).unwrap().plane.as_ref().expect("it healed itself to death");
+        assert_eq!(plane.shield, 0.0, "the aircraft regenerated mid-sortie");
+
+        // End it and call up another: that one is whole.
+        g.player_mut(0).unwrap().plane = None;
+        g.player_mut(0).unwrap().sortie_cooldown = 0.0;
+        g.launch_plane(0);
+        let powerups = g.player(0).unwrap().powerups;
+        let fresh = g.player(0).unwrap().plane.as_ref().expect("no second sortie");
+        assert_eq!(
+            fresh.shield,
+            sim::max_shield(VehicleKind::Plane, powerups),
+            "the next sortie inherited the last one's damage"
+        );
+        assert_eq!(fresh.hull, sim::max_hull(VehicleKind::Plane, powerups));
     }
 
     /// Passing under somebody is not flying into them.

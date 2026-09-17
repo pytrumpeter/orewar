@@ -197,13 +197,32 @@ pub fn spawn(
             HitKind::Blast => (&assets.blast_mesh, &assets.blast_fade[0], BLAST_LIFE),
             HitKind::Shield => (&assets.arc_mesh, &assets.shield_fade[0], SHIELD_LIFE),
         };
+        // Looked up here rather than carried on the wire: every client already
+        // has every aircraft's altitude, and the alternative is a byte on a
+        // struct that six of ride in every snapshot to describe something that
+        // is on the ground almost every time.
+        let lift = match fx.target() {
+            Some((player, VehicleSlot::Plane)) => state
+                .render
+                .players
+                .get(player as usize)
+                .and_then(|p| p.as_ref())
+                .and_then(|p| p.plane.as_ref())
+                .map_or(0.0, |v| v.alt),
+            _ => 0.0,
+        };
         commands.spawn((
             Effect { kind: fx.kind, age: 0.0, life, follow: fx.target(), angle: fx.angle },
             Mesh3d(mesh.clone()),
             MeshMaterial3d(material.clone()),
             // A shield flash is re-placed on its hull every frame; only the
-            // blast keeps the position it is spawned at.
-            Transform::from_translation(coords::sim_to_world_at(fx.pos, BLAST_CENTRE))
+            // blast keeps the position it is spawned at -- so this is the one
+            // chance to put it at the right height. `HitFx` carries a ground
+            // position and nothing else, which was the whole truth while every
+            // impact happened on the ground; two aircraft meeting is one that
+            // does not, and a blast for it drawn on the grass would be the most
+            // visible thing in the dogfight and in the wrong place.
+            Transform::from_translation(coords::sim_to_world_at(fx.pos, BLAST_CENTRE + lift))
                 .with_scale(Vec3::splat(0.01)),
             NotShadowCaster,
         ));
@@ -270,10 +289,14 @@ pub fn animate(
                 // shield rather than inside it.
                 let swell = SHIELD_INNER + SHIELD_SWELL * (std::f32::consts::PI * t).sin();
                 let radius = sim::tuning(slot.kind()).radius * swell;
-                // Concentric with that bubble, which rides 1.6 above the hull.
+                // Concentric with that bubble, which rides 1.6 above the hull --
+                // and for an aircraft the hull is not on the ground, so the
+                // flash has to climb with it. `alt` is zero for the two on the
+                // ground, which is what it used to be for all three.
                 // Uniform, because a cap of a sphere is only a cap of a sphere
                 // while all three axes agree.
-                *transform = Transform::from_translation(coords::sim_to_world_at(vehicle.pos, 1.6))
+                *transform =
+                    Transform::from_translation(coords::sim_to_world_at(vehicle.pos, vehicle.alt + 1.6))
                     .with_rotation(coords::yaw_to_quat(effect.angle))
                     .with_scale(Vec3::splat(radius));
             }

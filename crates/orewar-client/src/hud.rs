@@ -388,7 +388,7 @@ pub fn update_texts(
                 };
                 let cheat_line = if cheats { "\nCHEATS ON  [Alt-C]" } else { "" };
                 let weapons = if input.controlling == VehicleSlot::Plane {
-                    "AD bank | WS yoke | 1-5 throttle | LMB drop bombs"
+                    "AD bank | WS yoke | 1-5 throttle | LMB bombs | RMB cannon"
                 } else {
                     "WASD drive | mouse aim | LMB gun | RMB missile"
                 };
