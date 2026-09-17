@@ -45,7 +45,20 @@ pub struct Vehicle {
     pub capture_progress: f32,
     /// Seconds since last taking damage, gating shield regeneration.
     pub since_damage: f32,
+    /// How long before this aircraft can be charged for another collision.
+    ///
+    /// Two aircraft that meet overlap for several ticks, and nothing up here can
+    /// push them apart, so without this a single meeting would be charged once a
+    /// tick and take both of them down every time.
+    pub collision_grace: f32,
     pub gun_cooldown: f32,
+    /// A second clock, for the aircraft's cannon.
+    ///
+    /// Its own rather than shared with `gun_cooldown`, which up here is the bomb
+    /// bay: the two weapons are fired on different triggers at very different
+    /// rates, and one clock between them would mean every burst of cannon fire
+    /// held the bombs shut.
+    pub cannon_cooldown: f32,
     pub missile_cooldown: f32,
     /// Seconds of flying left. Only the bomber burns it; on the ground it stays
     /// at zero and is never read.
@@ -63,7 +76,9 @@ impl Vehicle {
             disabled: false,
             capture_progress: 0.0,
             since_damage: sim::SHIELD_REGEN_DELAY,
+            collision_grace: 0.0,
             gun_cooldown: 0.0,
+            cannon_cooldown: 0.0,
             missile_cooldown: 0.0,
             fuel: if kind.flies() { sim::PLANE_FUEL } else { 0.0 },
         }
@@ -245,6 +260,8 @@ impl Player {
                 speed: v.mv.speed,
                 fuel: (v.fuel / sim::PLANE_FUEL).clamp(0.0, 1.0),
                 alt: v.mv.alt,
+                shield: v.shield,
+                hull: v.hull,
             }),
             plane_ready_in: self.sortie_cooldown.ceil().max(0.0) as u8,
             // Rounded up, so a countdown on screen reaches zero at the moment
@@ -271,6 +288,10 @@ pub struct Projectile {
     pub yaw: f32,
     pub speed: f32,
     pub life: f32,
+    /// Height it is flying at. Zero for everything on the ground; for a cannon
+    /// round it is the altitude the aircraft fired it from, held for the whole
+    /// flight, and it is what decides whether the round can reach anything.
+    pub alt: f32,
 }
 
 /// The gun emplacement in a player's home corner.
@@ -327,6 +348,17 @@ struct Target {
     player: u8,
     what: Hittable,
     pos: Vec2,
+    radius: f32,
+}
+
+/// An aircraft, as something a cannon round can reach.
+struct AirTarget {
+    player: u8,
+    pos: Vec2,
+    /// What makes the yoke a weapon: a round flies level at the height it left
+    /// at, so being at somebody else's altitude is the price of shooting at
+    /// them, and climbing out of it is how you break off.
+    alt: f32,
     radius: f32,
 }
 
@@ -646,6 +678,9 @@ impl Game {
         // leaves from where the aircraft actually is. Outside `step_collisions`
         // entirely: nothing up there shares ground with anything.
         self.step_planes(dt);
+        // Straight after, so two aircraft are charged for meeting where they
+        // actually ended up rather than where they were a tick ago.
+        self.step_air_collisions(dt);
         // Before weapons and capture, so both read where the hulls actually
         // ended up rather than where they were before being pushed apart.
         self.step_collisions();
@@ -847,6 +882,7 @@ impl Game {
             // over, so the hull's heading is the only bearing it has.
             plane.turret_yaw = plane.mv.yaw;
             plane.gun_cooldown = (plane.gun_cooldown - dt).max(0.0);
+            plane.cannon_cooldown = (plane.cannon_cooldown - dt).max(0.0);
             if !cheats {
                 plane.fuel -= dt;
             }
@@ -862,6 +898,92 @@ impl Game {
                 // flying one badly and losing it early is not rewarded with a
                 // quicker second go.
                 p.sortie_cooldown = sim::SORTIE_COOLDOWN;
+            }
+        }
+    }
+
+    /// Two aircraft that meet each other, and what it costs them both.
+    ///
+    /// Its own pass rather than part of [`Game::step_collisions`], which pushes
+    /// hulls apart and charges for the impact. Nothing up here can be pushed
+    /// apart: an aircraft cannot stop, cannot reverse, and cannot be shoved off
+    /// a heading it is committed to, so the only honest answer to two of them
+    /// arriving in the same place is that both pay.
+    ///
+    /// Half of everything each, shield and hull together. It is the one
+    /// exchange in the game that nobody wins -- it does not matter who flew into
+    /// whom -- so ramming is a way to trade rather than a way to kill, and two
+    /// clean meetings take both aircraft down.
+    ///
+    /// **Charged once per meeting.** At cruise two aircraft converging head-on
+    /// overlap for several ticks, and charging per tick would kill both every
+    /// time they touched. A ground pair never has this problem because the push
+    /// separates them; an aircraft pair cannot be separated, so instead each one
+    /// carries a short grace after an impact during which it cannot be charged
+    /// for another.
+    fn step_air_collisions(&mut self, dt: f32) {
+        for p in self.players.iter_mut().flatten() {
+            if let Some(plane) = p.plane.as_mut() {
+                plane.collision_grace = (plane.collision_grace - dt).max(0.0);
+            }
+        }
+
+        // Gathered first: charging one aircraft needs the other's numbers, and
+        // both are behind the same `players` borrow.
+        let mut flying: Vec<(u8, Vec2, f32, f32)> = Vec::new();
+        for p in self.players.iter().flatten() {
+            if p.eliminated {
+                continue;
+            }
+            if let Some(v) = &p.plane {
+                flying.push((p.id, v.mv.pos, v.mv.alt, v.collision_grace));
+            }
+        }
+
+        let reach = sim::tuning(VehicleKind::Plane).radius * 2.0;
+        let mut struck: Vec<(u8, u8)> = Vec::new();
+        for i in 0..flying.len() {
+            for j in (i + 1)..flying.len() {
+                let (a_id, a_pos, a_alt, a_grace) = flying[i];
+                let (b_id, b_pos, b_alt, b_grace) = flying[j];
+                if a_grace > 0.0 || b_grace > 0.0 {
+                    continue;
+                }
+                // The same two tests a cannon round makes, for the same reason:
+                // passing a hundred units underneath somebody is not a collision.
+                if (a_alt - b_alt).abs() > sim::PLANE_HIT_HEIGHT {
+                    continue;
+                }
+                if a_pos.distance(b_pos) > reach {
+                    continue;
+                }
+                struck.push((a_id, b_id));
+                struck.push((b_id, a_id));
+            }
+        }
+
+        for (id, other) in struck {
+            let Some(p) = self.players.get_mut(id as usize).and_then(Option::as_mut) else {
+                continue;
+            };
+            let powerups = p.powerups;
+            let Some(plane) = p.plane.as_mut() else { continue };
+            // Half of what a fresh aircraft has, not half of what is left, so
+            // the second meeting finishes what the first started rather than
+            // halving a smaller number forever.
+            let full = sim::max_shield(VehicleKind::Plane, powerups)
+                + sim::max_hull(VehicleKind::Plane, powerups);
+            let damage = full * sim::PLANE_COLLISION_FRACTION;
+            plane.collision_grace = sim::PLANE_COLLISION_GRACE;
+            plane.since_damage = 0.0;
+            let at = plane.mv.pos;
+            let bearing = (plane.mv.pos - at).to_angle();
+            let hull = sim::apply_damage(&mut plane.shield, &mut plane.hull, damage);
+            self.fx.push(HitFx::on_vehicle(HitKind::Blast, at, bearing, id, VehicleSlot::Plane));
+            if hull <= 0.0 {
+                self.players[id as usize].as_mut().unwrap().plane = None;
+                self.players[id as usize].as_mut().unwrap().sortie_cooldown = sim::SORTIE_COOLDOWN;
+                self.events.push(GameEvent::PlaneShotDown { player: id, by: other });
             }
         }
     }
@@ -1004,6 +1126,7 @@ impl Game {
                             yaw: tank.turret_yaw,
                             speed: sim::BULLET_SPEED,
                             life: sim::bullet_lifetime(powerups),
+                            alt: 0.0,
                         });
                     }
                     if fire_secondary && tank.missile_cooldown <= 0.0 && missiles > 0 {
@@ -1017,6 +1140,35 @@ impl Game {
                             yaw: tank.turret_yaw,
                             speed: sim::MISSILE_LAUNCH_SPEED,
                             life: sim::MISSILE_LIFETIME,
+                            alt: 0.0,
+                        });
+                    }
+                }
+            }
+
+            // The cannon, on the secondary trigger. Two triggers and two
+            // weapons: the bomb bay keeps the primary it has always had, so
+            // nobody's bombing hand changes, and the gun takes the trigger that
+            // did nothing up here.
+            //
+            // There is nothing to aim. The aircraft has no turret -- it fires
+            // where its nose is pointed, at the height it is flying -- which is
+            // what makes a dogfight about flying rather than about aiming.
+            if input.controlling == VehicleSlot::Plane && input.fire_secondary {
+                if let Some(plane) = p.plane.as_mut() {
+                    if plane.cannon_cooldown <= 0.0 {
+                        plane.cannon_cooldown = sim::CANNON_COOLDOWN;
+                        spawned.push(Projectile {
+                            id: 0,
+                            kind: ProjectileKind::Cannon,
+                            owner,
+                            // Out in front of the nose, so an aircraft is never
+                            // inside its own round on the tick it fires.
+                            pos: plane.mv.pos + Vec2::from_angle(plane.mv.yaw) * 6.0,
+                            yaw: plane.mv.yaw,
+                            speed: sim::CANNON_SPEED,
+                            life: sim::CANNON_LIFE,
+                            alt: plane.mv.alt,
                         });
                     }
                 }
@@ -1024,8 +1176,7 @@ impl Game {
 
             // The bomb bay. There is nothing to aim: a bomb leaves with the
             // aircraft's own velocity and falls, so where it lands is decided
-            // by where the aircraft was pointing when it was let go. The
-            // secondary trigger does nothing up here.
+            // by where the aircraft was pointing when it was let go.
             if input.controlling == VehicleSlot::Plane && input.fire_primary {
                 if let Some(plane) = p.plane.as_mut() {
                     if plane.gun_cooldown <= 0.0 {
@@ -1042,6 +1193,7 @@ impl Game {
                             // the floor lands almost underneath. The client's
                             // sight reads the same function.
                             life: sim::bomb_fall_time(plane.mv.alt),
+                            alt: 0.0,
                         });
                     }
                 }
@@ -1073,6 +1225,7 @@ impl Game {
                                     yaw: m.turret_yaw,
                                     speed: sim::BULLET_SPEED,
                                     life: sim::shell_life_covering(sim::AUTO_TURRET_RANGE),
+                                    alt: 0.0,
                                 });
                             }
                         }
@@ -1146,6 +1299,7 @@ impl Game {
                     yaw: s.turret_yaw,
                     speed: sim::BULLET_SPEED,
                     life: sim::shell_life_covering(sim::SENTINEL_RANGE),
+                    alt: 0.0,
                 });
             }
         }
@@ -1179,12 +1333,15 @@ impl Game {
                     radius: sim::tuning(VehicleKind::Miner).radius,
                 });
             }
-            // The aircraft is deliberately absent. Everything that shoots in
-            // this game shoots along the ground, and the one limit on a sortie
-            // is the fuel clock -- putting the plane in here would have shells
-            // that visibly pass underneath it taking it down. `HitFx` is the
-            // second reason: it packs the slot into a single bit, so a hit on
-            // the plane could not even be described to a client.
+            // The aircraft is deliberately absent from *this* list. Everything
+            // that shoots along the ground shoots along the ground, and shells
+            // that visibly pass underneath an aeroplane should not take it
+            // down. What can reach it is another aircraft's cannon, and that
+            // reads `collect_air_targets` instead.
+            //
+            // The other reason it used to be kept out has gone: `HitFx` packed
+            // the slot into a single bit and could not name the plane at all.
+            // It has two bits now.
             //
             // Rubble is not worth shooting at.
             if p.sentinel.standing() {
@@ -1199,8 +1356,34 @@ impl Game {
         out
     }
 
+    /// Aircraft, which only other aircraft can reach.
+    ///
+    /// Separate from [`Game::collect_targets`] rather than a flag on it, because
+    /// the two lists have nothing to do with each other: nothing on the ground
+    /// can hit anything in this one, and a cannon round cannot hit anything in
+    /// the other. Carrying the altitude along is the point -- a round reaches an
+    /// aircraft only if it is flying at roughly the same height.
+    fn collect_air_targets(&self) -> Vec<AirTarget> {
+        let mut out = Vec::new();
+        for p in self.players.iter().flatten() {
+            if p.eliminated {
+                continue;
+            }
+            if let Some(v) = &p.plane {
+                out.push(AirTarget {
+                    player: p.id,
+                    pos: v.mv.pos,
+                    alt: v.mv.alt,
+                    radius: sim::tuning(VehicleKind::Plane).radius,
+                });
+            }
+        }
+        out
+    }
+
     fn step_projectiles(&mut self, dt: f32) {
         let targets = self.collect_targets();
+        let air = self.collect_air_targets();
         // Moved aside for the duration: `retain_mut` below holds a mutable
         // borrow of `self.projectiles`, and the terrain cannot change mid-tick.
         let hills = std::mem::take(&mut self.hills);
@@ -1231,6 +1414,53 @@ impl Game {
                 // makes `sim::bomb_impact` -- and so the sight on the client --
                 // exactly right rather than nearly right.
                 proj.pos += Vec2::from_angle(proj.yaw) * (proj.speed * dt);
+                return true;
+            }
+
+            if proj.kind == ProjectileKind::Cannon {
+                // The only weapon that works up here, and the only one that
+                // cannot touch the ground. It never meets a hill, a hull or a
+                // sentinel: the whole of the ground war passes underneath it.
+                let from = proj.pos;
+                let to = from + Vec2::from_angle(proj.yaw) * (proj.speed * dt);
+
+                // Swept like every other shot, so a round crossing four units a
+                // tick cannot pass through an aircraft five wide.
+                let mut earliest_air: Option<(f32, &AirTarget)> = None;
+                for t in air.iter().filter(|t| t.player != proj.owner) {
+                    // Height first, because it is the cheap test and the one
+                    // that makes altitude mean something. A round flies level
+                    // at the height it left at, so an aircraft that has climbed
+                    // out of the fight is genuinely out of reach.
+                    if (t.alt - proj.alt).abs() > sim::PLANE_HIT_HEIGHT {
+                        continue;
+                    }
+                    if let Some(hit) = sim::segment_circle_hit(from, to, t.pos, t.radius) {
+                        if earliest_air.map_or(true, |(best, _)| hit < best) {
+                            earliest_air = Some((hit, t));
+                        }
+                    }
+                }
+
+                if let Some((at, target)) = earliest_air {
+                    let impact = from.lerp(to, at);
+                    let bearing = (impact - target.pos).to_angle();
+                    hits.push((
+                        target.player,
+                        Hittable::Vehicle(VehicleSlot::Plane),
+                        sim::CANNON_DAMAGE,
+                        proj.owner,
+                        bearing,
+                    ));
+                    return false;
+                }
+
+                proj.pos = to;
+                // Not culled at the wall, unlike everything on the ground. An
+                // aircraft can be shot at while the edge is banking it back in,
+                // and a round that stopped dead at the boundary would make the
+                // rim of the field a place to hide. It expires on its own clock
+                // out there instead.
                 return true;
             }
 
@@ -1295,11 +1525,12 @@ impl Game {
                 let damage = match proj.kind {
                     ProjectileKind::Bullet => sim::BULLET_DAMAGE,
                     ProjectileKind::Missile => sim::MISSILE_DAMAGE,
-                    // A bomb never reaches this: it is at altitude for its
-                    // whole flight and is skipped by the pass that gets here.
-                    // What it does is done where it lands, to everything within
-                    // a radius rather than to the one thing in its way.
-                    ProjectileKind::Bomb => 0.0,
+                    // Neither a bomb nor a cannon round reaches this. Both are
+                    // at altitude for their whole flight and both returned
+                    // above: a bomb does what it does where it lands, to
+                    // everything within a radius, and a cannon round is settled
+                    // against the air list rather than the ground one.
+                    ProjectileKind::Bomb | ProjectileKind::Cannon => 0.0,
                 };
                 // The bearing from the hull's centre out to where it was
                 // struck, which is the face the shield has to flash on.
@@ -1423,11 +1654,19 @@ impl Game {
                 p.respawn_timer = sim::TANK_RESPAWN_DELAY;
                 self.events.push(GameEvent::TankDestroyed { player, by: attacker });
             }
-            // Nothing shoots at the aircraft, so nothing damages it and this
-            // is unreachable. Left explicit rather than folded into a wildcard:
-            // if something ever does learn to shoot upward, this is the line
-            // that has to decide what being hit up there means.
-            VehicleSlot::Plane => {}
+            // Something did learn to shoot upward: another aircraft. This is
+            // the line that comment was left here for.
+            //
+            // A sortie that is shot down is over. There is nothing to respawn
+            // and nothing to recover -- the aircraft is gone the way it goes
+            // when the fuel runs out, and the same cooldown starts, so being
+            // beaten in the air costs exactly what running dry costs plus the
+            // rest of the fuel you never got to use.
+            VehicleSlot::Plane => {
+                p.plane = None;
+                p.sortie_cooldown = sim::SORTIE_COOLDOWN;
+                self.events.push(GameEvent::PlaneShotDown { player, by: attacker });
+            }
             VehicleSlot::Miner => {
                 // Miners are never destroyed. They go dead in the water and
                 // become something an enemy tank has to come and take.
@@ -1795,6 +2034,7 @@ impl Game {
                     owner: p.owner,
                     pos: p.pos,
                     yaw: wrap_angle(p.yaw),
+                    alt: p.alt,
                 })
                 .collect(),
             cheats: self.cheats,
@@ -2688,6 +2928,7 @@ mod tests {
                 yaw,
                 speed,
                 life,
+                alt: 0.0,
             });
             for _ in 0..((life / TICK_DT) as usize + 3) {
                 g.step(TICK_DT);
@@ -2803,6 +3044,216 @@ mod tests {
         );
     }
 
+    /// Puts two aircraft up nose to nose, at the heights asked for.
+    ///
+    /// Pointed at each other along X, which is the only arrangement a dogfight
+    /// test needs and the one the altitude gate has to be able to break.
+    fn two_aircraft(g: &mut Game, a_alt: f32, b_alt: f32, apart: f32) {
+        launch_for(g, 0);
+        launch_for(g, 1);
+        let mid = world::WORLD_SIZE * 0.5;
+        {
+            let a = g.player_mut(0).unwrap().plane.as_mut().unwrap();
+            a.mv = MoveState {
+                pos: Vec2::new(mid - apart * 0.5, mid),
+                yaw: 0.0,
+                speed: sim::PLANE_CRUISE,
+                roll: 0.0,
+                alt: a_alt,
+            };
+        }
+        {
+            let b = g.player_mut(1).unwrap().plane.as_mut().unwrap();
+            b.mv = MoveState {
+                pos: Vec2::new(mid + apart * 0.5, mid),
+                yaw: std::f32::consts::PI,
+                speed: sim::PLANE_CRUISE,
+                roll: 0.0,
+                alt: b_alt,
+            };
+        }
+    }
+
+    fn hold_the_gun(g: &mut Game, tick: u32) {
+        g.set_input(
+            0,
+            InputFrame {
+                tick,
+                controlling: VehicleSlot::Plane,
+                fire_secondary: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Holding the secondary trigger with the nose on somebody takes them down.
+    ///
+    /// The whole of the dogfight in one test: the cannon exists, it reaches
+    /// another aircraft, that aircraft has something to lose, and losing all of
+    /// it ends the sortie and says so out loud.
+    #[test]
+    fn cannon_fire_shoots_down_an_aircraft_at_the_same_height() {
+        let mut g = two_player_game();
+        g.toggle_cheats(); // fuel off, so only the guns can end this
+        two_aircraft(&mut g, sim::PLANE_ALTITUDE, sim::PLANE_ALTITUDE, 60.0);
+
+        for tick in 0..200 {
+            hold_the_gun(&mut g, tick);
+            g.step(TICK_DT);
+            if g.player(1).unwrap().plane.is_none() {
+                assert!(
+                    g.events
+                        .iter()
+                        .any(|e| matches!(e, GameEvent::PlaneShotDown { player: 1, by: 0 })),
+                    "it went down without anybody being told"
+                );
+                assert!(
+                    g.player(1).unwrap().sortie_cooldown > 0.0,
+                    "being shot down did not start the cooldown"
+                );
+                return;
+            }
+        }
+        panic!(
+            "it survived the whole magazine, on {} hull",
+            g.player(1).unwrap().plane.as_ref().unwrap().hull
+        );
+    }
+
+    /// Climbing out of the other pilot's guns is what the yoke is for.
+    ///
+    /// Same geometry and the same held trigger, with the whole length of the
+    /// band between them. If rounds ever pass through this, altitude is
+    /// decoration and the third dimension buys the player nothing.
+    #[test]
+    fn a_cannon_round_cannot_reach_an_aircraft_that_has_climbed_away() {
+        let mut g = two_player_game();
+        g.toggle_cheats();
+        two_aircraft(&mut g, sim::PLANE_MIN_ALT, sim::PLANE_MAX_ALT, 60.0);
+
+        let before = g.player(1).unwrap().plane.as_ref().unwrap().hull;
+        for tick in 0..200 {
+            hold_the_gun(&mut g, tick);
+            g.step(TICK_DT);
+        }
+        let powerups = g.player(1).unwrap().powerups;
+        let plane = g.player(1).unwrap().plane.as_ref().expect("shot down from ninety below");
+        assert_eq!(plane.hull, before, "rounds reached ninety units up");
+        assert_eq!(
+            plane.shield,
+            sim::max_shield(VehicleKind::Plane, powerups),
+            "its shield was touched from ninety units below"
+        );
+    }
+
+    /// The ground war and the air war cannot touch each other.
+    ///
+    /// Both halves matter: a tank that could be strafed would make the aircraft
+    /// the whole game, and an aircraft that could be shot down by a tank would
+    /// make the sortie pointless. This is the first half.
+    #[test]
+    fn a_cannon_round_passes_over_everything_on_the_ground() {
+        let mut g = two_player_game();
+        g.toggle_cheats();
+        launch_for(&mut g, 0);
+        let mid = world::WORLD_SIZE * 0.5;
+        {
+            let a = g.player_mut(0).unwrap().plane.as_mut().unwrap();
+            a.mv = MoveState {
+                pos: Vec2::new(mid - 30.0, mid),
+                yaw: 0.0,
+                speed: sim::PLANE_CRUISE,
+                roll: 0.0,
+                alt: sim::PLANE_ALTITUDE,
+            };
+        }
+        // The other player's tank, parked directly under the line of fire.
+        {
+            let t = g.player_mut(1).unwrap().tank.as_mut().unwrap();
+            t.mv = MoveState {
+                pos: Vec2::new(mid + 10.0, mid),
+                yaw: 0.0,
+                speed: 0.0,
+                roll: 0.0,
+                alt: 0.0,
+            };
+        }
+        let shield = g.player(1).unwrap().tank.as_ref().unwrap().shield;
+        let hull = g.player(1).unwrap().tank.as_ref().unwrap().hull;
+
+        for tick in 0..120 {
+            hold_the_gun(&mut g, tick);
+            g.step(TICK_DT);
+        }
+        let tank = g.player(1).unwrap().tank.as_ref().expect("a cannon destroyed a tank");
+        assert_eq!(tank.shield, shield, "cannon fire reached a tank shield");
+        assert_eq!(tank.hull, hull, "cannon fire reached a tank hull");
+    }
+
+    /// Two aircraft meeting costs both of them half, once per meeting.
+    ///
+    /// The "once" is the part with teeth. At cruise a converging pair overlaps
+    /// for several ticks, and nothing up there can be pushed apart the way two
+    /// hulls are -- so without the grace latch one meeting would be charged
+    /// every tick and take both of them down on contact.
+    #[test]
+    fn two_aircraft_that_meet_each_pay_half_and_pay_once() {
+        let mut g = two_player_game();
+        g.toggle_cheats();
+        // Overlapping already and left there: nobody is flying, so they stay
+        // inside each other for the whole run.
+        two_aircraft(&mut g, sim::PLANE_ALTITUDE, sim::PLANE_ALTITUDE, 0.0);
+
+        let powerups = g.player(0).unwrap().powerups;
+        let full = sim::max_shield(VehicleKind::Plane, powerups)
+            + sim::max_hull(VehicleKind::Plane, powerups);
+
+        g.step(TICK_DT);
+        for id in 0..2u8 {
+            let plane = g.player(id).unwrap().plane.as_ref().expect("one meeting killed it");
+            let left = plane.shield + plane.hull;
+            assert!(
+                (left - full * 0.5).abs() < 1.0,
+                "player {id} has {left} of {full} after one meeting"
+            );
+        }
+
+        // Half a second sitting inside each other, well within the grace.
+        for _ in 0..15 {
+            g.step(TICK_DT);
+        }
+        for id in 0..2u8 {
+            let plane = g.player(id).unwrap().plane.as_ref().expect("the grace latch let go");
+            let left = plane.shield + plane.hull;
+            assert!(
+                (left - full * 0.5).abs() < 1.0,
+                "player {id} was charged twice inside the grace: {left} left"
+            );
+        }
+    }
+
+    /// Passing under somebody is not flying into them.
+    #[test]
+    fn aircraft_at_different_heights_pass_through_each_other() {
+        let mut g = two_player_game();
+        g.toggle_cheats();
+        two_aircraft(&mut g, sim::PLANE_MIN_ALT, sim::PLANE_MIN_ALT + 40.0, 0.0);
+
+        let powerups = g.player(0).unwrap().powerups;
+        let full = sim::max_shield(VehicleKind::Plane, powerups)
+            + sim::max_hull(VehicleKind::Plane, powerups);
+        for _ in 0..30 {
+            g.step(TICK_DT);
+        }
+        for id in 0..2u8 {
+            let plane = g.player(id).unwrap().plane.as_ref().expect("a fly-under was a collision");
+            assert!(
+                (plane.shield + plane.hull - full).abs() < 1.0,
+                "player {id} was charged for passing forty units underneath"
+            );
+        }
+    }
+
     /// The fuel is the only thing that ends a sortie.
     ///
     /// Flying out of the match used to be the other way, and is not any more:
@@ -2873,6 +3324,7 @@ mod tests {
             yaw: 0.0,
             speed: 0.0,
             life: TICK_DT * 0.5,
+            alt: 0.0,
         });
         g.step(TICK_DT);
 
@@ -2916,6 +3368,7 @@ mod tests {
                 yaw: 0.0,
                 speed: 0.0,
                 life: TICK_DT * 0.5,
+                alt: 0.0,
             });
             g.step(TICK_DT);
             before - taken(&g)
@@ -2937,11 +3390,13 @@ mod tests {
 
     /// Nothing on the ground can bring the aircraft down.
     ///
-    /// The fuel clock is the only limit on a sortie, and that is a deliberate
-    /// choice rather than an oversight: every gun in this game fires along the
-    /// ground, so a shell that took the plane down would be one the player
-    /// watched pass visibly underneath it. The aircraft is kept out of the
-    /// target list to make that true, and this is what says so.
+    /// Something can now -- another aircraft -- but that changes nothing down
+    /// here, and this is the half of the separation that keeps the sortie worth
+    /// buying. Every gun on the ground fires along the ground, so a shell that
+    /// took the plane down would be one the player watched pass visibly
+    /// underneath it. The aircraft stays out of `collect_targets` to make that
+    /// true; what reaches it is `collect_air_targets`, and only a cannon reads
+    /// that one.
     #[test]
     fn the_aircraft_is_not_something_that_can_be_shot_at() {
         let mut g = two_player_game();
@@ -2966,6 +3421,7 @@ mod tests {
             yaw: 0.0,
             speed: sim::MISSILE_MAX_SPEED,
             life: sim::MISSILE_LIFETIME,
+            alt: 0.0,
         });
         for _ in 0..20 {
             g.step(TICK_DT);
@@ -3411,6 +3867,7 @@ mod tests {
                 yaw: 0.0,
                 speed: sim::BULLET_SPEED,
                 life: sim::bullet_lifetime(powerups),
+                alt: 0.0,
             });
             let mut travelled = 0.0;
             for _ in 0..400 {
@@ -3497,6 +3954,7 @@ mod tests {
             yaw: 0.0,
             speed: sim::MISSILE_MAX_SPEED,
             life: sim::MISSILE_LIFETIME,
+            alt: 0.0,
         });
         // Long enough to cross the 12 units to the near face, short enough that
         // it could not have crossed the whole hill.

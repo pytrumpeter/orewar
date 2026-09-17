@@ -95,6 +95,10 @@ pub struct VehicleAssets {
     capture_bar: Handle<Mesh>,
     bullet: Handle<Mesh>,
     missile: Handle<Mesh>,
+    /// A cannon round. Longer and thinner than a bullet: it is drawn against
+    /// open sky at a hundred and twenty units a second, where a sphere reads as
+    /// a dot that teleports, and a streak reads as a tracer.
+    cannon: Handle<Mesh>,
     /// Per-player body, trim, shield, and projectile materials.
     body: Vec<Handle<StandardMaterial>>,
     trim: Vec<Handle<StandardMaterial>>,
@@ -218,6 +222,7 @@ pub fn setup(
         capture_bar: meshes.add(Cuboid::new(1.0, 0.45, 0.45)),
         bullet: meshes.add(Sphere::new(0.34).mesh().uv(8, 6)),
         missile: meshes.add(Cuboid::new(1.7, 0.36, 0.36)),
+        cannon: meshes.add(Cuboid::new(2.2, 0.22, 0.22)),
         body,
         trim,
         shield_material,
@@ -706,6 +711,7 @@ pub fn sync_projectiles(
                 ProjectileKind::Bullet => assets.bullet.clone(),
                 ProjectileKind::Missile => assets.missile.clone(),
                 ProjectileKind::Bomb => assets.bomb.clone(),
+                ProjectileKind::Cannon => assets.cannon.clone(),
             };
             // A bomb is a falling object rather than a tracer, so it is lit and
             // painted like a piece of ordnance instead of glowing.
@@ -742,6 +748,11 @@ pub fn sync_projectiles(
             let height = match projectile.kind {
                 ProjectileKind::Bullet => 2.2,
                 ProjectileKind::Missile => 2.4,
+                // The one projectile that carries its own height, because it is
+                // the one whose height decides anything: a round fired from the
+                // ceiling cannot touch an aircraft on the floor, and a tracer
+                // drawn on the grass would say the opposite.
+                ProjectileKind::Cannon => projectile.alt,
                 // How far it has left to fall. The snapshot has no room to
                 // carry a height, so it is taken from how long this client has
                 // been watching this bomb -- which is the same thing for every

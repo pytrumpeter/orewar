@@ -85,9 +85,19 @@ pub fn tuning(kind: VehicleKind) -> VehicleTuning {
             accel: 30.0,
             brake: 30.0,
             turn_rate: 1.5,
+            // What keeps it inside the field, and now also what a cannon round
+            // has to pass through: an aircraft is in the target list, though
+            // only for other aircraft.
             radius: 5.0,
-            base_shield: 0.0,
-            base_hull: 1.0,
+            // It used to be a token hull of one, because nothing could reach
+            // it. A hundred and fifty between the two is set from the cannon
+            // rather than from the ground vehicles: seven hits on target, which
+            // at `CANNON_COOLDOWN` is about a second and a half of somebody
+            // holding a bead on you. Less than a tank has, because an aircraft
+            // is not supposed to win by absorbing anything -- it is supposed to
+            // not be where the rounds are.
+            base_shield: 60.0,
+            base_hull: 90.0,
         },
     }
 }
@@ -574,6 +584,54 @@ pub const PLANE_EDGE_BAND: f32 = 14.0;
 /// rather than a state: [`SORTIE_COOLDOWN`] is unchanged, so the aircraft is
 /// available for a minute out of every minute and three quarters at best.
 pub const PLANE_FUEL: f32 = 60.0;
+
+/// How fast a cannon round leaves the aircraft, in units per second.
+///
+/// Comfortably clear of the fastest the aircraft itself can fly, which is 42 at
+/// full throttle -- a gun whose rounds an aeroplane could overtake would be a
+/// way to shoot yourself down. The same speed as the tank's gun: a round is a
+/// round, and the difference between the two weapons is what they can hit
+/// rather than how fast they travel.
+pub const CANNON_SPEED: f32 = 120.0;
+
+/// Seconds between cannon rounds. Four and a half a second.
+pub const CANNON_COOLDOWN: f32 = 0.22;
+
+/// How long a cannon round lives, which is what sets its reach.
+///
+/// About 156 units, a third of the field. Long enough to be a real weapon at
+/// the ranges a turning fight happens at, and short enough that four aircraft
+/// all holding the trigger do not fill the snapshot's projectile list on their
+/// own -- at this cooldown that is six rounds in the air per aircraft.
+///
+/// Rounds are *not* culled at the wall the way the ground weapons are. They fly
+/// out over the boundary and expire out there, because an aircraft can be shot
+/// at while it is being banked back in, and a round that stopped dead at the
+/// wall would make the edge of the field a place to hide.
+pub const CANNON_LIFE: f32 = 1.3;
+
+/// What one cannon round takes off another aircraft.
+///
+/// Seven of them is a kill from full, which is a burst rather than a snap shot:
+/// an aircraft that could be taken down by one lucky round would make the
+/// dogfight a coin toss, and one that shrugged off a whole magazine would make
+/// it a formality.
+pub const CANNON_DAMAGE: f32 = 22.0;
+
+/// What two aircraft take off each other by meeting, as a fraction of the whole.
+///
+/// Half of everything, shield and hull together, to both of them. It is the one
+/// exchange in the game that cannot be won -- whoever flies into whom, both pay
+/// the same -- so ramming is a way to trade rather than a way to kill, and two
+/// clean meetings take both aircraft down. It comes back with the next sortie,
+/// because a sortie is a fresh aircraft rather than a repaired one.
+pub const PLANE_COLLISION_FRACTION: f32 = 0.5;
+
+/// How long an aircraft is immune to being charged for another collision.
+///
+/// One second, which is far longer than a meeting lasts and short enough that
+/// two aircraft genuinely circling into each other are charged for each pass.
+pub const PLANE_COLLISION_GRACE: f32 = 1.0;
 
 /// Seconds between one sortie ending and the next being available.
 ///

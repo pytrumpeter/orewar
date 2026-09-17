@@ -121,8 +121,12 @@ fn plane_as_vehicle(p: &PlaneSnapshot) -> VehicleSnapshot {
         // Fuel rides in on `cargo`, which is the one field on a vehicle that
         // means nothing to an aircraft and is already a "how full is it".
         cargo: p.fuel,
-        shield: 0.0,
-        hull: 1.0,
+        // Real numbers now that the aircraft can be shot down. These were a
+        // token zero and one for as long as nothing could reach it, and leaving
+        // them that way meant the panel and the bars read an aeroplane that was
+        // always on its last point of hull.
+        shield: p.shield,
+        hull: p.hull,
         disabled: false,
         capture_progress: 0.0,
     }
@@ -185,6 +189,8 @@ pub struct RenderProjectile {
     pub owner: u8,
     pub pos: SimVec2,
     pub yaw: f32,
+    /// Height, for the cannon round. Everything else is on the ground.
+    pub alt: f32,
 }
 
 /// Everything the render systems read. Rebuilt every frame from the snapshot
@@ -713,6 +719,10 @@ impl GameState {
                         owner: pb.owner,
                         pos,
                         yaw,
+                        // Held rather than interpolated: a cannon round flies
+                        // level for its whole life, so the two snapshots either
+                        // side of this frame carry the same height.
+                        alt: pb.alt,
                     });
                 }
             }
@@ -753,6 +763,7 @@ impl GameState {
                         owner: p.owner,
                         pos: p.pos,
                         yaw: p.yaw,
+                        alt: p.alt,
                     }));
                 }
             }

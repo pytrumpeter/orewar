@@ -395,6 +395,22 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
         }
         // A tank lost to a hillside is charged to its own driver, so `by` is
         // the victim. Saying somebody destroyed their own tank reads as a bug.
+        GameEvent::PlaneShotDown { player, by } if by == player => {
+            if Some(player) == me {
+                "You flew your own aircraft into the ground".to_string()
+            } else {
+                format!("{} lost their aircraft", name(player))
+            }
+        }
+        GameEvent::PlaneShotDown { player, by } => {
+            if Some(player) == me {
+                format!("Your aircraft was shot down by {}", name(by))
+            } else if Some(by) == me {
+                format!("You shot down {}'s aircraft", name(player))
+            } else {
+                format!("{} shot down {}'s aircraft", name(by), name(player))
+            }
+        }
         GameEvent::TankDestroyed { player, by } if by == player => {
             if Some(player) == me {
                 "You wrecked your own tank".to_string()

@@ -20,12 +20,13 @@ use crate::world::{MAX_PLAYERS, PowerUp, WORLD_SIZE};
 /// Bumped whenever the wire format changes, so mismatched builds fail the
 /// handshake instead of misparsing each other.
 ///
-/// Last bumped for the bomber's altitude, which the yoke made something that
-/// varies: it joins the snapshot, and a yoke axis joins the input frame.
+/// Last bumped for the dogfight: a fourth projectile kind, a height on every
+/// projectile, shield and hull on every aircraft, a second slot bit in
+/// [`HitFx`], and an event for an aircraft going down.
 /// Without a bump an older peer would complete the handshake and then hit an
 /// unknown tag on the reliable stream, which is a decode error rather than a
 /// recoverable one.
-pub const PROTOCOL_ID: u32 = 0x4F52_570B;
+pub const PROTOCOL_ID: u32 = 0x4F52_570C;
 
 /// Quantization ceiling for shield and hull values.
 const STAT_SCALE: f32 = 512.0;
@@ -54,13 +55,15 @@ const PLANE_SPEED_SCALE: f32 = 500.0;
 /// first. Bullets are dense and short-lived; dropping the far ones keeps
 /// packets inside the MTU and is invisible in play.
 ///
-/// Came down from 40 to pay for the bomber, which put a [`PlaneSnapshot`] and
-/// a cooldown on every player and took the worst-case packet one byte over the
-/// budget. This is the right place to find it: four players firing flat out
-/// keep well under a dozen shells in the air between them, so the cap is slack
-/// that only a pathological case ever reaches, where the per-player bytes are
-/// paid on every single tick.
-pub const MAX_PROJECTILES_PER_SNAPSHOT: usize = 36;
+/// Came down from 40 to pay for the bomber, and from 36 to pay for the
+/// dogfight: every projectile now carries the height it is flying at, and every
+/// aircraft carries what is left of it. This is still the right place to find
+/// the bytes, but the slack is thinner than it was. Four players firing flat
+/// out on the ground keep well under a dozen shells in the air between them;
+/// four *aircraft* holding the trigger are about six rounds each, which is why
+/// [`sim::CANNON_LIFE`] is as short as it is. The cap is nearest-first, so
+/// reaching it drops the far ones, which are the ones nobody is watching.
+pub const MAX_PROJECTILES_PER_SNAPSHOT: usize = 34;
 
 /// A full ore resync is sent this often; between them only changed deposits go
 /// out. This bounds how long a client can hold a stale amount after packet loss.
@@ -417,6 +420,11 @@ pub struct PlaneSnapshot {
     /// reach anything, so every client needs every aircraft's altitude, not
     /// just its own.
     pub alt: f32,
+    /// What is left of it. On the wire because the aircraft can be shot down
+    /// now: its own panel reads these, and so does every client that has to
+    /// decide whether an enemy aircraft is worth staying with.
+    pub shield: f32,
+    pub hull: f32,
 }
 
 impl Encode for PlaneSnapshot {
@@ -431,6 +439,8 @@ impl Encode for PlaneSnapshot {
         // 256 rungs 0.4 units apart -- visible as a stutter in the climb, and
         // worse through `sim::bomb_fall_time`, which would step the bombsight.
         w.unorm16(self.alt, sim::PLANE_MAX_ALT);
+        w.unorm16(self.shield, STAT_SCALE);
+        w.unorm16(self.hull, STAT_SCALE);
     }
 }
 
@@ -443,13 +453,15 @@ impl Decode for PlaneSnapshot {
             speed: r.signed_fixed16(PLANE_SPEED_SCALE)?,
             fuel: r.unorm8()?,
             alt: r.unorm16(sim::PLANE_MAX_ALT)?,
+            shield: r.unorm16(STAT_SCALE)?,
+            hull: r.unorm16(STAT_SCALE)?,
         })
     }
 }
 
 /// Bytes one `PlaneSnapshot` occupies on the wire. Half a vehicle, and most of
 /// that is the position, which is the one thing it cannot do without.
-pub const PLANE_SNAPSHOT_BYTES: usize = 17;
+pub const PLANE_SNAPSHOT_BYTES: usize = 21;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerSnapshot {
@@ -567,6 +579,11 @@ pub enum ProjectileKind {
     /// falls; it is at altitude for its whole life, so it passes over hills and
     /// hulls alike and only does anything when it lands.
     Bomb = 2,
+    /// Fired from one aircraft at another. The only weapon in the game that
+    /// works at altitude, and the only one that cannot touch the ground: it
+    /// flies level at the height it was fired from and passes over everything
+    /// down there. It is also the only one not culled at the wall.
+    Cannon = 3,
 }
 
 impl ProjectileKind {
@@ -575,6 +592,7 @@ impl ProjectileKind {
             0 => Some(ProjectileKind::Bullet),
             1 => Some(ProjectileKind::Missile),
             2 => Some(ProjectileKind::Bomb),
+            3 => Some(ProjectileKind::Cannon),
             _ => None,
         }
     }
@@ -587,11 +605,26 @@ pub struct ProjectileSnapshot {
     pub owner: u8,
     pub pos: Vec2,
     pub yaw: f32,
+    /// Height it is flying at. Zero for everything that travels along the
+    /// ground, and for a bomb -- a bomb's height is reconstructed on the client
+    /// from how long it has been falling, which costs nothing.
+    ///
+    /// A cannon round needs it on the wire so the tracer is drawn where the
+    /// round actually is -- a dogfight read as happening on the ground would be
+    /// unreadable. The hit itself is decided on the server, which has the real
+    /// number; this is only what the client draws.
+    pub alt: f32,
 }
 
 impl Encode for ProjectileSnapshot {
     fn encode(&self, w: &mut Writer) {
         w.u16(self.id).u8(self.kind as u8).u8(self.owner).vec2(self.pos).angle(self.yaw);
+        // One byte, against sixteen for an aircraft's own altitude: this places
+        // a tracer and nothing reconciles against it, so 0.4 of a unit is far
+        // finer than anyone can see on something crossing the screen. It is
+        // also paid on every projectile in every snapshot, which is where the
+        // packet budget actually goes.
+        w.unorm8(self.alt / sim::PLANE_MAX_ALT);
     }
 }
 
@@ -606,11 +639,12 @@ impl Decode for ProjectileSnapshot {
             owner: r.u8()?,
             pos: r.vec2()?,
             yaw: r.angle()?,
+            alt: r.unorm8()? * sim::PLANE_MAX_ALT,
         })
     }
 }
 
-pub const PROJECTILE_SNAPSHOT_BYTES: usize = 14;
+pub const PROJECTILE_SNAPSHOT_BYTES: usize = 15;
 
 /// A deposit's current amount. Only changed deposits are sent between full syncs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -685,19 +719,26 @@ pub struct HitFx {
     /// Bearing from the struck vehicle's centre out to the impact, so a shield
     /// flash can be drawn on the face that took it. Meaningless for terrain.
     pub angle: f32,
-    /// Player in the low bits, slot in the high bit, or [`HitFx::TERRAIN`].
+    /// Player in the low two bits, slot in the next two, or [`HitFx::TERRAIN`].
     /// Packed here so the one place that knows the layout is this file.
+    ///
+    /// The slot used to be a single bit, which could say tank or miner and
+    /// nothing else -- and that was one of the two reasons the aircraft was
+    /// kept out of the target list entirely, because a hit on it could not be
+    /// described to a client. Two bits, at no cost: [`MAX_PLAYERS`] is four, so
+    /// the player only ever needed two of the seven it was given.
     target: u8,
 }
 
 impl HitFx {
     /// Stands for "hit something that is not a vehicle".
     pub const TERRAIN: u8 = u8::MAX;
-    const SLOT_BIT: u8 = 0b1000_0000;
+    const PLAYER_MASK: u8 = 0b0000_0011;
+    const SLOT_SHIFT: u32 = 2;
 
     pub fn on_vehicle(kind: HitKind, pos: Vec2, angle: f32, player: u8, slot: VehicleSlot) -> Self {
-        let slot_bit = if slot == VehicleSlot::Miner { Self::SLOT_BIT } else { 0 };
-        HitFx { kind, pos, angle, target: (player & 0x7F) | slot_bit }
+        let target = (player & Self::PLAYER_MASK) | ((slot as u8) << Self::SLOT_SHIFT);
+        HitFx { kind, pos, angle, target }
     }
 
     pub fn on_terrain(kind: HitKind, pos: Vec2) -> Self {
@@ -709,12 +750,8 @@ impl HitFx {
         if self.target == Self::TERRAIN {
             return None;
         }
-        let slot = if self.target & Self::SLOT_BIT != 0 {
-            VehicleSlot::Miner
-        } else {
-            VehicleSlot::Tank
-        };
-        Some((self.target & 0x7F, slot))
+        let slot = VehicleSlot::from_u8((self.target >> Self::SLOT_SHIFT) & 0b11)?;
+        Some((self.target & Self::PLAYER_MASK, slot))
     }
 }
 
@@ -880,6 +917,11 @@ pub enum GameEvent {
     SentinelRebuilt { player: u8 },
     /// A captured player is back on the field with a fresh pair of vehicles.
     PlayerReturned { player: u8 },
+    /// An aircraft was shot down, or flew into another one.
+    ///
+    /// `by` is the other pilot. In a collision both aircraft are announced,
+    /// each naming the other, because neither of them won that exchange.
+    PlaneShotDown { player: u8, by: u8 },
 }
 
 impl Encode for GameEvent {
@@ -936,6 +978,9 @@ impl Encode for GameEvent {
             GameEvent::PlayerReturned { player } => {
                 w.u8(17).u8(player);
             }
+            GameEvent::PlaneShotDown { player, by } => {
+                w.u8(18).u8(player).u8(by);
+            }
         }
     }
 }
@@ -973,6 +1018,7 @@ impl Decode for GameEvent {
             15 => GameEvent::SentinelDestroyed { player: r.u8()? },
             16 => GameEvent::SentinelRebuilt { player: r.u8()? },
             17 => GameEvent::PlayerReturned { player: r.u8()? },
+            18 => GameEvent::PlaneShotDown { player: r.u8()?, by: r.u8()? },
             other => return Err(DecodeError::BadTag("GameEvent", other)),
         })
     }
@@ -1121,6 +1167,8 @@ mod tests {
                 speed: 41.5,
                 fuel: 0.5,
                 alt: 71.5,
+                shield: 51.5,
+                hull: 77.25,
             }),
             plane_ready_in: 33,
         }
@@ -1206,6 +1254,7 @@ mod tests {
             GameEvent::MatchReset { world_seed: 0xFEED_FACE_1234_5678, by: 2 },
             GameEvent::OreSeized { by: 1, from: 2, amount: 47 },
             GameEvent::SentinelDestroyed { player: 3 },
+            GameEvent::PlaneShotDown { player: 2, by: 1 },
             GameEvent::SentinelRebuilt { player: 3 },
             GameEvent::PlayerReturned { player: 1 },
         ];
@@ -1242,6 +1291,7 @@ mod tests {
                     owner: (i % 4) as u8,
                     pos: vec2(i as f32, i as f32 * 2.0),
                     yaw: i as f32 * 0.1,
+                    alt: 0.0,
                 })
                 .collect(),
             cheats: true,
@@ -1279,25 +1329,33 @@ mod tests {
 
     #[test]
     fn a_hit_effect_round_trips_including_its_packed_target() {
-        let cases = [
-            HitFx::on_terrain(HitKind::Blast, vec2(12.5, 300.25)),
-            HitFx::on_vehicle(HitKind::Shield, vec2(0.0, 0.0), -2.5, 0, VehicleSlot::Tank),
-            HitFx::on_vehicle(HitKind::Shield, vec2(319.99, 1.0), 1.25, 3, VehicleSlot::Miner),
-        ];
-        for want in cases {
-            let got = HitFx::from_slice(&want.to_vec()).unwrap();
-            assert_eq!(got.kind, want.kind);
-            assert_eq!(got.target(), want.target(), "the packed target must survive");
-            assert!(got.pos.distance(want.pos) < 0.02, "{:?} vs {:?}", got.pos, want.pos);
-            assert!(crate::math::angle_delta(got.angle, want.angle).abs() < 0.01);
+        // Every slot against every player, which the single-bit packing could
+        // not have expressed: `Plane` had no bit pattern at all, and that was
+        // one of the two reasons the aircraft was kept out of the target list.
+        for player in 0..MAX_PLAYERS as u8 {
+            for slot in VehicleSlot::ALL {
+                let want =
+                    HitFx::on_vehicle(HitKind::Shield, vec2(319.99, 1.0), 1.25, player, slot);
+                let got = HitFx::from_slice(&want.to_vec()).unwrap();
+                assert_eq!(got.kind, want.kind);
+                assert_eq!(
+                    got.target(),
+                    Some((player, slot)),
+                    "player {player} on {slot:?} did not survive the packing"
+                );
+                assert!(got.pos.distance(want.pos) < 0.02, "{:?} vs {:?}", got.pos, want.pos);
+                assert!(crate::math::angle_delta(got.angle, want.angle).abs() < 0.01);
+            }
         }
-        // Terrain has no vehicle behind it, and player 127 must not be mistaken
-        // for the sentinel.
+
+        let terrain = HitFx::on_terrain(HitKind::Blast, vec2(12.5, 300.25));
+        let got = HitFx::from_slice(&terrain.to_vec()).unwrap();
+        assert_eq!(got.target(), None, "terrain has no vehicle behind it");
+        assert!(got.pos.distance(terrain.pos) < 0.02);
+
+        // The terrain marker must not collide with any real packing. It is
+        // all ones, whose slot bits say three, and there is no fourth slot.
         assert_eq!(HitFx::on_terrain(HitKind::Blast, Vec2::ZERO).target(), None);
-        assert_eq!(
-            HitFx::on_vehicle(HitKind::Blast, Vec2::ZERO, 0.0, 3, VehicleSlot::Tank).target(),
-            Some((3, VehicleSlot::Tank))
-        );
     }
 
     #[test]
@@ -1327,6 +1385,9 @@ mod tests {
                     owner: 3,
                     pos: vec2(255.0, 255.0),
                     yaw: 3.0,
+                    // The worst case is a sky full of cannon rounds, each
+                    // paying for the byte that says how high it is.
+                    alt: sim::PLANE_MAX_ALT,
                 })
                 .collect(),
             cheats: true,
@@ -1407,7 +1468,16 @@ mod tests {
             let throttle = -1.0 + step as f32 * 0.1;
             let speed = crate::sim::PLANE_CRUISE + throttle * crate::sim::PLANE_SPEED_TRIM;
             let sent =
-                PlaneSnapshot { pos: vec2(1.0, 2.0), yaw: 0.5, roll: -0.3, speed, fuel: 0.5, alt: 40.0 };
+                PlaneSnapshot {
+                    pos: vec2(1.0, 2.0),
+                    yaw: 0.5,
+                    roll: -0.3,
+                    speed,
+                    fuel: 0.5,
+                    alt: 40.0,
+                    shield: 30.0,
+                    hull: 45.0,
+                };
             let got = PlaneSnapshot::from_slice(&sent.to_vec()).expect("decodes");
             assert!(
                 (got.speed - speed).abs() < 0.01,
@@ -1444,6 +1514,7 @@ mod tests {
             owner: 0,
             pos: vec2(0.0, 0.0),
             yaw: 0.0,
+            alt: 0.0,
         };
         assert_eq!(proj.to_vec().len(), PROJECTILE_SNAPSHOT_BYTES);
         let fx = HitFx::on_terrain(HitKind::Blast, vec2(1.0, 2.0));

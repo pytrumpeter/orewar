@@ -71,7 +71,7 @@ the handshake with an error rather than let in. Start it with another name.
 | `1`–`5` | in the air, the throttle: `1` slowest, `3` cruise, `5` full |
 | mouse | aim the turret |
 | left mouse *or* `Space` | fire the gun |
-| right mouse *or* `F` | fire a missile |
+| right mouse *or* `F` | fire a missile; in the air, the cannon |
 | `Tab` | switch between the vehicles you have |
 | `G` | call up a bombing run and take its controls; once you own the **Bomber** |
 | `B` | build menu, then `1`–`8` to buy |
@@ -171,8 +171,8 @@ is thrown further ahead. Watching that ring slide out as you climb is the whole
 trade in one picture.
 
 Nothing on the ground can shoot it down. Every gun down there fires along the
-ground, so the clock is the only thing standing between a bombing run and the
-ground under it. What a bomb costs you instead is the run itself: it leaves with
+ground, and a shell that took an aeroplane down would be one you watched pass
+underneath it. What can reach you is another aircraft. What a bomb costs you instead is the run itself: it leaves with
 the aircraft's velocity and falls, landing well ahead of where you let it go, so
 a run is a line you commit to and fly through — and one you have to bank into
 early, because rolling level again takes as long as rolling over did. You cannot
@@ -189,6 +189,29 @@ does not survive one at all. That is deliberate: a bomb is released a long way
 before it lands, from an aircraft committed to a line and unable to stop,
 out of a sortie that comes round every forty-five seconds at best — against
 anything moving and paying attention, most of them miss.
+
+**Dogfighting.** Two aircraft in the air are the only things in the game that
+can reach each other, and the cannon on the right mouse button is the only
+weapon that works up there. It has no ammunition and no turret: it fires where
+the nose is pointed, at the height you are flying, so getting a hit is entirely
+a question of flying — which is what makes the bank worth understanding and the
+yoke worth using.
+
+Height is the whole of it. A round flies level at the altitude it left at, so
+climbing out of somebody's guns genuinely takes you out of reach, and coming
+back down to theirs is the price of shooting at them. The same is true of the
+aircraft themselves: two at different heights pass straight through each other,
+and two at the same height that meet take half of everything off both of them.
+Nobody wins that exchange — it does not matter who flew into whom — so ramming
+is a way to trade, and two clean meetings take both aircraft down. What it costs
+comes back with your next sortie, because a sortie is a fresh aircraft rather
+than a repaired one.
+
+Seven cannon hits will take an aircraft down from full, which at four and a half
+rounds a second is about a second and a half of somebody holding a bead on you.
+Its panel appears at the bottom right whenever a sortie is up — including while
+you are back in the tank, because an aircraft can be shot down whether or not
+you are watching it.
 
 Ore in a blast is not reduced, it is **gone**. A deposit is the one thing on the
 field that cannot be driven out of the way, and one bomb empties it — which is

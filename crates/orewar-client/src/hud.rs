@@ -42,6 +42,7 @@ pub enum HudText {
     BuildMenu,
     TankStats,
     MinerStats,
+    PlaneStats,
     Roster(u8),
 }
 
@@ -54,6 +55,9 @@ pub enum HudBar {
     MinerHull,
     MinerCargo,
     Capture,
+    PlaneShield,
+    PlaneHull,
+    PlaneFuel,
 }
 
 /// Panels shown and hidden as a whole.
@@ -62,6 +66,17 @@ pub enum HudPanel {
     BuildMenu,
     Radar,
     Banner,
+    /// Shown only while a sortie is up.
+    ///
+    /// The other two vehicle panels are always there because the vehicles
+    /// always are. An aircraft exists for a minute at a time, so a panel for
+    /// one would be an empty box for most of a match -- and the moment there is
+    /// something to say about it, it is the only thing on screen worth reading.
+    ///
+    /// "Up" rather than "being flown": an aircraft can be shot down while its
+    /// pilot is driving the tank, and finding out about that afterwards from
+    /// the event log is finding out too late to do anything.
+    Plane,
 }
 
 #[derive(Component)]
@@ -180,6 +195,24 @@ pub fn setup(mut commands: Commands) {
             spawn_bar(p, HudBar::MinerHull, HULL_COLOR, 210.0);
             spawn_bar(p, HudBar::MinerCargo, CARGO_COLOR, 210.0);
             spawn_bar(p, HudBar::Capture, CAPTURE_COLOR, 210.0);
+        });
+
+    // ---- Aircraft panel, above the miner's --------------------------------
+    // Stacked over the miner rather than beside it: the bottom corners are
+    // taken, and an aircraft is a thing you have for a minute rather than a
+    // permanent fixture, so it is allowed to sit on top of the layout.
+    commands
+        .spawn((
+            Node { bottom: px(150), right: px(12), width: px(230), ..panel_node() },
+            BackgroundColor(PANEL_BG),
+            HudPanel::Plane,
+        ))
+        .with_children(|p| {
+            p.spawn((Text::new("BOMBER"), font(12.0), TextColor(TEXT_DIM)));
+            p.spawn((HudText::PlaneStats, Text::new(""), font(13.0), TextColor(TEXT)));
+            spawn_bar(p, HudBar::PlaneShield, SHIELD_COLOR, 210.0);
+            spawn_bar(p, HudBar::PlaneHull, HULL_COLOR, 210.0);
+            spawn_bar(p, HudBar::PlaneFuel, CARGO_COLOR, 210.0);
         });
 
     // ---- Event log, bottom centre ----------------------------------------
@@ -389,6 +422,29 @@ pub fn update_texts(
                 };
             }
 
+            HudText::PlaneStats => {
+                // Nothing is drawn when there is no sortie: the panel is hidden
+                // then, and this would be a string nobody sees.
+                if let Some(v) = me.and_then(|p| p.plane) {
+                    let powerups = me.map_or(0, |p| p.powerups);
+                    // Altitude and airspeed as well as the bars. The status
+                    // line up top says them too, but that line is about the
+                    // aircraft you are flying and this panel is about the
+                    // aircraft you have -- they are the same one until you
+                    // switch back to the tank, and then only this one is left.
+                    **text = format!(
+                        "shield {:.0}/{:.0}   hull {:.0}/{:.0}
+{:.0} alt   {:.0} kts",
+                        v.shield,
+                        sim::max_shield(VehicleKind::Plane, powerups),
+                        v.hull,
+                        sim::max_hull(VehicleKind::Plane, powerups),
+                        v.alt,
+                        v.speed,
+                    );
+                }
+            }
+
             HudText::MinerStats => {
                 **text = match me.and_then(|p| p.miner) {
                     Some(v) => {
@@ -517,6 +573,16 @@ pub fn update_bars(state: Res<GameState>, mut bars: Query<(&HudBar, &mut Node)>)
             HudBar::Capture => me
                 .and_then(|p| p.miner)
                 .map(|v| if v.disabled { v.capture_progress } else { 0.0 }),
+            HudBar::PlaneShield => me.and_then(|p| p.plane).map(|v| {
+                v.shield / sim::max_shield(VehicleKind::Plane, powerups).max(1.0)
+            }),
+            HudBar::PlaneHull => me
+                .and_then(|p| p.plane)
+                .map(|v| v.hull / sim::max_hull(VehicleKind::Plane, powerups).max(1.0)),
+            // Fuel rides in on `cargo`, which is how the aircraft is widened
+            // into a vehicle in the first place -- it is the one field on a
+            // vehicle that means nothing up there and is already a "how full".
+            HudBar::PlaneFuel => me.and_then(|p| p.plane).map(|v| v.cargo),
         };
         node.width = percent(fraction.unwrap_or(0.0).clamp(0.0, 1.0) * 100.0);
     }
@@ -529,12 +595,14 @@ pub fn update_panels(
 ) {
     let radar_unlocked = state.local().is_some_and(|p| PowerUp::Radar.held(p.powerups));
     let banner = state.status != GameStatus::Running;
+    let flying = state.local().is_some_and(|p| p.plane.is_some());
 
     for (panel, mut visibility) in &mut panels {
         let show = match panel {
             HudPanel::BuildMenu => input.build_menu,
             HudPanel::Radar => radar_unlocked,
             HudPanel::Banner => banner,
+            HudPanel::Plane => flying,
         };
         *visibility = if show { Visibility::Visible } else { Visibility::Hidden };
     }
