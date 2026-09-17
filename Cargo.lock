@@ -4041,6 +4041,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "orewar-server-gui"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "orewar-server",
+ "orewar-shared",
+]
+
+[[package]]
 name = "orewar-shared"
 version = "0.1.0"
 

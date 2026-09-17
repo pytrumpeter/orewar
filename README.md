@@ -20,6 +20,20 @@ cargo run --release -p orewar-server
 cargo run --release -p orewar-client
 ```
 
+The host can have a window instead of a terminal:
+
+```bash
+cargo run --release -p orewar-server-gui
+```
+
+It asks for a port and a world seed, then shows the address to read out to
+everybody else, who is in the match, how far behind each of them is, and what
+the server has been doing. **New match** restarts on a fresh map for everyone;
+**Stop** ends it and says goodbye to each client rather than leaving them to
+time out. It hosts exactly the match the dedicated server does -- on its own
+thread, at its own thirty ticks a second, so nothing about the game depends on
+the window being open in front of somebody.
+
 Started with nothing to go on, the client opens on a **connect screen**: type
 the host's address and the name you want to play under, press Enter, and watch
 the handshake. Whatever the server says about it lands there -- a name somebody
@@ -53,6 +67,9 @@ The match begins when the second player connects. Up to four can play.
 | `--bind ADDR` | interface to listen on (default `0.0.0.0`) |
 | `--port N` | UDP port (default `45701`) |
 | `--seed N` | world seed; omit for a random map |
+
+`orewar-server-gui` takes no arguments -- it asks on screen instead, and always
+listens on every interface.
 
 | Client | |
 |---|---|
@@ -252,13 +269,17 @@ still ends a sortie; that is the one rule it does not lift.
 
 ```
 crates/
-  orewar-shared/   wire protocol, UDP reliability, world generation, vehicle physics
-  orewar-server/   authoritative simulation, 30 Hz
-  orewar-client/   Bevy renderer, prediction, HUD
+  orewar-shared/     wire protocol, UDP reliability, world generation, vehicle physics
+  orewar-server/     authoritative simulation, 30 Hz
+  orewar-server-gui/ the same server, hosted from a window
+  orewar-client/     Bevy renderer, prediction, HUD
 ```
 
 `orewar-shared` has **no dependencies**. The server links only against it, so it
-builds and runs headless in seconds without pulling in a renderer.
+builds and runs headless in seconds without pulling in a renderer. That is also
+why the window that hosts a match is a crate of its own rather than a second
+binary next to the server: a dedicated server should not have to build Bevy to
+be a dedicated server.
 
 ### The server decides everything
 

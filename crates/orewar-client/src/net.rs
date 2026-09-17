@@ -14,7 +14,7 @@ use bevy::prelude::*;
 use orewar_shared::bytes::{Decode, Encode};
 use orewar_shared::net::{Endpoint, MAX_PACKET, PacketKind, begin_packet, parse_packet};
 use orewar_shared::protocol::{
-    ClientMessage, DenyReason, GameEvent, MinerMode, InputFrame, PROTOCOL_ID,
+    self, ClientMessage, DenyReason, GameEvent, MinerMode, InputFrame, PROTOCOL_ID,
     ServerMessage,
 };
 use orewar_shared::sim;
@@ -437,6 +437,12 @@ fn describe_event(state: &GameState, event: GameEvent) -> Option<String> {
             } else {
                 format!("{} wins the match", name(winner))
             }
+        }
+        // A reset can come from the machine hosting the match rather than from
+        // anybody playing it, and `HOST` is no player's id: naming whoever
+        // happens to sit in that slot would blame them for it.
+        GameEvent::MatchReset { by, .. } if by == protocol::HOST => {
+            "The host started a new match".to_string()
         }
         GameEvent::MatchReset { by, .. } => {
             if Some(by) == me {

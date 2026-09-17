@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/orewar-shared", "crates/orewar-server", "crates/orewar-client"]
+members = [
+    "crates/orewar-shared",
+    "crates/orewar-server",
+    "crates/orewar-server-gui",
+    "crates/orewar-client",
+]
 
 [workspace.package]
 version = "0.1.0"

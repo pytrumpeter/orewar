@@ -69,6 +69,12 @@ pub const MAX_PROJECTILES_PER_SNAPSHOT: usize = 34;
 /// out. This bounds how long a client can hold a stale amount after packet loss.
 pub const ORE_FULL_SYNC_INTERVAL: u32 = 30;
 
+/// Stands in for a player id where the server itself did something a player
+/// normally does -- a new match started from the host's own window, which is
+/// nobody's slot. Out of range of any real id, so a client that shows names by
+/// id says "the host" rather than picking whoever sits in that slot.
+pub const HOST: u8 = u8::MAX;
+
 // ---------------------------------------------------------------------------
 // Client -> server
 // ---------------------------------------------------------------------------
