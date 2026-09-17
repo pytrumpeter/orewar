@@ -8,7 +8,7 @@
 //! address, so a player who drops out keeps their ore, power-ups, and vehicles
 //! and resumes the same slot when they reconnect.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use orewar_shared::math::{Vec2, angle_delta, wrap_angle};
 use orewar_shared::protocol::{
@@ -22,6 +22,14 @@ use orewar_shared::world::{
     self, Hill, MAX_PLAYERS, MISSILES_PER_PACK, OreDeposit, PowerUp, STARTING_CREDITS,
     STARTING_MISSILES, STARTING_POWERUPS,
 };
+
+/// Frames a player may have waiting to be simulated.
+///
+/// Eight is about a quarter of a second at the tick rate: enough to ride out
+/// the ordinary lumpiness of two unsynchronised clocks and a network, and short
+/// enough that a client recovering from a stall does not get to replay it in
+/// slow motion while everyone else plays the present.
+const MAX_QUEUED_INPUTS: usize = 8;
 
 /// How long a player's last input frame stays in effect.
 ///
@@ -136,11 +144,39 @@ pub struct Player {
     /// Counts down while the player is off the field entirely, having had their
     /// miner taken. Zero means they are in the match.
     pub down_for: f32,
+    /// The frame the simulation is currently running on: the last one taken off
+    /// the queue below, held until another is taken.
     pub input: InputFrame,
+    /// Frames received and not yet simulated, oldest first.
+    ///
+    /// The server used to simulate with "whichever frame arrived most recently",
+    /// which quietly breaks the one thing client prediction rests on: that the
+    /// server applies each frame exactly once, in order, so that replaying them
+    /// reproduces what the server did. Two free-running 30 Hz clocks with a
+    /// network between them do not deliver one frame per tick. They deliver two
+    /// on some ticks and none on others, for ever, because the phase between
+    /// them sweeps -- and on a "latest wins" server, two arrivals means a frame
+    /// is acknowledged and never simulated, while none means one is simulated
+    /// twice. Either way authority and prediction part company by a tick of
+    /// input, and the client's error smoothing drags the vehicle back and lets
+    /// it slide forward again.
+    ///
+    /// A queue makes the promise true. One frame off the front per tick, and
+    /// `acked_input` names the frame that was actually *run* rather than the
+    /// one that most recently showed up.
+    pub inputs: VecDeque<InputFrame>,
     /// Seconds since a fresh input frame arrived.
     pub input_age: f32,
-    /// Highest input tick accepted, echoed back so the client can reconcile.
+    /// Tick of the last frame actually simulated, echoed back so the client
+    /// knows exactly how much of its history to replay.
     pub acked_input: u32,
+    /// Highest tick ever admitted to the queue.
+    ///
+    /// Separate from `acked_input` now that the two mean different things: this
+    /// is what rejects a frame that arrives late or out of order, and it has to
+    /// run ahead of what has been simulated or everything still waiting in the
+    /// queue would be rejected as stale.
+    newest_input: u32,
 }
 
 /// Where a player's vehicles stand at the start of a match, and which way they
@@ -192,8 +228,10 @@ impl Player {
             respawn_timer: 0.0,
             down_for: 0.0,
             input: InputFrame::default(),
+            inputs: VecDeque::new(),
             input_age: 0.0,
             acked_input: 0,
+            newest_input: 0,
         }
     }
 
@@ -485,7 +523,10 @@ impl Game {
             // moment the old connection dropped does not drive the vehicle
             // until the first real frame lands.
             p.acked_input = 0;
+            p.newest_input = 0;
             p.input = InputFrame::default();
+            // Anything still queued belongs to the connection that died.
+            p.inputs.clear();
             p.input_age = 0.0;
             let id = p.id;
             self.events.push(GameEvent::PlayerJoined { player: id });
@@ -580,10 +621,43 @@ impl Game {
 
     pub fn set_input(&mut self, id: u8, frame: InputFrame) {
         if let Some(p) = self.player_mut(id) {
-            if frame.tick >= p.acked_input || p.acked_input == 0 {
+            // Strictly newer. Equal is not newer: a frame admitted twice would
+            // be simulated twice, which is the exact fault the queue exists to
+            // remove.
+            if frame.tick > p.newest_input || p.newest_input == 0 {
+                p.newest_input = frame.tick;
+                p.inputs.push_back(frame);
+                // A client that stalled and then burst-sent should catch up to
+                // the present, not make the server replay the stall. Dropping
+                // from the front keeps the newest intentions and costs the
+                // oldest, which are the ones already overtaken by events.
+                while p.inputs.len() > MAX_QUEUED_INPUTS {
+                    p.inputs.pop_front();
+                }
+                // Time since the client was last heard from, which is what the
+                // timeout is about -- not time since one was simulated, or a
+                // client whose queue is still draining would look silent.
+                p.input_age = 0.0;
+            }
+        }
+    }
+
+    /// Takes one frame per player off the front of the queue.
+    ///
+    /// Run once at the top of the tick, because `effective_input` is read
+    /// several times while a tick is simulated and every one of them has to see
+    /// the same frame.
+    ///
+    /// An empty queue holds the last frame rather than going neutral: one late
+    /// packet should not read as the player letting go of everything. Going
+    /// properly quiet is `INPUT_TIMEOUT`'s job, and `acked_input` deliberately
+    /// does not advance here -- the client keeps that frame in its history and
+    /// replays it, which is the truth, because the server did run it again.
+    fn take_inputs(&mut self) {
+        for p in self.players.iter_mut().flatten() {
+            if let Some(frame) = p.inputs.pop_front() {
                 p.acked_input = frame.tick;
                 p.input = frame;
-                p.input_age = 0.0;
             }
         }
     }
@@ -663,6 +737,9 @@ impl Game {
     pub fn step(&mut self, dt: f32) {
         self.tick = self.tick.wrapping_add(1);
         self.update_status();
+        // Before anything reads an input, and exactly once, so every part of
+        // this tick simulates the same frame and each frame is simulated once.
+        self.take_inputs();
         for p in self.players.iter_mut().flatten() {
             p.input_age += dt;
         }
@@ -4067,8 +4144,172 @@ mod tests {
         let mut g = two_player_game();
         g.set_input(0, InputFrame { tick: 100, throttle: 1.0, ..Default::default() });
         g.set_input(0, InputFrame { tick: 50, throttle: -1.0, ..Default::default() });
+        // Only the newer one was admitted, so only it can ever be simulated.
+        assert_eq!(g.player(0).unwrap().inputs.len(), 1, "the older frame was queued");
+        g.step(TICK_DT);
         assert_eq!(g.player(0).unwrap().input.tick, 100);
         assert!(g.player(0).unwrap().input.throttle > 0.0, "the older frame must not win");
+    }
+
+    /// Every frame is simulated exactly once, in order.
+    ///
+    /// This is the promise client prediction is built on: the client replays
+    /// each unacknowledged frame once, so if the server ever runs one twice or
+    /// skips one, authority and prediction part company and the error smoothing
+    /// drags the vehicle back and lets it slide forward again.
+    ///
+    /// The server used to simulate with "whichever frame arrived most recently",
+    /// which cannot keep that promise. Two free-running 30 Hz clocks with a
+    /// network between them do not deliver one frame per tick -- they deliver
+    /// two on some ticks and none on others, for ever, because the phase
+    /// between them sweeps. Both cases are exercised here.
+    #[test]
+    fn two_frames_arriving_in_one_tick_are_both_simulated_in_order() {
+        let mut g = two_player_game();
+        let frame = |tick, throttle| InputFrame {
+            tick,
+            controlling: VehicleSlot::Tank,
+            throttle,
+            ..Default::default()
+        };
+
+        // Both land between two ticks, which is what a little jitter does.
+        g.set_input(0, frame(1, 1.0));
+        g.set_input(0, frame(2, -1.0));
+
+        g.step(TICK_DT);
+        assert_eq!(g.player(0).unwrap().input.tick, 1, "the first frame was skipped");
+        assert_eq!(g.player(0).unwrap().acked_input, 1, "it acknowledged a frame it had not run");
+
+        g.step(TICK_DT);
+        assert_eq!(g.player(0).unwrap().input.tick, 2, "the second frame was never run");
+        assert_eq!(g.player(0).unwrap().acked_input, 2);
+    }
+
+    /// A tick with nothing waiting holds the last frame and admits to it.
+    ///
+    /// Holding is right: one late packet is not the player letting go of
+    /// everything, and going properly quiet is `INPUT_TIMEOUT`'s job. Not
+    /// advancing `acked_input` is the other half -- the client keeps that frame
+    /// in its history and replays it, which is exactly what happened.
+    #[test]
+    fn an_empty_queue_holds_the_last_frame_without_acknowledging_it_again() {
+        let mut g = two_player_game();
+        g.set_input(
+            0,
+            InputFrame { tick: 7, controlling: VehicleSlot::Tank, throttle: 1.0, ..Default::default() },
+        );
+        g.step(TICK_DT);
+        assert_eq!(g.player(0).unwrap().acked_input, 7);
+
+        for _ in 0..5 {
+            g.step(TICK_DT);
+        }
+        assert_eq!(g.player(0).unwrap().input.tick, 7, "it dropped the frame it was holding");
+        assert_eq!(
+            g.player(0).unwrap().acked_input,
+            7,
+            "it acknowledged the held frame again, telling the client to forget it"
+        );
+        assert!(
+            g.player(0).unwrap().tank.as_ref().unwrap().mv.speed > 0.0,
+            "a single late packet stopped the tank"
+        );
+    }
+
+    /// A client that stalls and then bursts catches up rather than replaying.
+    #[test]
+    fn a_burst_of_input_is_capped_at_the_newest_frames() {
+        let mut g = two_player_game();
+        for tick in 1..=(MAX_QUEUED_INPUTS as u32 + 20) {
+            g.set_input(
+                0,
+                InputFrame { tick, controlling: VehicleSlot::Tank, ..Default::default() },
+            );
+        }
+        let p = g.player(0).unwrap();
+        assert_eq!(p.inputs.len(), MAX_QUEUED_INPUTS, "the queue grew without bound");
+        assert_eq!(
+            p.inputs.front().unwrap().tick,
+            20 + 1,
+            "it kept the oldest frames rather than the newest"
+        );
+    }
+
+    /// The server's path is every frame applied once, in order.
+    ///
+    /// This is the contract client prediction is written against, stated as a
+    /// test rather than as a hope: the client replays each unacknowledged frame
+    /// exactly once, so the server has to have run them exactly once too. Any
+    /// gap is a correction the player sees -- the vehicle dragged back and
+    /// sliding forward again.
+    ///
+    /// Frames arrive two-on-one-tick and none-on-the-next here, which is what
+    /// two free-running 30 Hz clocks with a network between them actually do:
+    /// the phase between them sweeps, so arrivals keep crossing tick
+    /// boundaries. Under the old "simulate with whichever frame arrived most
+    /// recently" rule, the doubled tick acknowledged a frame it never ran and
+    /// the empty one ran a frame twice, and the trajectory below comes out
+    /// visibly different.
+    #[test]
+    fn the_server_runs_every_frame_exactly_once_in_order() {
+        let mut g = Game::new(11);
+        g.join(1, "ash").unwrap();
+        g.join(2, "bo").unwrap();
+        let powerups = g.player(0).unwrap().powerups;
+        let start = g.player(0).unwrap().tank.as_ref().unwrap().mv;
+
+        let frame = |tick: u32| InputFrame {
+            tick,
+            controlling: VehicleSlot::Tank,
+            throttle: 1.0,
+            // Varied, so a dropped or repeated frame cannot quietly cancel out.
+            steer: ((tick % 7) as f32 - 3.0) / 3.0,
+            ..Default::default()
+        };
+
+        let mut sent: Vec<InputFrame> = Vec::new();
+        let mut tick = 0u32;
+        // Two arrivals then none, forty times: the same number of frames as
+        // ticks, so the queue ends empty and the server has had every frame.
+        for round in 0..40 {
+            for _ in 0..if round % 2 == 0 { 2 } else { 0 } {
+                tick += 1;
+                let f = frame(tick);
+                sent.push(f);
+                g.set_input(0, f);
+            }
+            g.step(TICK_DT);
+        }
+
+        assert!(g.player(0).unwrap().inputs.is_empty(), "the queue never drained");
+        assert_eq!(
+            g.player(0).unwrap().acked_input as usize,
+            sent.len(),
+            "it did not acknowledge every frame it was sent"
+        );
+
+        // What those frames, applied once each in order, actually come to.
+        let mut honest = start;
+        for f in &sent {
+            let _ = sim::step_vehicle(
+                &mut honest,
+                f.throttle,
+                f.steer,
+                f.climb,
+                VehicleKind::Tank,
+                powerups,
+                &g.hills,
+                TICK_DT,
+            );
+        }
+
+        let authority = g.player(0).unwrap().tank.as_ref().unwrap().mv;
+        let gap = authority.pos.distance(honest.pos);
+        assert!(
+            gap < 1e-3,
+            "the server flew a different path from the one it was told: {gap:.4} units apart"
+        );
     }
 
     #[test]
