@@ -13,6 +13,7 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 orewar-client = { path = "../orewar-client" }
+orewar-shared.workspace = true
 # Neither activity backend is in Bevy's default features, and without one the
 # build fails on Android with no window and no input. `native-activity` is the
 # one that needs no Gradle project, so it is what the first APK is built with;

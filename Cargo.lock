@@ -4031,6 +4031,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "orewar-client",
+ "orewar-shared",
 ]
 
 [[package]]

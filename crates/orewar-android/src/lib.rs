@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use orewar_client::{Args, build_app};
 
-mod touch;
+mod controls;
 
 /// Android's entry point.
 ///
@@ -54,7 +54,7 @@ fn main() {
     let args =
         Args { server: None, name: None, token: None, token_file: token_path() };
 
-    build_app(args).add_plugins(touch::TouchAsMousePlugin).run();
+    build_app(args).add_plugins(controls::TouchControlsPlugin).run();
 }
 
 /// Where the identity token is kept.
