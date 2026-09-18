@@ -5,6 +5,19 @@ members = [
     "crates/orewar-server",
     "crates/orewar-server-gui",
     "crates/orewar-client",
+    "crates/orewar-android",
+]
+
+# The Android crate is a member so that `cargo check -p orewar-android` works,
+# but it is not one of these, so a bare `cargo build` or `cargo test` behaves
+# exactly as it did before it existed: no Windows shared library nobody wants,
+# and no Android activity backend unified into the feature set of the desktop
+# client. Ask for it by name, or by target, when you want it.
+default-members = [
+    "crates/orewar-shared",
+    "crates/orewar-server",
+    "crates/orewar-server-gui",
+    "crates/orewar-client",
 ]
 
 [workspace.package]

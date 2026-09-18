@@ -1,0 +1,55 @@
+[package]
+name = "orewar-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Orewar as an Android application."
+
+# Android loads a shared library and calls into it; there is no process to
+# start. `lib` alongside it so `cargo check` on a desktop still has something
+# to compile, which is how this crate gets type-checked without a device.
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+orewar-client = { path = "../orewar-client" }
+# Neither activity backend is in Bevy's default features, and without one the
+# build fails on Android with no window and no input. `native-activity` is the
+# one that needs no Gradle project, so it is what the first APK is built with;
+# Bevy's own mobile example uses `game-activity`, which is the fallback if the
+# soft keyboard or lifecycle handling turns out to need it.
+bevy = { version = "0.19.1", features = ["android-native-activity"] }
+
+[package.metadata.android]
+package = "com.orewar.client"
+build_targets = ["aarch64-linux-android"]
+# Debug symbols come out of the library before it goes into the APK. Without
+# this a dev build packages 1.8 GB of DWARF, which is not something to push over
+# a USB cable; with it the APK is the code and nothing else. The symbols are
+# still in `target/` if a stack trace ever needs them.
+strip = "strip"
+
+# `target_sdk_version` has to name a platform the NDK will actually accept, and
+# the ceiling is the NDK's, not the SDK's: NDK 28 declares
+# `NDK_MAX_PLATFORM_LEVEL := 35`, so an installed `platforms/android-36` is
+# filtered out and the packager reports having no platforms at all. Raise this
+# only alongside the NDK.
+[package.metadata.android.sdk]
+min_sdk_version = 28
+target_sdk_version = 35
+
+# The whole game is a network client. Without this the sockets bind and then
+# silently refuse to reach anything.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[package.metadata.android.application]
+label = "Orewar"
+
+# Landscape, locked. The HUD is laid out in absolute pixels against a 1180x680
+# window, so a tablet held portrait hands Bevy a tall surface and scatters every
+# panel. That is a layout job, not an orientation one, but until it is done a
+# locked orientation is the difference between a first run that looks like the
+# game and one that looks broken.
+[package.metadata.android.application.activity]
+orientation = "landscape"

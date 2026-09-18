@@ -3,3 +3,7 @@
 # anything else installed on the system.
 [toolchain]
 channel = "1.98.1"
+# The Android build needs the standard library for the device's architecture.
+# Named here so a fresh checkout gets it without anyone having to remember a
+# `rustup target add`.
+targets = ["aarch64-linux-android"]

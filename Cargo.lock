@@ -4026,6 +4026,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "orewar-android"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "orewar-client",
+]
+
+[[package]]
 name = "orewar-client"
 version = "0.1.0"
 dependencies = [
