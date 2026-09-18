@@ -33,9 +33,9 @@ use crate::{Args, token_from_file, token_from_name};
 /// [`crate::net`] uses for the same warning on the terminal.
 const QUIET: f64 = 4.0;
 
-/// Where the last successful server and name are kept, so a second session does
-/// not have to type them again. Alongside `.orewar-token`, and local to one
-/// machine in the same way.
+/// What the last successful server and name are kept in, so a second session
+/// does not have to type them again. Local to one machine, like the token it
+/// sits beside; [`remembered_beside`] decides which directory that is.
 const REMEMBERED: &str = ".orewar-connect";
 
 /// Longest name the screen accepts. The wire truncates at 255 bytes, but a
@@ -130,6 +130,9 @@ pub struct ConnectForm {
     /// name in the box.
     token: Option<u64>,
     token_file: Option<PathBuf>,
+    /// Where the last server and name are kept, worked out once at startup so
+    /// that writing them back lands wherever reading them came from.
+    remembered_at: PathBuf,
     /// Set when the command line already said where to go: the screen submits
     /// itself on the first frame rather than making a scripted launch stop and
     /// press a button.
@@ -141,7 +144,8 @@ impl ConnectForm {
     /// time, then from the host's own account name -- so the commonest case is
     /// pressing Enter on a screen that already says the right thing.
     pub fn new(args: Args) -> Self {
-        let remembered = remembered();
+        let remembered_at = remembered_beside(args.token_file.as_deref());
+        let remembered = remembered(&remembered_at);
         let given_address = args.server.is_some();
         let server = args
             .server
@@ -152,12 +156,7 @@ impl ConnectForm {
             .clone()
             .or_else(|| remembered.map(|(_, n)| n))
             .unwrap_or_else(default_name);
-        // A command line that named a server, a player, or an identity is a
-        // command line that has already answered this screen's questions.
-        let auto = given_address
-            || args.name.is_some()
-            || args.token.is_some()
-            || args.token_file.is_some();
+        let auto = skips_the_screen(given_address, &name);
         ConnectForm {
             server,
             name,
@@ -167,6 +166,7 @@ impl ConnectForm {
             attempt: None,
             token: args.token,
             token_file: args.token_file,
+            remembered_at,
             auto,
         }
     }
@@ -209,6 +209,26 @@ impl ConnectForm {
     }
 }
 
+/// Whether a launch has already said enough to go straight to the field.
+///
+/// Only an address does that. An identity -- a token, or a token file -- says
+/// who you are and never where to go, so on its own it is not an answer to
+/// anything this screen asks; a build that hands one over as a matter of
+/// course, the way the Android one does to keep its token in private storage,
+/// would otherwise dial the default address without a soul having asked it to.
+/// That default is this machine, which on a tablet is the tablet, where nothing
+/// is listening.
+///
+/// A name alone is not enough either, for the same reason in a quieter form:
+/// acting on it would mean assuming an address, and the address is the one
+/// thing this screen exists to be told.
+///
+/// The name still has to be there, because a launch that skips the screen skips
+/// the chance to notice it is joining as nobody.
+fn skips_the_screen(server_given: bool, name: &str) -> bool {
+    server_given && !name.trim().is_empty()
+}
+
 /// The player's own account name, as a first guess at what to call them.
 fn default_name() -> String {
     std::env::var("USERNAME")
@@ -217,10 +237,31 @@ fn default_name() -> String {
         .unwrap_or_default()
 }
 
+/// Where the remembered server and name live.
+///
+/// Beside the identity, whenever the identity was given a home of its own. The
+/// two belong together -- both say something about this device rather than
+/// about the match -- and a platform that has to put the token somewhere
+/// specific has to put this somewhere specific for exactly the same reason.
+/// Android is the case in point: its working directory is not writable, so
+/// without this the screen could never remember anything.
+///
+/// It is also how a tablet gets told where to play before it can be typed at.
+/// Two lines pushed onto the device fill the screen in, and the button does the
+/// rest -- no address compiled into the build, and no keyboard needed.
+fn remembered_beside(token_file: Option<&Path>) -> PathBuf {
+    match token_file.and_then(Path::parent) {
+        // A bare file name has an empty parent, which would turn an absolute
+        // answer into a relative one.
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(REMEMBERED),
+        _ => PathBuf::from(REMEMBERED),
+    }
+}
+
 /// Reads the remembered server and name: address on the first line, name on
 /// the second. Absent or unreadable is simply "nothing remembered".
-fn remembered() -> Option<(String, String)> {
-    let text = std::fs::read_to_string(REMEMBERED).ok()?;
+fn remembered(path: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let server = lines.next()?.trim().to_string();
     let name = lines.next().unwrap_or_default().trim().to_string();
@@ -229,8 +270,8 @@ fn remembered() -> Option<(String, String)> {
 
 /// Keeps what worked, for the next launch. Failing to write is not worth
 /// interrupting a match that has just started.
-fn remember(server: &str, name: &str) {
-    let _ = std::fs::write(REMEMBERED, format!("{server}\n{name}\n"));
+fn remember(path: &Path, server: &str, name: &str) {
+    let _ = std::fs::write(path, format!("{server}\n{name}\n"));
 }
 
 /// Adds a typed character to a field, dropping anything that is not text and
@@ -515,7 +556,7 @@ pub fn update(
     let Some(attempt) = &form.attempt else { return };
     match &net.link {
         Link::Connected => {
-            remember(form.server.trim(), form.name.trim());
+            remember(&form.remembered_at, form.server.trim(), form.name.trim());
             next.set(AppState::Playing);
         }
         Link::Denied(reason) => {
@@ -559,6 +600,24 @@ fn refusal(reason: DenyReason) -> String {
 
 /// Opens a socket and starts a handshake, or says why it could not.
 fn start(commands: &mut Commands, form: &mut ConnectForm, now: f64) {
+    // The two things the screen is for. Every way of leaving it comes through
+    // here -- the button, Enter, and a command line that answered in advance --
+    // so this is the one place both have to be true.
+    //
+    // A blank address would otherwise resolve to this machine and a blank name
+    // would join as nobody: two answers that nobody typed, arrived at by
+    // default, and the second is impossible to correct once a match has started.
+    if form.server.trim().is_empty() {
+        form.status = "Nowhere to go: type the address of the server to join.".to_string();
+        form.trouble = true;
+        return;
+    }
+    if form.name.trim().is_empty() {
+        form.status = "Nobody to be: type the name to play under.".to_string();
+        form.trouble = true;
+        return;
+    }
+
     let addr = match resolve(&form.server) {
         Ok(addr) => addr,
         Err(e) => {
@@ -645,9 +704,56 @@ mod tests {
         assert_eq!(prefer_ipv4(&[]), None);
     }
 
+    /// The resolver's own answer to nothing at all. The screen no longer lets
+    /// a blank address reach it -- [`start`] turns one away -- but a caller
+    /// that does ask gets this machine rather than an error.
     #[test]
-    fn an_empty_box_means_this_machine() {
+    fn an_empty_address_resolves_to_this_machine() {
         assert_eq!(resolve("   "), Ok(v4(DEFAULT_PORT)));
+    }
+
+    #[test]
+    fn an_address_and_a_name_go_straight_to_the_field() {
+        assert!(skips_the_screen(true, "Ash"));
+    }
+
+    /// Nothing but an address gets you past the screen, which is why an
+    /// identity is not even a question this asks: a build that always supplies
+    /// one -- Android, keeping its token in private storage -- cannot talk its
+    /// way to a destination it never named.
+    #[test]
+    fn a_name_alone_does_not_assume_an_address() {
+        assert!(!skips_the_screen(false, "Ash"));
+        assert!(!skips_the_screen(false, ""));
+    }
+
+    #[test]
+    fn an_address_without_a_name_still_asks() {
+        assert!(!skips_the_screen(true, ""));
+        assert!(!skips_the_screen(true, "   "));
+    }
+
+    #[test]
+    fn what_is_remembered_sits_beside_the_identity() {
+        let token = PathBuf::from("/data/user/0/com.orewar.client/files/orewar-token");
+        assert_eq!(
+            remembered_beside(Some(&token)),
+            Path::new("/data/user/0/com.orewar.client/files/.orewar-connect")
+        );
+    }
+
+    /// The desktop default: no token file was named, so it stays where it has
+    /// always been, in whatever directory the client was started from.
+    #[test]
+    fn with_no_identity_file_it_stays_in_the_working_directory() {
+        assert_eq!(remembered_beside(None), Path::new(REMEMBERED));
+    }
+
+    /// A bare file name has an empty parent. Joining onto that would give
+    /// `/.orewar-connect` -- the root of the disk -- rather than here.
+    #[test]
+    fn a_bare_identity_file_name_does_not_escape_to_the_root() {
+        assert_eq!(remembered_beside(Some(Path::new("my.token"))), Path::new(REMEMBERED));
     }
 
     #[test]

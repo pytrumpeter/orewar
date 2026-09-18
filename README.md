@@ -42,8 +42,8 @@ front of you to correct. What worked last time is filled in for you the next
 time you start it.
 
 Everything on that screen can also be given on the command line, which fills it
-in and presses the button, so a scripted launch still goes straight to the
-field:
+in. Naming a server is what presses the button, so a scripted launch still goes
+straight to the field:
 
 ```bash
 cargo run --release -p orewar-client -- --server 192.168.1.50 --name Ash
@@ -54,8 +54,8 @@ different names (the name decides your identity, so each gets its own slot):
 
 ```bash
 cargo run --release -p orewar-server
-cargo run --release -p orewar-client -- --name Ash
-cargo run --release -p orewar-client -- --name Bo
+cargo run --release -p orewar-client -- --server 127.0.0.1 --name Ash
+cargo run --release -p orewar-client -- --server 127.0.0.1 --name Bo
 ```
 
 The match begins when the second player connects. Up to four can play.
@@ -77,7 +77,19 @@ listens on every interface.
 | `--name NAME` | display name, and your identity |
 | `--token N` / `--token-file PATH` | identity, set explicitly |
 
-Any one of these skips the connect screen. With none of them the client asks.
+`--server` is the only one that skips the connect screen, and only when there is
+a name to go with it. The others fill the screen in and leave it up: an identity
+says who you are and never where to go, so it is never enough on its own to send
+the client somewhere. The screen will not connect with either box empty, which
+is why a build that supplies a token file and nothing else -- Android, keeping
+its token in private storage -- stops and asks rather than quietly dialling
+whatever the default happens to be.
+
+What worked last time is kept in `.orewar-connect`, beside the token file when
+one was named and in the working directory when it was not, so a platform whose
+working directory is read-only can still remember. Writing those two lines --
+address, then name -- by hand is also how a device with no keyboard yet gets
+told where to play.
 
 Host names resolve to IPv4 by preference. `localhost` resolves to `::1` before
 `127.0.0.1` on Windows, and the server binds `0.0.0.0` -- IPv4 only -- so
