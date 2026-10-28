@@ -123,7 +123,15 @@ the handshake with an error rather than let in. Start it with another name.
 | `B` | build menu, then `1`–`8` to buy |
 | `Alt-C` | cheat mode on or off, for everybody in the match |
 | `O` | overview camera; right-drag to pan, `+`/`-` to zoom |
+| wheel *or* `+`/`-` | zoom whichever camera is up |
+| `PgUp`/`PgDn` | tilt it: `PgUp` looks further down, `PgDn` toward the horizon |
+| `Home` | put it back how it started |
 | `Ctrl-Q` | leave the match |
+
+On a tablet, two fingers on open ground do the same: pinch to zoom, and slide
+both up or down the glass to tilt. The chase camera and the overview each keep
+their own setting, so a chase camera pulled back stays pulled back after a look
+at the whole field.
 
 Everything keeps working with the overview up — you can fly, drive, shoot, buy
 and call up a sortie while looking at the whole field. The mouse is the one

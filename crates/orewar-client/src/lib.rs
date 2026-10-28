@@ -99,6 +99,8 @@ pub fn build_app(args: Args) -> App {
     .init_resource::<LocalInput>()
     .init_resource::<MenuState>()
     .init_resource::<camera::Overview>()
+    .init_resource::<camera::CameraRig>()
+    .add_message::<camera::CameraNudge>()
     .add_systems(
         Startup,
         (

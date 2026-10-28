@@ -44,11 +44,30 @@ const AIM_HALF_LIFE: f32 = 0.07;
 const MIN_HEIGHT: f32 = 70.0;
 const MAX_HEIGHT: f32 = WORLD_SIZE / 0.75;
 /// What one wheel notch multiplies or divides the height by.
-const ZOOM_PER_NOTCH: f32 = 1.15;
+pub const ZOOM_PER_NOTCH: f32 = 1.15;
 /// How far behind the point it looks at the overview camera sits, as a fraction
-/// of its height. Straight down reads as a map; a little tilt keeps the hills
-/// and vehicles standing up.
+/// of its height, before anybody tilts it. Straight down reads as a map; a
+/// little tilt keeps the hills and vehicles standing up.
 const OVERVIEW_TILT: f32 = 0.32;
+
+/// How far the chase camera may be pulled in or pushed out, as multiples of the
+/// distance it starts at. Much closer and the hull fills the screen; much
+/// further and it is a slow overview that still turns with the vehicle.
+const CHASE_ZOOM_MIN: f32 = 0.6;
+const CHASE_ZOOM_MAX: f32 = 2.6;
+/// The chase camera's look-down angle, either side of where it starts. Low
+/// enough to see the horizon over the hull, but not so low that a pulled-in
+/// camera sits in the grass; high enough to look nearly down at the vehicle
+/// without losing which way it is heading.
+const CHASE_PITCH_MIN: f32 = 12.0 * (std::f32::consts::PI / 180.0);
+const CHASE_PITCH_MAX: f32 = 72.0 * (std::f32::consts::PI / 180.0);
+/// The overview's angle above the ground. The top end stops short of straight
+/// down, where "up the screen" stops meaning anything -- for looking at, and
+/// for aiming the tablet's stick.
+const OVERVIEW_PITCH_MIN: f32 = 30.0 * (std::f32::consts::PI / 180.0);
+const OVERVIEW_PITCH_MAX: f32 = 88.0 * (std::f32::consts::PI / 180.0);
+/// What the tilt keys turn the camera by per second held.
+const KEY_TILT_RATE: f32 = 0.9;
 /// Height the overview opens at when raised by hand: enough of the field to
 /// plan with, close enough to tell vehicles apart.
 const WORKING_HEIGHT: f32 = WORLD_SIZE * 0.55;
@@ -87,6 +106,93 @@ impl Default for Overview {
     }
 }
 
+/// How the player has set the two cameras up: how far out the chase camera
+/// sits, and how steeply each of them looks down.
+///
+/// Kept apart from [`Overview`] because it outlives it: a chase camera pulled
+/// back stays pulled back after a trip up to the overview and down again, and
+/// across swapping vehicles.
+#[derive(Resource)]
+pub struct CameraRig {
+    /// Multiple of the default trailing distance.
+    chase_zoom: f32,
+    /// Angle above the vehicle's heading the chase camera sits at, in radians.
+    chase_pitch: f32,
+    /// Angle above the ground the overview looks down from, in radians.
+    overview_pitch: f32,
+}
+
+impl Default for CameraRig {
+    fn default() -> Self {
+        CameraRig {
+            chase_zoom: 1.0,
+            chase_pitch: default_chase_pitch(),
+            overview_pitch: default_overview_pitch(),
+        }
+    }
+}
+
+impl CameraRig {
+    /// Where the chase camera sits and looks, along the vehicle's heading:
+    /// how far behind it, how far above it, and how far ahead it aims.
+    ///
+    /// At the defaults this is exactly [`TRAIL`], [`HEIGHT`] and
+    /// [`LOOK_AHEAD`].
+    fn chase_frame(&self) -> (f32, f32, f32) {
+        let distance = TRAIL.hypot(HEIGHT) * self.chase_zoom;
+        // The look-ahead shrinks as the camera climbs over the hull. Looking
+        // down from above, a point far ahead would put the vehicle itself at
+        // the bottom edge of the screen, or under it.
+        let ahead = LOOK_AHEAD * self.chase_pitch.cos() / default_chase_pitch().cos();
+        (distance * self.chase_pitch.cos(), distance * self.chase_pitch.sin(), ahead)
+    }
+
+    /// Where the overview camera sits relative to the point it looks at.
+    ///
+    /// Tilting swings it round that point at a fixed distance rather than
+    /// sliding it sideways at a fixed height. Distance is what the fog is
+    /// measured by, so a tilted overview sees as far as an untilted one.
+    fn overview_offset(&self, height: f32) -> Vec3 {
+        let distance = height * (1.0 + OVERVIEW_TILT * OVERVIEW_TILT).sqrt();
+        distance * Vec3::new(0.0, self.overview_pitch.sin(), self.overview_pitch.cos())
+    }
+
+    /// Zooms and tilts the chase camera. Positive `zoom` is in notches toward
+    /// the vehicle; positive `tilt` is radians toward looking straight down.
+    fn adjust_chase(&mut self, zoom: f32, tilt: f32) {
+        self.chase_zoom =
+            (self.chase_zoom * ZOOM_PER_NOTCH.powf(-zoom)).clamp(CHASE_ZOOM_MIN, CHASE_ZOOM_MAX);
+        self.chase_pitch = (self.chase_pitch + tilt).clamp(CHASE_PITCH_MIN, CHASE_PITCH_MAX);
+    }
+
+    fn tilt_overview(&mut self, tilt: f32) {
+        self.overview_pitch =
+            (self.overview_pitch + tilt).clamp(OVERVIEW_PITCH_MIN, OVERVIEW_PITCH_MAX);
+    }
+}
+
+fn default_chase_pitch() -> f32 {
+    HEIGHT.atan2(TRAIL)
+}
+
+fn default_overview_pitch() -> f32 {
+    1.0f32.atan2(OVERVIEW_TILT)
+}
+
+/// A request to zoom or tilt whichever camera is up, from input this module
+/// does not read for itself -- fingers on a tablet.
+///
+/// Sent without knowing which camera that is, because whoever sends it should
+/// not have to: a pinch means closer whether it lands on the chase camera or
+/// the overview.
+#[derive(Message, Clone, Copy, Default, Debug, PartialEq)]
+pub struct CameraNudge {
+    /// In wheel notches; positive is closer.
+    pub zoom: f32,
+    /// In radians; positive is steeper, toward looking straight down.
+    pub tilt: f32,
+}
+
 pub fn setup(mut commands: Commands) {
     let half = WORLD_SIZE * 0.5;
     commands.spawn((
@@ -110,7 +216,8 @@ pub fn setup(mut commands: Commands) {
     ));
 }
 
-/// Raises, lowers, pans and zooms the overview.
+/// Raises, lowers, pans and zooms the overview, and zooms and tilts whichever
+/// camera is up.
 ///
 /// Runs before [`follow`], which only reads the result.
 pub fn overview_controls(
@@ -118,12 +225,14 @@ pub fn overview_controls(
     buttons: Res<ButtonInput<MouseButton>>,
     mut wheel: MessageReader<MouseWheel>,
     mut motion: MessageReader<MouseMotion>,
+    mut nudges: MessageReader<CameraNudge>,
     windows: Query<&Window>,
     menu: Res<MenuState>,
     state: Res<GameState>,
     input: Res<LocalInput>,
     time: Res<Time>,
     mut overview: ResMut<Overview>,
+    mut rig: ResMut<CameraRig>,
 ) {
     // Off the field after losing a miner: there is no vehicle to chase, so
     // the overview is the only sensible thing to show, whether it was asked for
@@ -165,37 +274,39 @@ pub fn overview_controls(
     // the player is somewhere else entirely, and a stream of small scroll
     // events walks the zoom to a limit and holds it there.
     let focused = windows.iter().any(|w| w.focused);
-    if !overview.active || menu.open || !focused {
+    if menu.open {
         wheel.clear();
         motion.clear();
+        nudges.clear();
+        return;
+    }
+    if !focused {
+        // Fingers are not a pointing device left idling over the window, so
+        // what they send still counts.
+        wheel.clear();
+        motion.clear();
+    }
+
+    let (zoom, tilt) = camera_moves(&keys, focused, &mut wheel, &mut nudges, time.delta_secs());
+    let reset = focused && keys.just_pressed(KeyCode::Home);
+
+    if !overview.active {
+        // The mouse is aiming the turret down here, not dragging anything.
+        motion.clear();
+        if reset {
+            let fresh = CameraRig::default();
+            rig.chase_zoom = fresh.chase_zoom;
+            rig.chase_pitch = fresh.chase_pitch;
+        }
+        rig.adjust_chase(zoom, tilt);
         return;
     }
 
-    // A wheel event arrives either as lines or as raw pixels depending on the
-    // device and the platform, and Windows sends 120 pixels per notch. Summing
-    // the raw values and treating them as notches makes one flick of the wheel
-    // read as hundreds, which is not a difference the rest of this can absorb.
-    let notches: f32 = wheel
-        .read()
-        .map(|e| match e.unit {
-            MouseScrollUnit::Line => e.y,
-            MouseScrollUnit::Pixel => e.y / 120.0,
-        })
-        .sum::<f32>()
-        .clamp(-MAX_NOTCHES_PER_FRAME, MAX_NOTCHES_PER_FRAME);
-    // Keys do the same job. They are also the dependable way to zoom: some
-    // pointing devices deliver a stream of scroll events for as long as the
-    // cursor is over the window, whether or not anyone has touched the wheel,
-    // and there is no way to tell those apart from a real scroll by their
-    // contents. Where that happens the wheel is unusable and these are not.
-    let mut zoom = 0.0;
-    if keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd) {
-        zoom += KEY_ZOOM_RATE * time.delta_secs();
+    if reset {
+        overview.height = WORKING_HEIGHT;
+        rig.overview_pitch = default_overview_pitch();
     }
-    if keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract) {
-        zoom -= KEY_ZOOM_RATE * time.delta_secs();
-    }
-    zoom += notches;
+    rig.tilt_overview(tilt);
 
     if zoom != 0.0 {
         // Exponential, so a notch covers the same proportion of the view whether
@@ -231,6 +342,62 @@ pub fn overview_controls(
     overview.centre.y = overview.centre.y.clamp(margin, WORLD_SIZE - margin);
 }
 
+/// This frame's zoom, in notches toward the ground, and tilt, in radians
+/// toward looking straight down -- from the wheel, the keys and anything that
+/// sent a [`CameraNudge`], whichever camera they end up moving.
+fn camera_moves(
+    keys: &ButtonInput<KeyCode>,
+    focused: bool,
+    wheel: &mut MessageReader<MouseWheel>,
+    nudges: &mut MessageReader<CameraNudge>,
+    dt: f32,
+) -> (f32, f32) {
+    let mut zoom = 0.0;
+    let mut tilt = 0.0;
+    for nudge in nudges.read() {
+        zoom += nudge.zoom;
+        tilt += nudge.tilt;
+    }
+    if !focused {
+        return (zoom, tilt);
+    }
+
+    // A wheel event arrives either as lines or as raw pixels depending on the
+    // device and the platform, and Windows sends 120 pixels per notch. Summing
+    // the raw values and treating them as notches makes one flick of the wheel
+    // read as hundreds, which is not a difference the rest of this can absorb.
+    let notches: f32 = wheel
+        .read()
+        .map(|e| match e.unit {
+            MouseScrollUnit::Line => e.y,
+            MouseScrollUnit::Pixel => e.y / 120.0,
+        })
+        .sum::<f32>()
+        .clamp(-MAX_NOTCHES_PER_FRAME, MAX_NOTCHES_PER_FRAME);
+    // Keys do the same job. They are also the dependable way to zoom: some
+    // pointing devices deliver a stream of scroll events for as long as the
+    // cursor is over the window, whether or not anyone has touched the wheel,
+    // and there is no way to tell those apart from a real scroll by their
+    // contents. Where that happens the wheel is unusable and these are not.
+    if keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd) {
+        zoom += KEY_ZOOM_RATE * dt;
+    }
+    if keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract) {
+        zoom -= KEY_ZOOM_RATE * dt;
+    }
+    zoom += notches;
+
+    // Page Up looks further down, toward a map; Page Down lifts the view
+    // toward the horizon.
+    if keys.pressed(KeyCode::PageUp) {
+        tilt += KEY_TILT_RATE * dt;
+    }
+    if keys.pressed(KeyCode::PageDown) {
+        tilt -= KEY_TILT_RATE * dt;
+    }
+    (zoom, tilt)
+}
+
 /// How much ground a camera at `height` sees top to bottom, for the default
 /// vertical field of view.
 fn visible_height(height: f32) -> f32 {
@@ -242,6 +409,7 @@ pub fn follow(
     state: Res<GameState>,
     input: Res<LocalInput>,
     overview: Res<Overview>,
+    rig: Res<CameraRig>,
     time: Res<Time>,
     mut camera: Query<&mut Transform, With<ChaseCamera>>,
     mut aim: Local<Option<Vec3>>,
@@ -267,10 +435,7 @@ pub fn follow(
         // however high it has been zoomed.
         _ if overview.active => {
             let look = coords::sim_to_world(overview.centre);
-            (
-                look + Vec3::new(0.0, overview.height, overview.height * OVERVIEW_TILT),
-                look,
-            )
+            (look + rig.overview_offset(overview.height), look)
         }
         Some((pos, yaw, alt)) => {
             // An aircraft is followed at its own altitude, so the camera rides
@@ -283,9 +448,10 @@ pub fn follow(
             // which is what the constant used to be for them.
             let center = coords::sim_to_world(pos) + Vec3::Y * alt;
             let heading = coords::yaw_to_quat(yaw) * Vec3::X;
+            let (behind, above, ahead) = rig.chase_frame();
             (
-                center - heading * TRAIL + Vec3::Y * HEIGHT,
-                center + heading * LOOK_AHEAD + Vec3::Y * LOOK_HEIGHT,
+                center - heading * behind + Vec3::Y * above,
+                center + heading * ahead + Vec3::Y * LOOK_HEIGHT,
             )
         }
         None => (
@@ -310,4 +476,68 @@ fn smoothing(half_life: f32, dt: f32) -> f32 {
         return 1.0;
     }
     1.0 - (-dt * std::f32::consts::LN_2 / half_life).exp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    /// Nobody who never touches the new controls should see a different
+    /// camera: the defaults have to land exactly where the constants used to.
+    #[test]
+    fn an_untouched_rig_frames_the_vehicle_as_before() {
+        let rig = CameraRig::default();
+        let (behind, above, ahead) = rig.chase_frame();
+        assert!(close(behind, TRAIL) && close(above, HEIGHT) && close(ahead, LOOK_AHEAD));
+
+        let offset = rig.overview_offset(100.0);
+        assert!(close(offset.x, 0.0));
+        assert!(close(offset.y, 100.0));
+        assert!(close(offset.z, 100.0 * OVERVIEW_TILT));
+    }
+
+    /// However far either control is pushed, the camera stays inside the
+    /// range it was given -- in particular, no amount of zooming in puts it
+    /// inside the hull.
+    #[test]
+    fn the_chase_camera_stops_at_its_limits() {
+        let mut rig = CameraRig::default();
+        rig.adjust_chase(1000.0, 1000.0);
+        assert!(close(rig.chase_zoom, CHASE_ZOOM_MIN));
+        assert!(close(rig.chase_pitch, CHASE_PITCH_MAX));
+        rig.adjust_chase(-1000.0, -1000.0);
+        assert!(close(rig.chase_zoom, CHASE_ZOOM_MAX));
+        assert!(close(rig.chase_pitch, CHASE_PITCH_MIN));
+    }
+
+    /// Looking down at the vehicle from above, the point aimed at must come in
+    /// toward it, or the hull slides off the bottom of the screen.
+    #[test]
+    fn a_steeper_chase_camera_looks_nearer_the_hull() {
+        let mut rig = CameraRig::default();
+        let (_, _, before) = rig.chase_frame();
+        rig.adjust_chase(0.0, 1.0);
+        let (behind, above, after) = rig.chase_frame();
+        assert!(after < before);
+        assert!(above > behind, "a steep camera should be more above than behind");
+    }
+
+    /// Tilting swings the overview round the point it looks at, so it never
+    /// comes nearer to it or goes further from it -- that is what the fog is
+    /// measured by.
+    #[test]
+    fn tilting_the_overview_keeps_its_distance() {
+        let mut rig = CameraRig::default();
+        let before = rig.overview_offset(150.0).length();
+        rig.tilt_overview(-0.5);
+        let after = rig.overview_offset(150.0);
+        assert!(close(after.length(), before));
+        assert!(after.y < 150.0, "tilted toward the horizon, it should sit lower");
+        rig.tilt_overview(1000.0);
+        assert!(close(rig.overview_pitch, OVERVIEW_PITCH_MAX));
+    }
 }

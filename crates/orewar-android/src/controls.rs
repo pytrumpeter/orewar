@@ -12,6 +12,12 @@
 //! once, on the way down, is what stops a thumb sliding out of its ring from
 //! suddenly becoming a click somewhere behind it.
 //!
+//! Two fingers on open ground are the camera instead: pinching zooms it, and
+//! sliding both up or down the glass tilts it. The pair is recognised when the
+//! second finger lands, which is the first moment it can be told apart from a
+//! tap, and the first finger's press is let go then so that a pinch does not
+//! also hold the trigger down.
+//!
 //! The sticks write to [`LocalInput`] after the client has gathered the
 //! keyboard, so they take precedence over keys that are not being pressed while
 //! leaving everything else alone. Nothing in the client is modified.
@@ -24,7 +30,7 @@ use bevy::prelude::*;
 use bevy::ui::FocusPolicy;
 use bevy::window::PrimaryWindow;
 
-use orewar_client::camera::{ChaseCamera, Overview};
+use orewar_client::camera::{CameraNudge, ChaseCamera, Overview, ZOOM_PER_NOTCH};
 use orewar_client::connect::AppState;
 use orewar_client::coords;
 use orewar_client::input::{self, LocalInput};
@@ -53,6 +59,10 @@ const AIM_DEADZONE: f32 = 0.16;
 /// How far it has to move before it also pulls the trigger. Well past aiming,
 /// so lining a shot up is not the same as taking it.
 const FIRE_POINT: f32 = 0.45;
+
+/// How far the camera tilts for each logical pixel two fingers slide up or
+/// down the glass together. A thumb's length of travel is most of the range.
+const TILT_PER_PIXEL: f32 = 0.005;
 /// The same for the driving stick, which only has to ignore a resting thumb.
 const MOVE_DEADZONE: f32 = 0.12;
 
@@ -96,6 +106,8 @@ enum Owner {
     /// Standing in for the mouse, which is how everything that is not a stick
     /// -- menus, panels, the connect screen -- carries on working.
     Cursor,
+    /// One of a pair on open ground, moving the camera.
+    Camera,
     /// A second finger somewhere that already has one. Tracked so that lifting
     /// it does not release something it never took.
     Spare,
@@ -126,6 +138,9 @@ struct Touches {
     drive: Stick,
     aim: Stick,
     firing_secondary: bool,
+    /// Where each finger of a camera pair is, so the next move can be measured
+    /// against it.
+    camera: HashMap<u64, Vec2>,
 }
 
 /// Where the three controls sit, for a window of this size.
@@ -153,6 +168,7 @@ fn route(
     menu: Res<MenuState>,
     mut buttons: ResMut<ButtonInput<MouseButton>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut nudges: MessageWriter<CameraNudge>,
 ) {
     let Ok(mut window) = windows.single_mut() else { return };
     let layout = layout(&window);
@@ -176,18 +192,55 @@ fn route(
                         window.set_cursor_position(Some(touch.position));
                         buttons.press(MouseButton::Left);
                     }
+                    Owner::Camera => {
+                        // The finger already down was taken for the mouse.
+                        // It becomes the other half of the pair, starting
+                        // from wherever it moved the cursor to, and its press
+                        // is let go -- with the sticks up a held left button
+                        // is the gun.
+                        let first = touches
+                            .owners
+                            .iter()
+                            .find(|(_, o)| **o == Owner::Cursor)
+                            .map(|(id, _)| *id);
+                        if let Some(first) = first {
+                            let at = window.cursor_position().unwrap_or(touch.position);
+                            touches.owners.insert(first, Owner::Camera);
+                            touches.camera.insert(first, at);
+                        }
+                        touches.camera.insert(touch.id, touch.position);
+                        buttons.release(MouseButton::Left);
+                    }
                     Owner::Spare => {}
                 }
             }
             TouchPhase::Moved => match touches.owners.get(&touch.id).copied() {
                 Some(Owner::Stick(side)) => push(&mut touches, side, &layout, touch.position),
                 Some(Owner::Cursor) => window.set_cursor_position(Some(touch.position)),
+                Some(Owner::Camera) => {
+                    if let Some(nudge) = move_camera(&mut touches.camera, touch.id, touch.position)
+                    {
+                        nudges.write(nudge);
+                    }
+                }
                 _ => {}
             },
             TouchPhase::Ended | TouchPhase::Canceled => {
                 match touches.owners.remove(&touch.id) {
                     Some(Owner::Stick(side)) => release(&mut touches, side),
                     Some(Owner::Fire) => touches.firing_secondary = false,
+                    Some(Owner::Camera) => {
+                        // One finger is not a pinch. The one left behind does
+                        // nothing until it lifts too, rather than turning back
+                        // into a mouse halfway through a gesture and clicking
+                        // wherever it happens to be.
+                        touches.camera.clear();
+                        for owner in touches.owners.values_mut() {
+                            if *owner == Owner::Camera {
+                                *owner = Owner::Spare;
+                            }
+                        }
+                    }
                     Some(Owner::Cursor) => {
                         buttons.release(MouseButton::Left);
                         // The cursor stays where the finger left it, exactly as
@@ -226,7 +279,47 @@ fn claim(touches: &Touches, layout: &Layout, at: Vec2, sticks_live: bool) -> Own
             return if held(Owner::Stick(side)) { Owner::Spare } else { Owner::Stick(side) };
         }
     }
-    if held(Owner::Cursor) { Owner::Spare } else { Owner::Cursor }
+    if held(Owner::Camera) {
+        Owner::Spare
+    } else if held(Owner::Cursor) {
+        // A second finger on open ground: the two of them are a pinch.
+        Owner::Camera
+    } else {
+        Owner::Cursor
+    }
+}
+
+/// Moves one finger of a camera pair, and says what that did to the camera.
+///
+/// Nothing, until there are two fingers to measure between.
+fn move_camera(pair: &mut HashMap<u64, Vec2>, id: u64, to: Vec2) -> Option<CameraNudge> {
+    let before: Vec<Vec2> = pair.values().copied().collect();
+    *pair.get_mut(&id)? = to;
+    let after: Vec<Vec2> = pair.values().copied().collect();
+    match (before.as_slice(), after.as_slice()) {
+        ([a, b], [c, d]) => Some(gesture([*a, *b], [*c, *d])),
+        _ => None,
+    }
+}
+
+/// The camera move two fingers make between one position and the next.
+///
+/// Spreading them apart is zooming in, by as many wheel notches as it takes to
+/// grow the view by the same proportion the gap grew -- so the ground under
+/// the fingers roughly stays under them. Sliding them down the glass together
+/// tilts toward looking straight down, and up toward the horizon, which is the
+/// way a map on a phone does it.
+fn gesture(before: [Vec2; 2], after: [Vec2; 2]) -> CameraNudge {
+    let gap_before = before[0].distance(before[1]);
+    let gap_after = after[0].distance(after[1]);
+    let zoom = if gap_before > 1.0 && gap_after > 1.0 {
+        (gap_after / gap_before).ln() / ZOOM_PER_NOTCH.ln()
+    } else {
+        0.0
+    };
+    let middle = |p: [Vec2; 2]| (p[0] + p[1]) * 0.5;
+    let tilt = (middle(after).y - middle(before).y) * TILT_PER_PIXEL;
+    CameraNudge { zoom, tilt }
 }
 
 /// Moves a stick to follow its thumb, held inside the ring.
@@ -475,6 +568,42 @@ mod tests {
     #[test]
     fn aiming_starts_before_firing_does() {
         assert!(AIM_DEADZONE < FIRE_POINT);
+    }
+
+    /// Fingers spreading is closer, closing is further, and nothing else
+    /// about a pinch should tilt the camera.
+    #[test]
+    fn a_pinch_zooms_without_tilting() {
+        let near = [Vec2::new(400.0, 300.0), Vec2::new(500.0, 300.0)];
+        let far = [Vec2::new(350.0, 300.0), Vec2::new(550.0, 300.0)];
+
+        let spread = gesture(near, far);
+        assert!(spread.zoom > 0.0);
+        assert_eq!(spread.tilt, 0.0);
+        // Twice the gap is however many notches double the view.
+        assert!((ZOOM_PER_NOTCH.powf(spread.zoom) - 2.0).abs() < 1e-3);
+
+        let closed = gesture(far, near);
+        assert!((closed.zoom + spread.zoom).abs() < 1e-4);
+    }
+
+    /// Down the glass looks down at the ground; up looks toward the horizon.
+    #[test]
+    fn two_fingers_sliding_down_tilt_toward_the_ground() {
+        let start = [Vec2::new(400.0, 300.0), Vec2::new(500.0, 300.0)];
+        let lower = start.map(|p| p + Vec2::new(0.0, 40.0));
+        let nudge = gesture(start, lower);
+        assert!(nudge.tilt > 0.0);
+        assert!(nudge.zoom.abs() < 1e-6);
+        assert!(gesture(lower, start).tilt < 0.0);
+    }
+
+    /// A finger with no partner yet must not move the camera at all.
+    #[test]
+    fn one_finger_is_not_a_gesture() {
+        let mut pair = HashMap::from([(1, Vec2::new(10.0, 10.0))]);
+        assert_eq!(move_camera(&mut pair, 1, Vec2::new(50.0, 50.0)), None);
+        assert_eq!(move_camera(&mut pair, 7, Vec2::new(50.0, 50.0)), None);
     }
 
     #[test]

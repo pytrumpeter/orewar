@@ -395,7 +395,7 @@ pub fn update_texts(
                 **text = format!(
                     "OREWAR  {name}\n{link}\nore {credits}   mined {}\ndriving: {}{sortie}{cheat_line}\n\n\
                      {weapons}\n\
-                     TAB swap vehicle | B build | O overview | ESC menu",
+                     TAB swap vehicle | B build | O overview | wheel zoom, PgUp/PgDn tilt | ESC menu",
                     me.map_or(0, |p| p.ore_mined),
                     match input.controlling {
                         VehicleSlot::Tank => "TANK",
